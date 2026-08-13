@@ -16,6 +16,7 @@ pub mod present;
 pub mod review;
 pub mod session;
 pub mod shadow;
+pub mod state;
 
 use anyhow::{Context, Result};
 use time::format_description::well_known::Rfc3339;

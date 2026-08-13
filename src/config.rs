@@ -8,6 +8,17 @@ use std::path::Path;
 
 pub const DEFAULT_MAX_HUNK_LINES: usize = 20;
 
+/// Two seconds of stillness before rote asks whether you meant it.
+///
+/// Long enough that a pause to think mid-hunk does not trigger a question,
+/// short enough that a real disagreement surfaces while you still remember
+/// writing it. Any further save to the file restarts the clock.
+pub const DEFAULT_DIVERGENCE_GRACE_MS: u64 = 2000;
+
+/// Trailing-edge debounce on the expensive path. A full re-diff shells out to
+/// git once per changed file; a burst of saves must collapse into one.
+pub const DEFAULT_DEBOUNCE_MS: u64 = 400;
+
 fn default_editor() -> String {
     "nvim".into()
 }
@@ -68,6 +79,8 @@ struct ProjectFile {
     checks: Option<ChecksFile>,
     #[serde(default)]
     review: Option<ReviewFile>,
+    #[serde(default)]
+    watch: Option<WatchFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -96,6 +109,14 @@ struct ReviewFile {
     model_args: Option<Vec<String>>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatchFile {
+    divergence_grace_ms: Option<u64>,
+    debounce_ms: Option<u64>,
+    ignore: Option<Vec<String>>,
+}
+
 /// Fully resolved configuration: defaults, overlaid by global, overlaid by project.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -111,6 +132,16 @@ pub struct Config {
     pub check_commands: Vec<String>,
     pub review_enabled: bool,
     pub review_model_args: Vec<String>,
+    /// How long a file must sit still, holding a version that disagrees with the
+    /// proposal, before rote asks about it. Zero is legal: the in-progress
+    /// predicate already suppresses mid-typing, so zero means "ask at the first
+    /// quiet moment" rather than "ask on every keystroke".
+    pub watch_divergence_grace_ms: u64,
+    /// Trailing-edge debounce before a full re-diff of the trees.
+    pub watch_debounce_ms: u64,
+    /// Extra globs the watcher ignores, on top of `.git`, `shadow.preserve`,
+    /// and rote's own state directory.
+    pub watch_ignore: Vec<String>,
 }
 
 impl Default for Config {
@@ -128,6 +159,9 @@ impl Default for Config {
             check_commands: Vec::new(),
             review_enabled: true,
             review_model_args: Vec::new(),
+            watch_divergence_grace_ms: DEFAULT_DIVERGENCE_GRACE_MS,
+            watch_debounce_ms: DEFAULT_DEBOUNCE_MS,
+            watch_ignore: Vec::new(),
         }
     }
 }
@@ -195,6 +229,17 @@ impl Config {
                     cfg.review_model_args = v;
                 }
             }
+            if let Some(w) = p.watch {
+                if let Some(v) = w.divergence_grace_ms {
+                    cfg.watch_divergence_grace_ms = v;
+                }
+                if let Some(v) = w.debounce_ms {
+                    cfg.watch_debounce_ms = v;
+                }
+                if let Some(v) = w.ignore {
+                    cfg.watch_ignore = v;
+                }
+            }
         }
 
         if cfg.max_hunk_lines == 0 {
@@ -213,6 +258,11 @@ impl Config {
     /// Compiled matcher for `[transcribe] verbatim`.
     pub fn verbatim_set(&self) -> Result<GlobSet> {
         build_globset(&self.verbatim, "transcribe.verbatim")
+    }
+
+    /// Extra paths the watcher should never wake for.
+    pub fn watch_ignore_set(&self) -> Result<GlobSet> {
+        build_globset(&self.watch_ignore, "watch.ignore")
     }
 }
 
@@ -313,6 +363,16 @@ verbatim = {verbatim}
 enabled = true
 # Extra args appended to `claude -p`, e.g. ["--model", "claude-haiku-4-5"]
 model_args = []
+
+[watch]
+# How long a file must sit still, holding a version that disagrees with the
+# proposal, before `rote watch` asks about it. Any further save restarts it.
+divergence_grace_ms = 2000
+# Trailing-edge debounce before re-diffing the trees.
+debounce_ms = 400
+# Extra globs the watcher ignores, on top of .git, shadow.preserve, and
+# rote's own state directory.
+ignore = []
 "#,
         preserve = toml_list(&default_preserve()),
         verbatim = toml_list(&detected.verbatim),
@@ -393,7 +453,8 @@ mod tests {
             "[shadow]\ncopy = [\".env\", \".envrc\"]\npreserve = [\"out/\"]\n\
              [transcribe]\nverbatim = [\"*.lock\"]\n\
              [checks]\ncommands = [\"cargo test\"]\n\
-             [review]\nenabled = false\nmodel_args = [\"--model\", \"claude-haiku-4-5\"]\n",
+             [review]\nenabled = false\nmodel_args = [\"--model\", \"claude-haiku-4-5\"]\n\
+             [watch]\ndivergence_grace_ms = 0\ndebounce_ms = 50\nignore = [\"*.log\"]\n",
         );
         let cfg = Config::load(&dir.path().join("absent.toml"), &p).unwrap();
         assert_eq!(cfg.shadow_copy, vec![".env", ".envrc"]);
@@ -402,6 +463,10 @@ mod tests {
         assert_eq!(cfg.check_commands, vec!["cargo test"]);
         assert!(!cfg.review_enabled);
         assert_eq!(cfg.review_model_args, vec!["--model", "claude-haiku-4-5"]);
+        // Zero is a legal grace window, so the merge must not treat it as unset.
+        assert_eq!(cfg.watch_divergence_grace_ms, 0);
+        assert_eq!(cfg.watch_debounce_ms, 50);
+        assert_eq!(cfg.watch_ignore, vec!["*.log"]);
     }
 
     #[test]
@@ -432,6 +497,13 @@ mod tests {
             assert!(cfg.review_enabled);
             assert_eq!(cfg.check_commands, detected.checks, "for {kind:?}");
             assert_eq!(cfg.verbatim, detected.verbatim, "for {kind:?}");
+            // The template's [watch] block must agree with the defaults it is
+            // meant to be showing; a drift here means the file lies to the user.
+            assert_eq!(
+                cfg.watch_divergence_grace_ms, DEFAULT_DIVERGENCE_GRACE_MS,
+                "for {kind:?}"
+            );
+            assert_eq!(cfg.watch_debounce_ms, DEFAULT_DEBOUNCE_MS, "for {kind:?}");
         }
     }
 

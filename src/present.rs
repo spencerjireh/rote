@@ -7,10 +7,12 @@
 use crate::hunks::{Hunk, Op};
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// How an anchor was located, worst case last.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnchorVia {
     ContextBefore,
     ContextAfter,
