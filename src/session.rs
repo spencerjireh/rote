@@ -284,7 +284,8 @@ pub fn recompute(
 
     // Rule 1: the fresh truth from the trees.
     let fresh = compute_hunks(project, cfg)?;
-    let mut report = reconcile(manifest, fresh);
+    let mut report = reconcile(manifest, fresh, cfg.strict_whitespace);
+    promote_state(manifest);
 
     report.drift = drift;
     if drift {
@@ -298,12 +299,29 @@ pub fn recompute(
     Ok(report)
 }
 
+/// A session with a queue is a session being transcribed.
+///
+/// This used to live in `rote next`, which made the state machine a property of
+/// one command rather than of the session — under a watcher nobody runs `next`,
+/// and a session would have sat in `working` while the user typed their way
+/// through it. Recompute is the right home: it is the only thing that can
+/// observe a queue coming into existence.
+pub fn promote_state(manifest: &mut Manifest) {
+    if manifest.state == State::Working && manifest.pending().next().is_some() {
+        manifest.state = State::Transcribing;
+    }
+}
+
 /// Rules 2–7 of DESIGN.md §5, as a pure function over (manifest, fresh).
 ///
 /// Separated from `recompute` so the rules are tested directly rather than
 /// through a fixture repository — and so the tests exercise this code rather
 /// than a reimplementation of it.
-pub fn reconcile(manifest: &mut Manifest, fresh: Vec<Hunk>) -> RecomputeReport {
+pub fn reconcile(
+    manifest: &mut Manifest,
+    fresh: Vec<Hunk>,
+    strict_whitespace: bool,
+) -> RecomputeReport {
     let mut report = RecomputeReport::default();
     let fresh_ids: HashSet<&str> = fresh.iter().map(|h| h.id.as_str()).collect();
 
@@ -311,7 +329,16 @@ pub fn reconcile(manifest: &mut Manifest, fresh: Vec<Hunk>) -> RecomputeReport {
     let before = manifest.hunks.len();
     manifest.hunks.retain(|h| {
         if h.status == Status::Pending {
-            fresh_ids.contains(h.id.as_str())
+            // An unanswered divergence question is the exception. Its own text
+            // is already in the real tree, so the next diff of that region is
+            // (yours → proposal) under a *different* id, and this retain would
+            // otherwise drop the question the user is still deciding about.
+            //
+            // Safe against stranding: a question is only cleared by answering
+            // it or by the region reaching `Typed`, and the engine commits a
+            // terminal status *before* it recomputes — so by the time a fixed
+            // region produces no fresh hunk, this entry is no longer pending.
+            h.pending_divergence.is_some() || fresh_ids.contains(h.id.as_str())
         } else {
             // Rules 2 and 4: every terminal status stays, whether or not it is
             // still outstanding in the trees. This is what makes `skip` durable
@@ -358,6 +385,29 @@ pub fn reconcile(manifest: &mut Manifest, fresh: Vec<Hunk>) -> RecomputeReport {
         .filter_map(|h| h.divergence.clone().map(|d| (h.file.clone(), d)))
         .collect();
 
+    // A question the user has been asked but has not answered. Exactly the same
+    // predicate as `resolved` over a different status, and that symmetry is the
+    // argument for it: answering `keep` turns `pending_divergence` into
+    // `divergence` and `Pending` into `Diverged`, so an open question and a
+    // closed one describe the same region the same way. Without this the fresh
+    // hunk restating the question is appended beside the entry that already
+    // carries it, and the user is asked twice about one disagreement.
+    let asked: Vec<(String, Divergence)> = manifest
+        .hunks
+        .iter()
+        .filter(|h| h.status == Status::Pending)
+        .filter_map(|h| h.pending_divergence.clone().map(|d| (h.file.clone(), d)))
+        .collect();
+
+    // What each typed hunk put into the real tree. Used to recognise the
+    // whitespace phantom below.
+    let typed_regions: Vec<(String, Vec<String>)> = manifest
+        .hunks
+        .iter()
+        .filter(|h| h.status == Status::Typed)
+        .map(|h| (h.file.clone(), h.new_lines.clone()))
+        .collect();
+
     for f in fresh {
         if known.contains(&f.id) {
             continue;
@@ -368,11 +418,59 @@ pub fn reconcile(manifest: &mut Manifest, fresh: Vec<Hunk>) -> RecomputeReport {
         if already_decided {
             continue;
         }
+        let already_asked = asked.iter().any(|(file, d)| {
+            *file == f.file && d.actual == f.old_lines && d.proposed == f.new_lines
+        });
+        if already_asked {
+            continue;
+        }
+        if is_whitespace_phantom(&f, &typed_regions, strict_whitespace) {
+            continue;
+        }
         manifest.hunks.push(f);
         report.added += 1;
     }
 
     report
+}
+
+/// A fresh hunk that exists only because the user's typing was accepted under a
+/// whitespace tolerance the tree comparison does not share.
+///
+/// `classify` calls a hunk typed when the region matches the proposal modulo
+/// trailing whitespace, but `compute_hunks` compares the trees byte for byte —
+/// so a tolerated trailing space leaves the region still differing, and the next
+/// recompute produces a hunk whose `old_lines` are the user's version and whose
+/// `new_lines` are the proposal. Its id is new, so rule 3 cannot recognise it
+/// and rule 6 appends it: a permanent pending hunk that says nothing but "you
+/// left a trailing space", and that typing cannot clear, because typing it
+/// exactly produces yet another state.
+///
+/// Narrow on purpose. It fires only when the two sides differ by nothing but
+/// trailing whitespace *and* some typed hunk in the same file already put that
+/// proposal into the tree. A genuinely new proposal for a region the user has
+/// touched still reaches the queue — the property
+/// `a_genuinely_new_proposal_for_a_diverged_region_is_still_offered` guards.
+fn is_whitespace_phantom(
+    f: &Hunk,
+    typed_regions: &[(String, Vec<String>)],
+    strict_whitespace: bool,
+) -> bool {
+    if strict_whitespace {
+        // The user asked for whitespace to count. Then it is a real difference.
+        return false;
+    }
+    if f.old_lines.is_empty() || f.new_lines.is_empty() {
+        return false;
+    }
+    if !crate::present::lines_eq(&f.old_lines, &f.new_lines, false) {
+        return false;
+    }
+    // `is_subrun`, not equality: git diffs only the lines that differ, so the
+    // phantom covers a subset of what the typed hunk proposed.
+    typed_regions.iter().any(|(file, new_lines)| {
+        *file == f.file && crate::present::is_subrun(new_lines, &f.new_lines, false)
+    })
 }
 
 fn short(sha: &str) -> String {
@@ -462,6 +560,24 @@ mod tests {
         h
     }
 
+    /// A hunk with explicit content, for the rules that turn on what the lines
+    /// actually say rather than merely on identity.
+    fn hunk_with(file: &str, old: &[&str], new: &[&str], status: Status) -> Hunk {
+        let mut h = hunk("seed", status);
+        h.file = file.into();
+        h.old_lines = old.iter().map(|s| s.to_string()).collect();
+        h.new_lines = new.iter().map(|s| s.to_string()).collect();
+        h.id = Hunk::compute_id(
+            &h.file,
+            &h.old_lines,
+            &h.new_lines,
+            &h.context_before,
+            &h.context_after,
+        );
+        h.key = Hunk::compute_key(&h.file, &h.old_lines, &h.new_lines);
+        h
+    }
+
     fn manifest_with(hunks: Vec<Hunk>) -> Manifest {
         Manifest {
             version: MANIFEST_VERSION,
@@ -508,7 +624,7 @@ mod tests {
     #[test]
     fn typed_hunk_absent_from_fresh_keeps_its_status() {
         let mut m = manifest_with(vec![hunk("a", Status::Typed)]);
-        let report = reconcile(&mut m, vec![]);
+        let report = reconcile(&mut m, vec![], false);
         assert_eq!(m.hunks.len(), 1);
         assert_eq!(m.hunks[0].status, Status::Typed);
         assert_eq!(m.pending().count(), 0);
@@ -521,7 +637,7 @@ mod tests {
         let old = hunk("a", Status::Pending);
         let mut m = manifest_with(vec![old.clone()]);
         let new = hunk("b", Status::Pending);
-        let report = reconcile(&mut m, vec![new.clone()]);
+        let report = reconcile(&mut m, vec![new.clone()], false);
         assert_eq!(report.dropped, 1);
         assert_eq!(report.added, 1);
         assert_eq!(m.hunks.len(), 1);
@@ -533,7 +649,7 @@ mod tests {
     fn typed_hunk_that_reappears_is_reset_with_a_warning() {
         let h = hunk("a", Status::Typed);
         let mut m = manifest_with(vec![h.clone()]);
-        let report = reconcile(&mut m, vec![hunk("a", Status::Pending)]);
+        let report = reconcile(&mut m, vec![hunk("a", Status::Pending)], false);
         assert_eq!(m.hunks[0].status, Status::Pending);
         assert_eq!(report.warnings.len(), 1);
     }
@@ -546,6 +662,7 @@ mod tests {
         let report = reconcile(
             &mut m,
             vec![hunk("a", Status::Pending), hunk("b", Status::Pending)],
+            false,
         );
         assert_eq!(report.added, 1);
         assert_eq!(m.hunks.len(), 2);
@@ -559,7 +676,7 @@ mod tests {
         let mut m = manifest_with(vec![h.clone()]);
         // Its region still differs, so it is in every fresh set, forever.
         for round in 0..10 {
-            let report = reconcile(&mut m, vec![hunk("a", Status::Pending)]);
+            let report = reconcile(&mut m, vec![hunk("a", Status::Pending)], false);
             assert_eq!(
                 m.hunks.len(),
                 1,
@@ -589,7 +706,7 @@ mod tests {
         });
         let mut m = manifest_with(vec![h]);
         for round in 0..10 {
-            reconcile(&mut m, vec![hunk("a", Status::Pending)]);
+            reconcile(&mut m, vec![hunk("a", Status::Pending)], false);
             assert_eq!(m.hunks.len(), 1, "round {round}");
             assert_eq!(m.hunks[0].status, Status::Diverged, "round {round}");
             assert!(
@@ -608,7 +725,7 @@ mod tests {
         let mut m = manifest_with(vec![skipped.clone()]);
         let reworked = hunk("b", Status::Pending);
 
-        let report = reconcile(&mut m, vec![reworked.clone()]);
+        let report = reconcile(&mut m, vec![reworked.clone()], false);
 
         assert_eq!(report.added, 1);
         assert_eq!(m.hunks.len(), 2);
@@ -644,7 +761,7 @@ mod tests {
         assert_ne!(fresh.id, m.hunks[0].id, "the fixture must have a new ID");
 
         for round in 0..5 {
-            let report = reconcile(&mut m, vec![fresh.clone()]);
+            let report = reconcile(&mut m, vec![fresh.clone()], false);
             assert_eq!(
                 report.added, 0,
                 "round {round}: the decision was already made"
@@ -676,7 +793,7 @@ mod tests {
             &fresh.context_after,
         );
 
-        let report = reconcile(&mut m, vec![fresh]);
+        let report = reconcile(&mut m, vec![fresh], false);
         assert_eq!(report.added, 1, "a different proposal is genuinely new");
         assert_eq!(m.pending().count(), 1);
     }
@@ -695,7 +812,7 @@ mod tests {
             hunk("diverged", Status::Pending),
         ];
         for _ in 0..5 {
-            let report = reconcile(&mut m, fresh.clone());
+            let report = reconcile(&mut m, fresh.clone(), false);
             assert_eq!(report.added, 0, "nothing new should ever be added");
             assert_eq!(m.pending().count(), 0, "the queue must stay empty");
             assert_eq!(m.hunks.len(), 3);
@@ -749,5 +866,174 @@ mod tests {
         // And an unranked hunk sorts after every ranked one.
         let order: Vec<_> = m.queue_view().iter().map(|h| h.file.clone()).collect();
         assert_eq!(order, vec!["zzz.rs", "aaa.rs"]);
+    }
+
+    // ------------------------------------------------ unanswered divergence
+
+    /// A pending hunk carrying an unanswered question, plus the fresh hunk the
+    /// trees now produce for that same region: (what they typed → proposal).
+    fn open_question() -> (Hunk, Hunk) {
+        let mut asked = hunk_with("m.py", &["    was()"], &["    proposal()"], Status::Pending);
+        asked.pending_divergence = Some(Divergence {
+            proposed: vec!["    proposal()".into()],
+            actual: vec!["    mine()".into()],
+        });
+        // Their text is already in the tree, so the diff has moved on.
+        let fresh = hunk_with(
+            "m.py",
+            &["    mine()"],
+            &["    proposal()"],
+            Status::Pending,
+        );
+        assert_ne!(asked.id, fresh.id, "the region re-ids once they type");
+        (asked, fresh)
+    }
+
+    #[test]
+    fn an_unanswered_divergence_survives_a_recompute_that_no_longer_lists_it() {
+        // Rule 5 would drop it: its id is absent from `fresh` the moment the
+        // user's own text lands in the real tree. Dropping a question the user
+        // is still deciding about loses their work silently.
+        let (asked, _) = open_question();
+        let mut m = manifest_with(vec![asked.clone()]);
+
+        let report = reconcile(&mut m, vec![], false);
+
+        assert_eq!(report.dropped, 0, "the question must not be dropped");
+        assert_eq!(m.hunks.len(), 1);
+        assert!(m.hunks[0].pending_divergence.is_some());
+    }
+
+    #[test]
+    fn the_same_question_is_not_appended_a_second_time() {
+        let (asked, fresh) = open_question();
+        let mut m = manifest_with(vec![asked.clone()]);
+
+        for round in 0..5 {
+            let report = reconcile(&mut m, vec![fresh.clone()], false);
+            assert_eq!(report.added, 0, "round {round}: one question, one entry");
+            assert_eq!(m.hunks.len(), 1, "round {round}");
+            assert_eq!(
+                m.hunks[0].id, asked.id,
+                "round {round}: the entry the user was told to resolve survives"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuinely_new_proposal_while_a_question_is_open_is_still_appended() {
+        // The narrowness guard. Suppression keys on the question's content, so
+        // the agent reworking that region must still reach the queue.
+        let (asked, _) = open_question();
+        let mut m = manifest_with(vec![asked]);
+        let reworked = hunk_with(
+            "m.py",
+            &["    mine()"],
+            &["    something_else()"],
+            Status::Pending,
+        );
+
+        let report = reconcile(&mut m, vec![reworked], false);
+
+        assert_eq!(
+            report.added, 1,
+            "a different proposal is a different question"
+        );
+        assert_eq!(m.hunks.len(), 2);
+    }
+
+    #[test]
+    fn fixing_the_text_clears_the_question_before_the_retain_can_strand_it() {
+        // The third touch point. If the user types the proposal correctly
+        // instead of answering, the region matches the shadow and `fresh` is
+        // empty — so the retain guard above would keep a pending entry alive
+        // forever. The engine's ordering is what prevents it: the terminal
+        // status is committed first, and a typed hunk is not pending.
+        let (mut asked, _) = open_question();
+        asked.status = Status::Typed;
+        asked.pending_divergence = None;
+        let mut m = manifest_with(vec![asked]);
+
+        let report = reconcile(&mut m, vec![], false);
+
+        assert_eq!(report.added, 0);
+        assert_eq!(m.pending().count(), 0, "nothing is stranded in the queue");
+        assert_eq!(m.count(Status::Typed), 1, "history is kept");
+    }
+
+    // ------------------------------------------------ whitespace phantom
+
+    /// A typed hunk, and the phantom the trees then produce because the user's
+    /// line carries a trailing space the byte comparison will not forgive.
+    fn phantom() -> (Hunk, Hunk) {
+        let typed = hunk_with("m.py", &["    was()"], &["    two();"], Status::Typed);
+        let fresh = hunk_with("m.py", &["    two();   "], &["    two();"], Status::Pending);
+        (typed, fresh)
+    }
+
+    #[test]
+    fn a_trailing_whitespace_phantom_does_not_re_enter_the_queue() {
+        let (typed, fresh) = phantom();
+        let mut m = manifest_with(vec![typed]);
+
+        for round in 0..5 {
+            let report = reconcile(&mut m, vec![fresh.clone()], false);
+            assert_eq!(
+                report.added, 0,
+                "round {round}: a trailing space is not a hunk"
+            );
+            assert_eq!(m.pending().count(), 0, "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_whitespace_phantom_is_still_offered_under_strict_whitespace() {
+        // Asking for strictness means asking for exactly this hunk.
+        let (typed, fresh) = phantom();
+        let mut m = manifest_with(vec![typed]);
+
+        let report = reconcile(&mut m, vec![fresh], true);
+
+        assert_eq!(report.added, 1);
+        assert_eq!(m.pending().count(), 1);
+    }
+
+    #[test]
+    fn a_real_edit_to_a_typed_region_is_not_mistaken_for_a_phantom() {
+        // The phantom rule must not swallow the agent genuinely changing its
+        // mind about a region the user already typed.
+        let (typed, _) = phantom();
+        let mut m = manifest_with(vec![typed]);
+        let real = hunk_with("m.py", &["    two();"], &["    three();"], Status::Pending);
+
+        let report = reconcile(&mut m, vec![real], false);
+
+        assert_eq!(
+            report.added, 1,
+            "old and new differ by more than whitespace"
+        );
+    }
+
+    // ------------------------------------------------ state promotion
+
+    #[test]
+    fn a_working_session_becomes_transcribing_once_the_queue_is_not_empty() {
+        let mut m = manifest_with(vec![]);
+        m.state = State::Working;
+        promote_state(&mut m);
+        assert_eq!(
+            m.state,
+            State::Working,
+            "an empty queue is still just working"
+        );
+
+        m.hunks.push(hunk("a", Status::Pending));
+        promote_state(&mut m);
+        assert_eq!(m.state, State::Transcribing);
+
+        // It never travels backwards once the queue drains.
+        m.hunks[0].status = Status::Typed;
+        promote_state(&mut m);
+        assert_eq!(m.state, State::Transcribing);
     }
 }

@@ -139,7 +139,7 @@ pub enum Classification {
     Diverged { actual: Vec<String> },
 }
 
-fn lines_eq(a: &[String], b: &[String], strict_whitespace: bool) -> bool {
+pub(crate) fn lines_eq(a: &[String], b: &[String], strict_whitespace: bool) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -154,8 +154,69 @@ fn lines_eq(a: &[String], b: &[String], strict_whitespace: bool) -> bool {
     })
 }
 
+/// Does `needle` appear as a run of lines somewhere in `haystack`?
+///
+/// Built on `lines_eq` rather than on `find_all`'s fuzzy mode, and the
+/// difference is not cosmetic: fuzzy matching trims *both* ends, so it treats a
+/// change in indentation as a match. Indentation is meaning. This is the same
+/// tolerance `classify` applied when it decided a hunk was typed, which is the
+/// point — the whitespace-phantom rule in `reconcile` has to ask exactly the
+/// question `classify` already answered, or the two disagree and a hunk
+/// oscillates between typed and pending forever.
+pub(crate) fn is_subrun(haystack: &[String], needle: &[String], strict_whitespace: bool) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    (0..=haystack.len() - needle.len())
+        .any(|i| lines_eq(&haystack[i..i + needle.len()], needle, strict_whitespace))
+}
+
+/// Is `actual` a plausible half-finished transcription of `proposal`?
+///
+/// True when `actual` is a line-wise prefix of `proposal`, with the final line
+/// allowed to be a character prefix of its counterpart. That is exactly what
+/// typing top to bottom looks like at any instant, and typing top to bottom is
+/// what transcription *is*.
+///
+/// This exists because `classify` has no in-progress state: mid-hunk the region
+/// equals neither the proposal nor the original, so it returns `Diverged` and a
+/// watcher would raise a divergence question on every keystroke-flush. The
+/// naive alternative — waiting a fixed time after each save and asking then —
+/// still interrupts a slow typist who pauses to think. A prefix cannot be a
+/// disagreement; it can only be an unfinished agreement.
+///
+/// Deliberately not sufficient on its own: someone who types bottom-up, or
+/// pastes the middle of a hunk, is never a prefix. The caller pairs this with a
+/// quiescence window so those cases can still reach a question.
+pub fn is_in_progress(actual: &[String], proposal: &[String], strict_whitespace: bool) -> bool {
+    if actual.len() > proposal.len() {
+        return false;
+    }
+    // An empty region is the state before the first keystroke.
+    let Some((last, head)) = actual.split_last() else {
+        return true;
+    };
+    if !lines_eq(head, &proposal[..head.len()], strict_whitespace) {
+        return false;
+    }
+    let target = &proposal[head.len()];
+    // The line under the cursor: a prefix of where it is going. Compared
+    // untrimmed on the left because leading whitespace is indentation, and
+    // trimmed on the right because a half-typed line has no trailing content
+    // to speak of yet.
+    let typed = if strict_whitespace {
+        last.as_str()
+    } else {
+        last.trim_end()
+    };
+    target.starts_with(typed)
+}
+
 /// Read the region this hunk owns, given where it starts.
-fn region<'a>(
+pub(crate) fn region<'a>(
     file_lines: &'a [String],
     start: usize,
     hunk: &Hunk,
@@ -476,6 +537,80 @@ mod tests {
         let a = find_anchor(&file, &h);
         assert_eq!(a.via, AnchorVia::Hint);
         assert_eq!(a.line, 2);
+    }
+
+    #[test]
+    fn a_partial_transcription_reads_as_in_progress() {
+        let proposal = lines(&["    one();", "    two();", "    three();"]);
+        // Nothing typed yet.
+        assert!(is_in_progress(&[], &proposal, false));
+        // A whole line down.
+        assert!(is_in_progress(&lines(&["    one();"]), &proposal, false));
+        // Two whole lines down.
+        assert!(is_in_progress(
+            &lines(&["    one();", "    two();"]),
+            &proposal,
+            false
+        ));
+        // All of it — the caller checks `Typed` first, so this overlapping.
+        assert!(is_in_progress(&proposal, &proposal, false));
+    }
+
+    #[test]
+    fn a_partial_last_line_reads_as_in_progress() {
+        // The line under the cursor, half typed. This is the common case and
+        // the one a naive watcher calls a divergence.
+        let proposal = lines(&["    tags = TagManager()"]);
+        for typed in ["", "    ", "    tag", "    tags = Tag"] {
+            assert!(
+                is_in_progress(&lines(&[typed]), &proposal, false),
+                "{typed:?} is on its way to the proposal"
+            );
+        }
+        // Indentation is meaning: the wrong leading whitespace is not a prefix.
+        assert!(!is_in_progress(&lines(&["tags = Tag"]), &proposal, false));
+    }
+
+    #[test]
+    fn a_wrong_line_is_not_in_progress() {
+        let proposal = lines(&["    one();", "    two();"]);
+        // Diverges on the very first line.
+        assert!(!is_in_progress(&lines(&["    won();"]), &proposal, false));
+        // First line agrees, second does not.
+        assert!(!is_in_progress(
+            &lines(&["    one();", "    tvo();"]),
+            &proposal,
+            false
+        ));
+        // Longer than the proposal cannot be a prefix of it.
+        assert!(!is_in_progress(
+            &lines(&["    one();", "    two();", "    three();"]),
+            &proposal,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_complete_but_different_region_is_not_in_progress() {
+        // The case the grace window exists for: a finished line that simply
+        // disagrees. No prefix relationship, so only quiescence can decide.
+        let proposal = lines(&["    tags = TagManager()"]);
+        let mine = lines(&["    tags = TaggableManager()"]);
+        assert!(!is_in_progress(&mine, &proposal, false));
+    }
+
+    #[test]
+    fn is_subrun_finds_a_run_and_tolerates_trailing_whitespace() {
+        let hay = lines(&["a", "    two();   ", "b"]);
+        assert!(is_subrun(&hay, &lines(&["    two();"]), false));
+        assert!(!is_subrun(&hay, &lines(&["    two();"]), true));
+        assert!(is_subrun(&hay, &lines(&["a", "    two();"]), false));
+        assert!(!is_subrun(&hay, &lines(&["b", "a"]), false));
+        // Unlike fuzzy anchoring, indentation is never tolerated.
+        assert!(!is_subrun(&hay, &lines(&["two();"]), false));
+        // An empty needle is vacuously present; an over-long one cannot be.
+        assert!(is_subrun(&hay, &[], false));
+        assert!(!is_subrun(&lines(&["a"]), &lines(&["a", "b"]), false));
     }
 
     #[test]
