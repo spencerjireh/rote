@@ -122,6 +122,19 @@ pub fn observe(
         Classification::Typed => Observation::Typed,
         Classification::Untouched => Observation::Untouched,
         Classification::Diverged { actual } => {
+            // `classify` decides "untouched" by comparing the whole file, which
+            // is right for one editor session over one hunk and wrong for a
+            // watcher: a file usually holds several hunks, so editing any one
+            // of them makes every other hunk in it look touched. Untouched text
+            // is rarely a prefix of its proposal, so each of those would arm a
+            // question about work the user has not started.
+            //
+            // The narrower question is the correct one here: did *this region*
+            // move? Note this cannot swallow a botched transcription — that
+            // leaves the region different from where it started, by definition.
+            if present::region_of(before, hunk) == actual {
+                return Observation::Untouched;
+            }
             if present::is_in_progress(&actual, &hunk.new_lines, strict_whitespace) {
                 Observation::InProgress
             } else {

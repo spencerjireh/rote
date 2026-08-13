@@ -191,6 +191,43 @@ fn typing_one_hunk_does_not_raise_a_question_about_its_neighbour() {
 }
 
 #[test]
+fn starting_one_hunk_does_not_accuse_the_untouched_hunks_beside_it() {
+    // Caught by hand, not by the suite. `classify` decides "untouched" by
+    // comparing the whole file, which is right for one editor session over one
+    // hunk and wrong for a watcher: a file usually holds several hunks, so
+    // typing a single character into one made every other hunk in the file look
+    // touched — and untouched text is rarely a prefix of its proposal, so each
+    // of them armed a question about work not yet begun.
+    let (fx, _cfg, mut engine) = started(
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+        "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nNINE\nten\n",
+    );
+    engine.step(None, Tick(0)).unwrap();
+    assert_eq!(manifest(&fx).pending().count(), 2);
+
+    // Begin the first hunk. Nothing is finished, and the second is untouched.
+    fx.write(
+        "a.rs",
+        "one\nTW\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+    );
+    engine.step(Some(changed()), Tick(100)).unwrap();
+    engine.step(None, Tick(100_000)).unwrap();
+
+    let m = manifest(&fx);
+    let accused: Vec<&Vec<String>> = m
+        .hunks
+        .iter()
+        .filter(|h| h.pending_divergence.is_some())
+        .map(|h| &h.new_lines)
+        .collect();
+    assert!(
+        accused.is_empty(),
+        "typing into a file must not raise questions about the rest of it: {accused:?}"
+    );
+    assert_eq!(m.count(Status::Typed), 0, "nothing was finished");
+}
+
+#[test]
 fn a_save_that_changes_nothing_relevant_does_not_re_diff_the_trees() {
     // The fast path exists so the keystroke loop never shells out to git. A
     // save that types nothing changes no status, so nothing needs recomputing.

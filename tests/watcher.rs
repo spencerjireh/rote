@@ -29,7 +29,7 @@ fn a_real_write_reaches_the_engine() {
     std::fs::create_dir_all(&project.shadow_dir).unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
-    let _watch = watcher::spawn(&project, &cfg, tx).expect("a watcher");
+    let _watch = watcher::spawn(&project, &cfg, move |ev| tx.send(ev).is_ok()).expect("a watcher");
 
     // Give the platform a moment to register the recursive watch before the
     // write, or the event can genuinely predate the subscription.
@@ -66,7 +66,7 @@ fn writes_under_git_never_reach_the_engine() {
     std::fs::create_dir_all(&project.shadow_dir).unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
-    let _watch = watcher::spawn(&project, &cfg, tx).expect("a watcher");
+    let _watch = watcher::spawn(&project, &cfg, move |ev| tx.send(ev).is_ok()).expect("a watcher");
     std::thread::sleep(Duration::from_millis(300));
 
     std::fs::write(project.repo_root.join(".git/ROTE_TEST"), "noise").unwrap();

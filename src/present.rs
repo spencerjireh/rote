@@ -237,6 +237,17 @@ pub(crate) fn region<'a>(
     &file_lines[start..end]
 }
 
+/// The lines this hunk owns, as the file currently stands.
+///
+/// Anchors and extracts in one step, which is what a caller almost always
+/// wants. Exposed so the watch engine can ask whether *this region* moved
+/// rather than whether *the file* moved — an edit anywhere in a file makes
+/// `classify`'s whole-file comparison say "touched" for every hunk in it.
+pub fn region_of(file_lines: &[String], hunk: &Hunk) -> Vec<String> {
+    let anchor = find_anchor(file_lines, hunk);
+    region(file_lines, anchor.index(), hunk, hunk.new_lines.len()).to_vec()
+}
+
 /// Decide what the user did, by comparing the file before and after. DESIGN.md §6.
 ///
 /// "Untouched" is decided by comparing against `before` rather than by checking

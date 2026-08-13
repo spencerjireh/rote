@@ -12,6 +12,7 @@ pub mod diffparse;
 pub mod engine;
 pub mod git;
 pub mod hunks;
+pub mod pane;
 pub mod paths;
 pub mod present;
 pub mod review;

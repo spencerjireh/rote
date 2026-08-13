@@ -125,6 +125,13 @@ impl ProjectPaths {
         self.state_dir.join("session.json.lock")
     }
 
+    /// Held for a whole `rote watch` session, unlike `lock_path`, which is
+    /// taken and released around each manifest write. They must be separate
+    /// files: the pane writes through the manifest lock constantly.
+    pub fn watch_lock_path(&self) -> PathBuf {
+        self.state_dir.join("watch.lock")
+    }
+
     pub fn baseline_patch(&self) -> PathBuf {
         self.state_dir.join("baseline.patch")
     }

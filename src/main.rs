@@ -4,6 +4,7 @@ use rote::config::{self, Config};
 use rote::detect;
 use rote::git;
 use rote::hunks::{Divergence, Op, Status};
+use rote::pane;
 use rote::paths::{self, Lock, ProjectPaths};
 use rote::present::{self, Classification};
 use rote::review;
@@ -69,6 +70,20 @@ enum Command {
 
     /// Re-print the most recently presented hunk. Display only; changes nothing.
     Back,
+
+    /// Watch your tree and classify as you type. The transcription loop.
+    Watch {
+        /// Print frames instead of taking the terminal. Inferred off a pipe.
+        #[arg(long)]
+        headless: bool,
+        /// Exit once the queue is empty, instead of waiting for more work.
+        #[arg(long, hide = true)]
+        exit_when_empty: bool,
+        /// Give up after this many milliseconds. A wedged watcher should fail
+        /// a test rather than hang the machine running it.
+        #[arg(long, hide = true)]
+        timeout: Option<u64>,
+    },
 
     /// Leave a hunk untyped. Defaults to the active one.
     Skip {
@@ -205,6 +220,22 @@ fn run() -> Result<ExitCode> {
         }
         Command::Back => {
             cmd_back(&project, color)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Watch {
+            headless,
+            exit_when_empty,
+            timeout,
+        } => {
+            cmd_watch(
+                &project,
+                &cfg,
+                pane::Options {
+                    headless,
+                    exit_when_empty,
+                    timeout_ms: timeout,
+                },
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Skip { hunk_id } => {
@@ -710,6 +741,15 @@ fn cmd_done(
         }
     }
     Ok(())
+}
+
+/// The transcription loop: watch, classify, advance.
+fn cmd_watch(project: &ProjectPaths, cfg: &Config, opts: pane::Options) -> Result<()> {
+    // A rebase or merge in flight makes every classification nonsense, and the
+    // pane would report it confidently. Refuse before taking the terminal.
+    shadow::ensure_no_operation_in_progress(project)?;
+    Manifest::require(project)?;
+    pane::run(project, cfg, opts)
 }
 
 /// Recompute, then present the head of the queue.

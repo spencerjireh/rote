@@ -166,6 +166,33 @@ impl Cli {
         child.wait_with_output().unwrap()
     }
 
+    /// Start a command and leave it running.
+    ///
+    /// The first thing in this suite that outlives a single call — `rote watch`
+    /// is a loop, so a test has to run alongside it rather than after it. Stdin
+    /// is null so the pane never takes raw mode.
+    pub fn spawn(&self, args: &[&str]) -> std::process::Child {
+        let path = format!(
+            "{}:{}",
+            self.bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Command::new(rote_bin())
+            .args(args)
+            .current_dir(&self.fx.repo)
+            .env("PATH", path)
+            .env("XDG_CACHE_HOME", &self.fx.xdg_cache)
+            .env("XDG_DATA_HOME", &self.fx.xdg_data)
+            .env("XDG_CONFIG_HOME", &self.fx.xdg_config)
+            .env("NO_COLOR", "1")
+            .env_remove("ROTE_EDITOR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
     pub fn shadow(&self) -> PathBuf {
         self.fx.project().shadow_dir
     }

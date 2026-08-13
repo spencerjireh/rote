@@ -23,7 +23,6 @@ use anyhow::{Context, Result};
 use globset::GlobSet;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 
 /// The compiled filter, kept beside the watcher so a path is classified without
 /// recompiling a glob set per event.
@@ -100,7 +99,15 @@ pub struct Watch {
 /// agent, asking for rework, and flipping away again shows up in the pane
 /// without anyone running a command — the "argue with it and carry on" story in
 /// DESIGN.md §5, which was only true on paper while recompute was manual.
-pub fn spawn(project: &ProjectPaths, cfg: &Config, out: Sender<EngineEvent>) -> Result<Watch> {
+/// `sink` returns false when the consumer has gone away, which stops the pump.
+/// A closure rather than a `Sender<EngineEvent>` so a caller can wrap events in
+/// its own type without a bridging thread — the pane multiplexes these with
+/// keystrokes.
+pub fn spawn(
+    project: &ProjectPaths,
+    cfg: &Config,
+    sink: impl Fn(EngineEvent) -> bool + Send + 'static,
+) -> Result<Watch> {
     let filter = Filter::new(project, cfg)?;
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
 
@@ -123,7 +130,7 @@ pub fn spawn(project: &ProjectPaths, cfg: &Config, out: Sender<EngineEvent>) -> 
                     let mut ok = true;
                     for path in ev.paths {
                         if let Some((origin, rel)) = filter.classify(&path) {
-                            if out.send(EngineEvent::Changed(origin, rel)).is_err() {
+                            if !sink(EngineEvent::Changed(origin, rel)) {
                                 ok = false;
                                 break;
                             }
@@ -134,7 +141,7 @@ pub fn spawn(project: &ProjectPaths, cfg: &Config, out: Sender<EngineEvent>) -> 
                 // A watch-limit exhaustion or an unreadable directory. Report it
                 // and let the engine fall back to polling rather than dying:
                 // a session with a broken watcher is still a session.
-                Err(e) => out.send(EngineEvent::WatchError(e.to_string())).is_ok(),
+                Err(e) => sink(EngineEvent::WatchError(e.to_string())),
             };
             if !sent {
                 return; // the engine hung up
