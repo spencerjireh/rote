@@ -3,110 +3,20 @@
 
 mod common;
 
+use common::cli::{claude_stub_with_help as claude_stub, rote_bin, stderr, stdout, Cli};
 use common::Fixture;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn rote_bin() -> PathBuf {
-    let mut p = std::env::current_exe().unwrap();
-    p.pop();
-    p.pop();
-    p.join("rote")
-}
-
-fn write_exec(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(path, perms).unwrap();
-}
-
-/// A `claude` stand-in whose `--help` advertises the tool-restriction flag.
-fn claude_stub(dir: &Path) -> PathBuf {
-    let p = dir.join("claude-stub");
-    write_exec(
-        &p,
-        "#!/bin/sh\n\
-         case \"$1\" in --help) echo '  --tools <tools...>  Use \"\" to disable all tools';; esac\n\
-         exit 0\n",
-    );
-    p
-}
-
-struct Run {
-    fx: Fixture,
-    /// Extra directory prepended to PATH, for stubbing binaries.
-    bin: PathBuf,
-}
-
-impl Run {
-    fn new() -> Self {
-        let fx = Fixture::new();
-        let bin = fx.root.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        Self { fx, bin }
-    }
-
-    fn cmd(&self, args: &[&str], cwd: &Path) -> Output {
-        self.cmd_with_input(args, cwd, "")
-    }
-
-    fn cmd_with_input(&self, args: &[&str], cwd: &Path, stdin_text: &str) -> Output {
-        use std::io::Write as _;
-        let path = format!(
-            "{}:{}",
-            self.bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let mut child = Command::new(rote_bin())
-            .args(args)
-            .current_dir(cwd)
-            .env("PATH", path)
-            .env("XDG_CACHE_HOME", &self.fx.xdg_cache)
-            .env("XDG_DATA_HOME", &self.fx.xdg_data)
-            .env("XDG_CONFIG_HOME", &self.fx.xdg_config)
-            .env("NO_COLOR", "1")
-            .env_remove("ROTE_EDITOR")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(stdin_text.as_bytes())
-            .unwrap();
-        drop(child.stdin.take());
-        child.wait_with_output().unwrap()
-    }
-
-    fn in_repo(&self, args: &[&str]) -> Output {
-        self.cmd(args, &self.fx.repo)
-    }
-
-    fn global_config(&self) -> PathBuf {
-        self.fx.xdg_config.join("rote/config.toml")
-    }
-}
-
-fn stdout(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
+use std::path::Path;
+use std::process::Command;
 
 // ---------------------------------------------------------------- doctor
 
 #[test]
 fn doctor_runs_outside_a_repository_and_marks_repo_lines_unavailable() {
-    let r = Run::new();
+    let r = Cli::new();
     let elsewhere = r.fx.root.path().join("not-a-repo");
     std::fs::create_dir_all(&elsewhere).unwrap();
 
-    let out = r.cmd(&["doctor"], &elsewhere);
+    let out = r.run_in(&["doctor"], &elsewhere);
     let text = stdout(&out);
 
     // Machine-level checks still report.
@@ -123,7 +33,7 @@ fn doctor_runs_outside_a_repository_and_marks_repo_lines_unavailable() {
 
 #[test]
 fn doctor_reports_a_missing_claude_and_exits_nonzero() {
-    let r = Run::new();
+    let r = Cli::new();
     // Point claude_cmd at something that cannot resolve.
     std::fs::create_dir_all(r.global_config().parent().unwrap()).unwrap();
     std::fs::write(
@@ -132,7 +42,7 @@ fn doctor_reports_a_missing_claude_and_exits_nonzero() {
     )
     .unwrap();
 
-    let out = r.in_repo(&["doctor"]);
+    let out = r.run(&["doctor"]);
     let text = stdout(&out);
 
     assert!(text.contains("not on PATH"), "{text}");
@@ -147,7 +57,7 @@ fn doctor_reports_a_missing_claude_and_exits_nonzero() {
 
 #[test]
 fn doctor_passes_when_everything_resolves() {
-    let r = Run::new();
+    let r = Cli::new();
     r.fx.write("a.rs", "fn a() {}\n");
     r.fx.commit_all("initial");
     r.fx.write(".rote.toml", "[checks]\ncommands = [\"true\"]\n");
@@ -160,7 +70,7 @@ fn doctor_passes_when_everything_resolves() {
     )
     .unwrap();
 
-    let out = r.in_repo(&["doctor"]);
+    let out = r.run(&["doctor"]);
     let text = stdout(&out);
 
     assert!(out.status.success(), "{text}\n{}", stderr(&out));
@@ -178,7 +88,7 @@ fn doctor_passes_when_everything_resolves() {
 
 #[test]
 fn doctor_flags_a_repo_with_no_commits() {
-    let r = Run::new();
+    let r = Cli::new();
     let stub = claude_stub(&r.bin);
     std::fs::create_dir_all(r.global_config().parent().unwrap()).unwrap();
     std::fs::write(
@@ -188,7 +98,7 @@ fn doctor_flags_a_repo_with_no_commits() {
     .unwrap();
 
     // Fixture repo is initialized but has no commit yet.
-    let out = r.in_repo(&["doctor"]);
+    let out = r.run(&["doctor"]);
     let text = stdout(&out);
     assert!(text.contains("no commits yet"), "{text}");
     assert!(!out.status.success());
@@ -196,11 +106,11 @@ fn doctor_flags_a_repo_with_no_commits() {
 
 #[test]
 fn doctor_reports_a_missing_global_config_and_points_at_setup() {
-    let r = Run::new();
+    let r = Cli::new();
     r.fx.write("a.rs", "fn a() {}\n");
     r.fx.commit_all("initial");
 
-    let text = stdout(&r.in_repo(&["doctor"]));
+    let text = stdout(&r.run(&["doctor"]));
     assert!(text.contains("global config"), "{text}");
     assert!(text.contains("missing"), "{text}");
     assert!(text.contains("→ rote setup"), "{text}");
@@ -210,8 +120,8 @@ fn doctor_reports_a_missing_global_config_and_points_at_setup() {
 
 #[test]
 fn setup_writes_a_config_that_loads_back() {
-    let r = Run::new();
-    let out = r.in_repo(&["setup"]);
+    let r = Cli::new();
+    let out = r.run(&["setup"]);
     assert!(out.status.success(), "{}", stderr(&out));
 
     let path = r.global_config();
@@ -226,10 +136,10 @@ fn setup_writes_a_config_that_loads_back() {
 
 #[test]
 fn setup_refuses_to_overwrite_without_force() {
-    let r = Run::new();
-    assert!(r.in_repo(&["setup"]).status.success());
+    let r = Cli::new();
+    assert!(r.run(&["setup"]).status.success());
 
-    let second = r.in_repo(&["setup"]);
+    let second = r.run(&["setup"]);
     assert!(!second.status.success());
     assert!(
         stderr(&second).contains("already exists"),
@@ -238,23 +148,23 @@ fn setup_refuses_to_overwrite_without_force() {
     );
     assert!(stderr(&second).contains("--force"), "{}", stderr(&second));
 
-    assert!(r.in_repo(&["setup", "--force"]).status.success());
+    assert!(r.run(&["setup", "--force"]).status.success());
 }
 
 #[test]
 fn setup_works_outside_a_repository() {
-    let r = Run::new();
+    let r = Cli::new();
     let elsewhere = r.fx.root.path().join("no-repo-here");
     std::fs::create_dir_all(&elsewhere).unwrap();
 
-    let out = r.cmd(&["setup"], &elsewhere);
+    let out = r.run_in(&["setup"], &elsewhere);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(r.global_config().is_file());
 }
 
 #[test]
 fn setup_preserves_a_detected_claude_path() {
-    let r = Run::new();
+    let r = Cli::new();
     let stub = claude_stub(&r.bin);
     std::fs::create_dir_all(r.global_config().parent().unwrap()).unwrap();
     std::fs::write(
@@ -263,7 +173,7 @@ fn setup_preserves_a_detected_claude_path() {
     )
     .unwrap();
 
-    assert!(r.in_repo(&["setup", "--force"]).status.success());
+    assert!(r.run(&["setup", "--force"]).status.success());
     let cfg = rote::config::Config::load(&r.global_config(), Path::new("/nonexistent")).unwrap();
     assert_eq!(
         cfg.claude_cmd,
@@ -276,14 +186,14 @@ fn setup_preserves_a_detected_claude_path() {
 
 #[test]
 fn init_prefills_checks_for_a_rust_project() {
-    let r = Run::new();
+    let r = Cli::new();
     r.fx.write(
         "Cargo.toml",
         "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
     );
     r.fx.commit_all("initial");
 
-    let out = r.in_repo(&["init"]);
+    let out = r.run(&["init"]);
     let text = stdout(&out);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(text.contains("detected a Rust project"), "{text}");
@@ -314,14 +224,14 @@ fn init_prefills_checks_for_a_rust_project() {
 
 #[test]
 fn init_prefills_from_package_json_scripts() {
-    let r = Run::new();
+    let r = Cli::new();
     r.fx.write(
         "package.json",
         r#"{"scripts":{"test":"jest","lint":"eslint ."}}"#,
     );
     r.fx.commit_all("initial");
 
-    let text = stdout(&r.in_repo(&["init"]));
+    let text = stdout(&r.run(&["init"]));
     assert!(text.contains("detected a Node project"), "{text}");
 
     let body = r.fx.read(".rote.toml");
@@ -332,11 +242,11 @@ fn init_prefills_from_package_json_scripts() {
 
 #[test]
 fn init_says_so_when_it_recognizes_nothing() {
-    let r = Run::new();
+    let r = Cli::new();
     r.fx.write("README.md", "# just docs\n");
     r.fx.commit_all("initial");
 
-    let text = stdout(&r.in_repo(&["init"]));
+    let text = stdout(&r.run(&["init"]));
     assert!(text.contains("no project type detected"), "{text}");
 
     let body = r.fx.read(".rote.toml");
@@ -349,12 +259,12 @@ fn init_says_so_when_it_recognizes_nothing() {
 
 #[test]
 fn init_still_refuses_to_overwrite_without_force() {
-    let r = Run::new();
+    let r = Cli::new();
     r.fx.write("Cargo.toml", "[package]\nname = \"x\"\n");
     r.fx.commit_all("initial");
 
-    assert!(r.in_repo(&["init"]).status.success());
-    let second = r.in_repo(&["init"]);
+    assert!(r.run(&["init"]).status.success());
+    let second = r.run(&["init"]);
     assert!(!second.status.success());
     assert!(stderr(&second).contains("--force"), "{}", stderr(&second));
 }
@@ -363,7 +273,7 @@ fn init_still_refuses_to_overwrite_without_force() {
 
 #[test]
 fn start_refuses_when_claude_does_not_resolve_and_names_doctor() {
-    let r = Run::new();
+    let r = Cli::new();
     r.fx.write("a.rs", "fn a() {}\n");
     r.fx.commit_all("initial");
     std::fs::create_dir_all(r.global_config().parent().unwrap()).unwrap();
@@ -373,7 +283,7 @@ fn start_refuses_when_claude_does_not_resolve_and_names_doctor() {
     )
     .unwrap();
 
-    let out = r.in_repo(&["start", "some task"]);
+    let out = r.run(&["start", "some task"]);
     assert!(!out.status.success());
     let err = stderr(&out);
     assert!(err.contains("not on PATH"), "{err}");
@@ -393,13 +303,13 @@ fn start_refuses_when_claude_does_not_resolve_and_names_doctor() {
 fn start_no_launch_does_not_require_claude() {
     // --no-launch never execs, so a missing claude must not block it — this is
     // what every other integration test depends on.
-    let r = Run::new();
+    let r = Cli::new();
     r.fx.write("a.rs", "fn a() {}\n");
     r.fx.commit_all("initial");
     std::fs::create_dir_all(r.global_config().parent().unwrap()).unwrap();
     std::fs::write(r.global_config(), "claude_cmd = [\"nope-not-real\"]\n").unwrap();
 
-    let out = r.in_repo(&["start", "--no-launch", "t"]);
+    let out = r.run(&["start", "--no-launch", "t"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(r.fx.project().session_json().exists());
 }

@@ -103,7 +103,7 @@ are re-offered as new ones.
 | `rote status` | State, task, age, shadow path, hunk counts. |
 | `rote next` | Present the next hunk and open your editor on it. |
 | `rote back` | Re-print the last hunk. Display only — changes nothing. |
-| `rote skip` | Leave a hunk untyped. Durable: it will not come back. |
+| `rote skip [HUNK_ID]` | Leave a hunk untyped, defaulting to the active one. Durable: it will not come back. |
 | `rote talk` | Print the shadow path; `--attach` resumes the agent there. |
 | `rote done` | Run checks, review the session, close it. |
 | `rote abort` | Discard the session. Your real tree is untouched. |

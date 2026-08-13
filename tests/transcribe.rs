@@ -3,97 +3,15 @@
 
 mod common;
 
+use common::cli::{scripted_editor, stdout, Cli};
 use common::Fixture;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn rote_bin() -> PathBuf {
-    // The test binary lives in target/<profile>/deps/; rote is two levels up.
-    let mut p = std::env::current_exe().unwrap();
-    p.pop();
-    p.pop();
-    p.join("rote")
-}
-
-/// Write a shell script that acts as `$ROTE_EDITOR`, applying a canned edit.
-///
-/// It ignores the `+LINE` argument and rewrites the whole file, which is all a
-/// test needs: what matters is what lands on disk before rote reads it back.
-fn scripted_editor(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    let script = format!(
-        "#!/bin/sh\n\
-         # last argument is the file; earlier ones may include +LINE\n\
-         for a in \"$@\"; do f=\"$a\"; done\n\
-         cat > \"$f\" <<'ROTE_EOF'\n{body}ROTE_EOF\n",
-    );
-    std::fs::write(&path, script).unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
-    path
-}
-
-struct Cli {
-    fx: Fixture,
-    editor: Option<PathBuf>,
-}
-
-impl Cli {
-    fn new(fx: Fixture) -> Self {
-        Self { fx, editor: None }
-    }
-
-    fn with_editor(mut self, editor: PathBuf) -> Self {
-        self.editor = Some(editor);
-        self
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        self.run_with_input(args, "")
-    }
-
-    fn run_with_input(&self, args: &[&str], stdin_text: &str) -> Output {
-        use std::io::Write as _;
-        let mut cmd = Command::new(rote_bin());
-        cmd.args(args)
-            .current_dir(&self.fx.repo)
-            .env("XDG_CACHE_HOME", &self.fx.xdg_cache)
-            .env("XDG_DATA_HOME", &self.fx.xdg_data)
-            .env("XDG_CONFIG_HOME", &self.fx.xdg_config)
-            .env("NO_COLOR", "1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        if let Some(e) = &self.editor {
-            cmd.env("ROTE_EDITOR", e);
-        }
-        let mut child = cmd.spawn().unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(stdin_text.as_bytes())
-            .unwrap();
-        drop(child.stdin.take());
-        child.wait_with_output().unwrap()
-    }
-
-    fn shadow(&self) -> PathBuf {
-        self.fx.project().shadow_dir
-    }
-}
-
-fn stdout(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
 
 /// A started session whose shadow already holds the agent's edit.
 fn session_with_agent_edit() -> Cli {
     let fx = Fixture::new();
     fx.write("a.rs", "fn a() {\n}\n");
     fx.commit_all("initial");
-    let cli = Cli::new(fx);
+    let cli = Cli::with_fixture(fx);
     let out = cli.run(&["start", "--no-launch", "add work"]);
     assert!(
         out.status.success(),
@@ -251,7 +169,7 @@ fn a_session_holding_a_skip_and_a_divergence_still_terminates() {
         "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
     );
     fx.commit_all("initial");
-    let cli = Cli::new(fx);
+    let cli = Cli::with_fixture(fx);
     cli.run(&["start", "--no-launch", "two edits"]);
     // Two edits far enough apart to be separate hunks.
     std::fs::write(
@@ -331,25 +249,59 @@ fn next_json_emits_one_hunk_and_classifies_nothing() {
 }
 
 #[test]
-fn mark_sets_status_from_outside() {
+fn there_is_no_verb_that_marks_a_hunk_typed() {
+    // `mark` is gone, and nothing replaces it. `Typed` is producible only by the
+    // classifier, whose input is the hunk's own `new_lines` — which came from
+    // the shadow. A front end cannot assert its way to a finished session.
     let cli = session_with_agent_edit();
-    let text = stdout(&cli.run(&["next", "--json"]));
-    let hunk: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-    let id = hunk["id"].as_str().unwrap();
+    let out = cli.run(&["mark", "h-whatever", "typed"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unrecognized subcommand"), "{err}");
+}
 
-    let out = cli.run(&["mark", id, "typed"]);
+#[test]
+fn skip_takes_a_hunk_id_and_skips_that_one() {
+    // Addressed by id, not by position: the head of the queue can move between
+    // the moment a front end renders a hunk and the moment the user skips it.
+    let cli = session_with_agent_edit();
+    cli.fx.write("b.rs", "fn b() {\n}\n");
+    cli.fx.commit_all("second file");
+    std::fs::write(cli.shadow().join("b.rs"), "fn b() {\n    more();\n}\n").unwrap();
+
+    // Build the queue and take the *second* hunk's id.
+    cli.run(&["next", "--json"]);
+    let status = stdout(&cli.run(&["status"]));
+    assert!(status.contains("2 pending"), "{status}");
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    let hunks = manifest["hunks"].as_array().unwrap();
+    let b_id = hunks
+        .iter()
+        .find(|h| h["file"] == "b.rs")
+        .expect("a hunk for b.rs")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = cli.run(&["skip", &b_id]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let status = stdout(&cli.run(&["status"]));
-    assert!(status.contains("1 typed"), "{status}");
+    assert!(stdout(&out).contains("skipped — b.rs"), "{}", stdout(&out));
 
-    // An unknown status is refused rather than silently accepted.
-    let bad = cli.run(&["mark", id, "finished"]);
+    // a.rs is untouched and still pending; only the named hunk was skipped.
+    let status = stdout(&cli.run(&["status"]));
+    assert!(status.contains("1 pending"), "{status}");
+    assert!(status.contains("1 skipped"), "{status}");
+
+    // An unknown id is refused rather than silently skipping the head.
+    let bad = cli.run(&["skip", "h-nosuchhunk"]);
     assert!(!bad.status.success());
-    assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown status"));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("no hunk h-nosuchhunk"));
 }
 
 #[test]
@@ -357,7 +309,7 @@ fn a_generated_file_is_gated_on_bytes_not_typing() {
     let fx = Fixture::new();
     fx.write("Cargo.lock", "version = 3\n");
     fx.commit_all("initial");
-    let cli = Cli::new(fx);
+    let cli = Cli::with_fixture(fx);
     cli.run(&["start", "--no-launch", "add a dep"]);
     std::fs::write(
         cli.shadow().join("Cargo.lock"),

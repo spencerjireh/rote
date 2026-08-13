@@ -44,7 +44,11 @@ Prints: state, task, session age, shadow path, and if `transcribing`/`working`: 
 - Runs **recompute** (§5), takes the first `pending` hunk, renders it (§6), launches the editor, classifies the outcome, updates the manifest, prints one-line progress (`[4/11] typed — src/models.py`).
 - Progress is position within the queue *as it stands after this recompute*, not a fixed target. The denominator moves when the agent reworks something or adds new work; that is expected, and the display should not pretend otherwise.
 - If the queue is empty: prints "nothing to transcribe" and, if all hunks are terminal, suggests `rote done`.
-- Hidden flag `--json`: instead of rendering + launching the editor, emit the next pending hunk as one JSON line (schema = the Hunk object in §4) and exit. This is the v2 nvim-plugin seam. `--json` performs no classification; a matching hidden `rote mark <hunk_id> <status>` sets hunk status externally.
+- Hidden flag `--json`: instead of rendering + launching the editor, emit the next pending hunk as one JSON line (schema = the Hunk object in §4) and exit. This is the front-end seam. `--json` performs no classification.
+
+  There is deliberately **no verb that sets a hunk's status to `typed`**. The hidden `rote mark` did exactly that and has been removed. `Typed` is producible only by the classifier, whose input is the hunk's own `new_lines` — which came from the shadow. Three layers hold the line: no verb exists, the engine is the only producer, and reconcile rule 3 returns a `typed` hunk to the queue the moment the trees disagree again. A front end cannot assert its way to a finished session.
+
+  Status changes a front end *may* make are the ones that record a human decision rather than a fact about the trees: `rote skip [HUNK_ID]`, and (from Stage 1) resolving a divergence. Both are addressed by hunk id, never by queue position — the head of the queue can move between the moment a front end renders a hunk and the moment the user acts on it.
 
 ### `rote back`
 Re-prints the most recently presented hunk (`last_presented`) for reference. **It does not change the hunk's status and does not open the editor.** This is a display command, not an undo: rote never writes the real tree, so it cannot un-type keystrokes, and a correctly typed hunk has already vanished from the fresh diff (§5 rule 7) — there is nothing to restore. To re-edit a region, open it yourself; the next recompute will notice. One level of history is sufficient for v0.

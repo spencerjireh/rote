@@ -12,7 +12,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const MANIFEST_VERSION: u32 = 1;
+/// Bumped to 2 for the v2 manifest: `generation`, and the per-hunk `key`,
+/// `pending_divergence`, `curator_note`, `curator_rank` and `input` fields.
+/// A v1 session cannot be read by this build — `load` refuses it with advice.
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// The live states. There is no `done` or `aborted` state: both return the
 /// session to `idle`, and how it ended is recorded on the archived copy.
@@ -69,6 +72,13 @@ pub struct Manifest {
     pub shadow_dir: String,
     pub baseline: BaselineRecord,
     pub hunks: Vec<Hunk>,
+    /// Monotonic, bumped by every `with_session` write.
+    ///
+    /// The anti-staleness token: a front end sends the generation it was looking
+    /// at with each verb, and a mismatch means the world moved underneath it. It
+    /// is also the cheap "has anything changed" signal for `/health`.
+    #[serde(default)]
+    pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_presented: Option<String>,
     /// Set only on archived manifests.
@@ -87,6 +97,7 @@ impl Manifest {
             shadow_dir: project.shadow_dir.to_string_lossy().into_owned(),
             baseline: baseline.into(),
             hunks: Vec::new(),
+            generation: 0,
             last_presented: None,
             terminal: None,
         }
@@ -138,12 +149,18 @@ impl Manifest {
         self.hunks.iter().filter(|h| h.status == Status::Pending)
     }
 
+    /// The head of the *ordered* queue. Delegates to `active` so that every
+    /// caller agrees with `queue_position` about what "next" means.
     pub fn head_of_queue(&self) -> Option<&Hunk> {
-        self.hunks.iter().find(|h| h.status == Status::Pending)
+        self.active()
     }
 
     pub fn count(&self, status: Status) -> usize {
         self.hunks.iter().filter(|h| h.status == status).count()
+    }
+
+    pub fn find(&self, id: &str) -> Option<&Hunk> {
+        self.hunks.iter().find(|h| h.id == id)
     }
 
     pub fn find_mut(&mut self, id: &str) -> Option<&mut Hunk> {
@@ -152,12 +169,92 @@ impl Manifest {
 
     /// Position of a hunk in the queue, 1-based, for progress display.
     pub fn queue_position(&self, id: &str) -> Option<usize> {
-        self.hunks
+        self.queue_view()
             .iter()
-            .filter(|h| h.status == Status::Pending)
             .position(|h| h.id == id)
             .map(|p| p + 1)
     }
+
+    /// The pending queue in the order it should be transcribed.
+    ///
+    /// Ordering is a *read-time view*, never storage order. `reconcile` appends
+    /// new hunks to the tail (rule 6), so the vector drifts out of any sort as
+    /// the session runs; and its positional invariants are what the reconcile
+    /// tests assert against. Sorting here leaves all of that untouched.
+    ///
+    /// Curator rank first where it exists, then a deterministic fallback: file
+    /// path, then position within the file. The fallback is the entire ordering
+    /// when no curator has run, and the tie-break when one has. `id` last so the
+    /// sort is total — two hunks can share a file and an anchor.
+    pub fn queue_view(&self) -> Vec<&Hunk> {
+        let mut q: Vec<&Hunk> = self.pending().collect();
+        q.sort_by(|a, b| {
+            a.curator_rank
+                .unwrap_or(u32::MAX)
+                .cmp(&b.curator_rank.unwrap_or(u32::MAX))
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.anchor_hint.cmp(&b.anchor_hint))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        q
+    }
+
+    /// The hunk to work on next.
+    pub fn active(&self) -> Option<&Hunk> {
+        self.queue_view().into_iter().next()
+    }
+}
+
+/// Run a read-modify-write cycle against the manifest under the lock.
+///
+/// This is the only correct way to mutate a session. The pattern it replaces —
+/// load unlocked, mutate in memory, then lock just long enough to write — is a
+/// TOCTOU: two processes both load, both mutate different hunks, both save, and
+/// the second silently discards the first's work. Nothing detected it, because
+/// nothing could.
+///
+/// Holding the lock across the whole cycle costs nothing here: a cycle is a
+/// small read, an in-memory edit, and an atomic write. Expensive work (recompute,
+/// checks, the reviewer) stays outside.
+///
+/// The daemon uses this exactly as the CLI does. Neither is privileged.
+pub fn with_session<T>(
+    project: &ProjectPaths,
+    f: impl FnOnce(&mut Manifest) -> Result<T>,
+) -> Result<T> {
+    project.ensure_state_dir()?;
+    let _lock = crate::paths::Lock::acquire(&project.lock_path())?;
+
+    // Loaded *inside* the lock. Loading outside it is the bug this exists to fix.
+    let mut manifest = Manifest::require(project)?;
+    let out = f(&mut manifest)?;
+    manifest.generation += 1;
+    manifest.save(project)?;
+    Ok(out)
+}
+
+/// `with_session`, with a recompute between the load and the closure.
+///
+/// The recompute runs inside the lock even though it is the expensive part of
+/// the cycle. It has to: `recompute` mutates the manifest, so doing it outside
+/// and assigning the result back in would reintroduce exactly the lost-update
+/// bug `with_session` exists to prevent. A few hundred milliseconds of lock is
+/// the price of correctness on the CLI path; the daemon avoids paying it by
+/// classifying against pending hunks without shelling out at all.
+pub fn with_session_recomputed<T>(
+    project: &ProjectPaths,
+    cfg: &Config,
+    f: impl FnOnce(&mut Manifest, &RecomputeReport) -> Result<T>,
+) -> Result<T> {
+    project.ensure_state_dir()?;
+    let _lock = crate::paths::Lock::acquire(&project.lock_path())?;
+
+    let mut manifest = Manifest::require(project)?;
+    let report = recompute(&mut manifest, project, cfg)?;
+    let out = f(&mut manifest, &report)?;
+    manifest.generation += 1;
+    manifest.save(project)?;
+    Ok(out)
 }
 
 /// What a recompute observed and had to warn about.
@@ -339,6 +436,7 @@ mod tests {
     fn hunk(id_seed: &str, status: Status) -> Hunk {
         let mut h = Hunk {
             id: String::new(),
+            key: String::new(),
             file: format!("{id_seed}.rs"),
             op: Op::Replace,
             context_before: vec!["ctx".into()],
@@ -349,6 +447,10 @@ mod tests {
             status,
             divergence: None,
             note: None,
+            pending_divergence: None,
+            curator_note: None,
+            curator_rank: None,
+            input: Default::default(),
         };
         h.id = Hunk::compute_id(
             &h.file,
@@ -374,6 +476,7 @@ mod tests {
                 synced_at: "2026-01-01T00:00:00Z".into(),
             },
             hunks,
+            generation: 0,
             last_presented: None,
             terminal: None,
         }
@@ -606,9 +709,45 @@ mod tests {
             hunk("next", Status::Pending),
             hunk("later", Status::Pending),
         ]);
-        let ids: Vec<_> = m.pending().map(|h| h.id.clone()).collect();
+        let ids: Vec<_> = m.queue_view().iter().map(|h| h.id.clone()).collect();
+        assert_eq!(ids.len(), 2, "terminal hunks are not in the queue");
         assert_eq!(m.queue_position(&ids[0]), Some(1));
         assert_eq!(m.queue_position(&ids[1]), Some(2));
         assert_eq!(m.count(Status::Typed), 1);
+    }
+
+    #[test]
+    fn the_queue_is_ordered_by_file_not_by_insertion() {
+        // The fixture names files after the seed, so "later.rs" sorts before
+        // "next.rs" despite being appended second. Storage order is arrival
+        // order; the queue is a sorted view over it.
+        let m = manifest_with(vec![
+            hunk("next", Status::Pending),
+            hunk("later", Status::Pending),
+        ]);
+        let files: Vec<_> = m.queue_view().iter().map(|h| h.file.clone()).collect();
+        assert_eq!(files, vec!["later.rs", "next.rs"]);
+        assert_eq!(
+            m.hunks.iter().map(|h| h.file.clone()).collect::<Vec<_>>(),
+            vec!["next.rs", "later.rs"],
+            "storage order is untouched"
+        );
+        assert_eq!(m.head_of_queue().unwrap().file, "later.rs");
+    }
+
+    #[test]
+    fn curator_rank_outranks_the_deterministic_sort() {
+        let mut m = manifest_with(vec![
+            hunk("aaa", Status::Pending),
+            hunk("zzz", Status::Pending),
+        ]);
+        // Unranked, "aaa.rs" leads on file order.
+        assert_eq!(m.head_of_queue().unwrap().file, "aaa.rs");
+        // Ranked, the curator decides.
+        m.hunks[1].curator_rank = Some(1);
+        assert_eq!(m.head_of_queue().unwrap().file, "zzz.rs");
+        // And an unranked hunk sorts after every ranked one.
+        let order: Vec<_> = m.queue_view().iter().map(|h| h.file.clone()).collect();
+        assert_eq!(order, vec!["zzz.rs", "aaa.rs"]);
     }
 }

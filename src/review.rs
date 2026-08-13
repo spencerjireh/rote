@@ -259,6 +259,7 @@ mod tests {
     fn hunk(file: &str, status: Status) -> Hunk {
         Hunk {
             id: "h-abcd1234".into(),
+            key: "k-abcd1234".into(),
             file: file.into(),
             op: Op::Replace,
             context_before: vec![],
@@ -269,6 +270,10 @@ mod tests {
             status,
             divergence: None,
             note: None,
+            pending_divergence: None,
+            curator_note: None,
+            curator_rank: None,
+            input: Default::default(),
         }
     }
 
@@ -286,6 +291,7 @@ mod tests {
                 synced_at: "2026-01-01T00:00:00Z".into(),
             },
             hunks,
+            generation: 0,
             last_presented: None,
             terminal: None,
         }

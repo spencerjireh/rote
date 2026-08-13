@@ -11,6 +11,7 @@ use crate::paths::ProjectPaths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Context lines carried on each side of a hunk.
@@ -81,9 +82,39 @@ pub struct Divergence {
     pub actual: Vec<String>,
 }
 
+/// How the content of a hunk arrived in the real tree.
+///
+/// Reported by the front end, not inferred: nvim knows `TextChangedI` from a
+/// paste and a browser knows its paste event, but the filesystem cannot tell
+/// them apart — a careful typist writes a whole hunk into the buffer and saves
+/// once, which is byte-identical to a paste. Advisory, and surfaced rather than
+/// enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Input {
+    #[default]
+    Unknown,
+    Typed,
+    Pasted,
+}
+
+impl std::fmt::Display for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Input::Unknown => "unknown",
+            Input::Typed => "typed",
+            Input::Pasted => "pasted",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hunk {
     pub id: String,
+    /// Content identity *without* context — see `compute_key`. Stable under the
+    /// edits that churn `id`, so it is what caches key off.
+    #[serde(default)]
+    pub key: String,
     pub file: String,
     pub op: Op,
     pub context_before: Vec<String>,
@@ -96,6 +127,20 @@ pub struct Hunk {
     pub status: Status,
     pub divergence: Option<Divergence>,
     pub note: Option<String>,
+    /// A divergence the user has not yet answered. The hunk stays `Pending`;
+    /// `divergence` plus `Status::Diverged` is the answered, terminal form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_divergence: Option<Divergence>,
+    /// One line of "why", written by the curator pass. Kept apart from `note`,
+    /// which carries mechanical facts ("possible rename from x") that a model
+    /// cannot reconstruct and must not overwrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curator_note: Option<String>,
+    /// Curator-assigned teaching order. `None` sorts after everything ranked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curator_rank: Option<u32>,
+    #[serde(default)]
+    pub input: Input,
 }
 
 /// The four line arrays of a hunk, which always travel together.
@@ -131,8 +176,36 @@ impl Hunk {
             h.update([1u8]);
         }
         let digest = h.finalize();
-        let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+        // 8 bytes, not 4. At 32 bits a session hits a ~1% birthday collision
+        // around nine thousand hunks, and every lookup in the manifest is by id.
+        let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
         format!("h-{hex}")
+    }
+
+    /// Content identity ignoring surrounding context.
+    ///
+    /// `compute_id` folds in up to `CONTEXT_LINES` lines each side, which is what
+    /// makes it a precise reconciliation key — and what makes it useless as a
+    /// cache key. Typing anywhere within three lines of a hunk changes its
+    /// neighbour's context and therefore its id, so anything stored against an id
+    /// evaporates as the user works. The key survives exactly that churn.
+    ///
+    /// Two hunks in one file with the same `old -> new` pair share a key. That is
+    /// correct: they are the same change, and they deserve the same note.
+    pub fn compute_key(file: &str, old_lines: &[String], new_lines: &[String]) -> String {
+        let mut h = Sha256::new();
+        h.update(file.as_bytes());
+        h.update([0u8]);
+        for group in [old_lines, new_lines] {
+            for line in group {
+                h.update(line.as_bytes());
+                h.update([0u8]);
+            }
+            h.update([1u8]);
+        }
+        let digest = h.finalize();
+        let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        format!("k-{hex}")
     }
 
     fn new(file: &str, op: Op, lines: Lines, anchor_hint: usize, note: Option<String>) -> Self {
@@ -143,8 +216,10 @@ impl Hunk {
             &lines.context_before,
             &lines.context_after,
         );
+        let key = Self::compute_key(file, &lines.old, &lines.new);
         Self {
             id,
+            key,
             file: file.to_string(),
             op,
             context_before: lines.context_before,
@@ -155,6 +230,10 @@ impl Hunk {
             status: Status::Pending,
             divergence: None,
             note,
+            pending_divergence: None,
+            curator_note: None,
+            curator_rank: None,
+            input: Input::default(),
         }
     }
 
@@ -532,7 +611,30 @@ pub fn compute_hunks(project: &ProjectPaths, cfg: &Config) -> Result<Vec<Hunk>> 
     }
 
     annotate_possible_renames(&mut out);
+    disambiguate_ids(&mut out);
     Ok(out)
+}
+
+/// Give exact-duplicate hunks distinct ids within one run.
+///
+/// Two identical edits in one file, with identical context, hash identically —
+/// deterministically, not by birthday. Repetitive code makes that ordinary. The
+/// manifest looks hunks up by id (`find_mut`, `queue_position`), and both return
+/// the *first* match, so without this the second duplicate is unaddressable:
+/// typing it mutates the first one's entry instead.
+///
+/// The suffix is positional within a run, and the run order is deterministic
+/// (`candidates.sort()`, then diff order within a file), so ids stay stable
+/// across recomputes for as long as the content is stable.
+fn disambiguate_ids(hunks: &mut [Hunk]) {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for h in hunks.iter_mut() {
+        let n = seen.entry(h.id.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            h.id = format!("{}.{}", h.id, n);
+        }
+    }
 }
 
 /// Fraction of lines the two sides share, ignoring order.
@@ -603,7 +705,75 @@ mod tests {
         let b = Hunk::compute_id("f.rs", &lines(&["a"]), &lines(&["b"]), &[], &[]);
         assert_eq!(a, b);
         assert!(a.starts_with("h-"));
-        assert_eq!(a.len(), 10);
+        // 8 bytes of digest: "h-" plus 16 hex.
+        assert_eq!(a.len(), 18);
+    }
+
+    #[test]
+    fn the_key_survives_the_context_churn_that_changes_the_id() {
+        // The user types a line three above this hunk. Its `context_before`
+        // changes, so its id changes and reconcile treats it as a new hunk —
+        // but it is the same change, and anything cached against it must hold.
+        let old = lines(&["    tags = Manager()"]);
+        let new = lines(&["    tags = TagManager()"]);
+
+        let id_before = Hunk::compute_id("m.py", &old, &new, &lines(&["class Post:"]), &[]);
+        let id_after = Hunk::compute_id("m.py", &old, &new, &lines(&["class Post(Base):"]), &[]);
+        assert_ne!(id_before, id_after, "context is part of the id");
+
+        let key_before = Hunk::compute_key("m.py", &old, &new);
+        let key_after = Hunk::compute_key("m.py", &old, &new);
+        assert_eq!(key_before, key_after, "context is not part of the key");
+        assert!(key_before.starts_with("k-"));
+        assert_eq!(key_before.len(), 18);
+
+        // The key still separates genuinely different changes.
+        assert_ne!(
+            key_before,
+            Hunk::compute_key("m.py", &old, &lines(&["    tags = Other()"]))
+        );
+        assert_ne!(key_before, Hunk::compute_key("other.py", &old, &new));
+    }
+
+    #[test]
+    fn identical_hunks_in_one_file_get_distinct_ids() {
+        // Two identical edits with identical context hash identically — not by
+        // birthday, by construction. Repetitive code makes it ordinary. Without
+        // disambiguation the second is unaddressable: `find_mut` returns the
+        // first, so typing the second mutates the first one's entry.
+        let mut hs = vec![
+            Hunk::new(
+                "f.rs",
+                Op::Replace,
+                Lines {
+                    context_before: lines(&["ctx"]),
+                    old: lines(&["a"]),
+                    new: lines(&["b"]),
+                    context_after: vec![],
+                },
+                10,
+                None,
+            ),
+            Hunk::new(
+                "f.rs",
+                Op::Replace,
+                Lines {
+                    context_before: lines(&["ctx"]),
+                    old: lines(&["a"]),
+                    new: lines(&["b"]),
+                    context_after: vec![],
+                },
+                40,
+                None,
+            ),
+        ];
+        assert_eq!(hs[0].id, hs[1].id, "identical content collides by design");
+
+        disambiguate_ids(&mut hs);
+        assert_ne!(hs[0].id, hs[1].id, "but the queue entries must be distinct");
+        assert_eq!(hs[1].id, format!("{}.2", hs[0].id));
+        // The key is content identity, so it is deliberately still shared.
+        assert_eq!(hs[0].key, hs[1].key);
     }
 
     #[test]

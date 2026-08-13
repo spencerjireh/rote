@@ -70,8 +70,11 @@ enum Command {
     /// Re-print the most recently presented hunk. Display only; changes nothing.
     Back,
 
-    /// Mark the head-of-queue hunk skipped without opening the editor.
-    Skip,
+    /// Leave a hunk untyped. Defaults to the active one.
+    Skip {
+        /// Which hunk. Omit for the active hunk.
+        hunk_id: Option<String>,
+    },
 
     /// Print the shadow path, or resume the session agent with --attach.
     Talk {
@@ -99,10 +102,6 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-
-    /// Set a hunk's status directly (companion to `next --json`).
-    #[command(hide = true)]
-    Mark { hunk_id: String, status: String },
 
     /// Check that this machine is set up to run rote.
     Doctor {
@@ -208,12 +207,8 @@ fn run() -> Result<ExitCode> {
             cmd_back(&project, color)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Skip => {
-            cmd_skip(&project, &cfg)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Mark { hunk_id, status } => {
-            cmd_mark(&project, &hunk_id, &status)?;
+        Command::Skip { hunk_id } => {
+            cmd_skip(&project, &cfg, hunk_id.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Talk { attach } => {
@@ -627,20 +622,20 @@ fn cmd_done(
     no_review: bool,
     quiet: bool,
 ) -> Result<()> {
-    let mut manifest = Manifest::require(project)?;
-
     // 1. Refuse mid-operation, before anything expensive runs.
     shadow::ensure_no_operation_in_progress(project)?;
 
-    // 2. Recompute; pending hunks need consent before they become skipped.
-    let report = session::recompute(&mut manifest, project, cfg)?;
-    for w in &report.warnings {
-        eprintln!("warning: {w}");
-    }
-    let pending: Vec<String> = manifest
-        .pending()
-        .map(|h| format!("  {}:{}", h.file, h.anchor_hint))
-        .collect();
+    // 2. Recompute under the lock; then release it before prompting. A
+    // confirmation waits on a human, and no lock is ever held across that.
+    let pending = session::with_session_recomputed(project, cfg, |m, report| {
+        for w in &report.warnings {
+            eprintln!("warning: {w}");
+        }
+        Ok(m.pending()
+            .map(|h| format!("  {}:{}", h.file, h.anchor_hint))
+            .collect::<Vec<String>>())
+    })?;
+
     if !pending.is_empty() {
         println!("{} hunk(s) still pending:", pending.len());
         for p in &pending {
@@ -650,14 +645,20 @@ fn cmd_done(
             println!("left the session open. `rote next` continues.");
             return Ok(());
         }
-        let ids: Vec<String> = manifest.pending().map(|h| h.id.clone()).collect();
-        for id in ids {
-            if let Some(h) = manifest.find_mut(&id) {
-                h.status = Status::Skipped;
+        session::with_session(project, |m| {
+            let ids: Vec<String> = m.pending().map(|h| h.id.clone()).collect();
+            for id in ids {
+                if let Some(h) = m.find_mut(&id) {
+                    h.status = Status::Skipped;
+                }
             }
-        }
+            Ok(())
+        })?;
     }
 
+    // Re-read once the mutations above have landed. Everything from here is
+    // read-only until teardown, which takes the lock again and reloads.
+    let manifest = Manifest::require(project)?;
     let empty_session = manifest.hunks.is_empty();
     if empty_session && !quiet {
         println!("no changes this session.");
@@ -695,7 +696,10 @@ fn cmd_done(
     }
 
     // 6. Residue first, then archive, then the sync that destroys the shadow's copy.
+    //    Reloaded under the lock: the copy above predates the prompts, and
+    //    archiving a stale manifest would file the wrong record.
     let _lock = Lock::acquire(&project.lock_path())?;
+    let mut manifest = Manifest::require(project)?;
     let archived = session::archive_and_clear(&mut manifest, project, cfg, Terminal::Done)?;
     shadow::sync(project, cfg)?;
 
@@ -710,21 +714,27 @@ fn cmd_done(
 
 /// Recompute, then present the head of the queue.
 fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Result<()> {
-    let mut manifest = Manifest::require(project)?;
+    // Phase 1, under the lock: recompute, advance the state machine, and take a
+    // copy of the hunk to present.
+    let picked = session::with_session_recomputed(project, cfg, |m, report| {
+        for w in &report.warnings {
+            eprintln!("warning: {w}");
+        }
+        // First `next` is what turns a working session into a transcribing one.
+        if m.state == State::Working {
+            m.state = State::Transcribing;
+        }
+        let Some(hunk) = m.active().cloned() else {
+            return Ok(None);
+        };
+        let position = m.queue_position(&hunk.id).unwrap_or(1);
+        let total = m.pending().count();
+        Ok(Some((hunk, position, total)))
+    })?;
 
-    // First `next` is what turns a working session into a transcribing one.
-    if manifest.state == State::Working {
-        manifest.state = State::Transcribing;
-    }
-
-    let report = session::recompute(&mut manifest, project, cfg)?;
-    for w in &report.warnings {
-        eprintln!("warning: {w}");
-    }
-
-    let Some(hunk) = manifest.head_of_queue().cloned() else {
-        save_locked(&manifest, project)?;
+    let Some((hunk, position, total)) = picked else {
         println!("nothing to transcribe.");
+        let manifest = Manifest::require(project)?;
         if !manifest.hunks.is_empty() {
             println!("every hunk is accounted for — `rote done` closes the session.");
         }
@@ -732,17 +742,15 @@ fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Re
     };
 
     if json {
-        // The v2 seam: emit and exit, classifying nothing. `rote mark` is how a
-        // front end reports back.
+        // The front-end seam: emit and exit, classifying nothing.
         println!("{}", serde_json::to_string(&hunk)?);
-        save_locked(&manifest, project)?;
         return Ok(());
     }
 
-    let total = manifest.pending().count();
-    let position = manifest.queue_position(&hunk.id).unwrap_or(1);
+    // Phase 2, unlocked: the editor blocks on a human and can sit here for
+    // minutes. Holding the lock across it would wedge every other invocation,
+    // which is exactly the mistake the old `Lock` was shaped to avoid making.
     let real_file = project.repo_root.join(&hunk.file);
-
     let outcome = present_one(&hunk, project, cfg, position, total, color, &real_file)?;
 
     let label = match &outcome {
@@ -751,8 +759,9 @@ fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Re
         Classification::Diverged { .. } => "diverged",
     };
 
-    {
-        let entry = manifest
+    // Phase 3, under the lock again: record what the user did.
+    session::with_session(project, |m| {
+        let entry = m
             .find_mut(&hunk.id)
             .context("the hunk vanished from the manifest mid-command")?;
         match &outcome {
@@ -766,9 +775,9 @@ fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Re
                 });
             }
         }
-    }
-    manifest.last_presented = Some(hunk.id.clone());
-    save_locked(&manifest, project)?;
+        m.last_presented = Some(hunk.id.clone());
+        Ok(())
+    })?;
 
     println!("[{position}/{total}] {label} — {}", hunk.file);
     if matches!(outcome, Classification::Untouched) {
@@ -886,42 +895,38 @@ fn cmd_back(project: &ProjectPaths, color: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_skip(project: &ProjectPaths, cfg: &Config) -> Result<()> {
-    let mut manifest = Manifest::require(project)?;
-    session::recompute(&mut manifest, project, cfg)?;
+/// Leave a hunk untyped, by id or by "whatever is active".
+///
+/// Addressed by id rather than by position. Resolving "the active hunk" and then
+/// mutating it are two steps, and between them the queue can move — the daemon
+/// reorders after a curator pass, and a concurrent recompute can retire the head
+/// entirely. Resolving to an id first means the thing skipped is the thing the
+/// user was looking at, or nothing at all.
+fn cmd_skip(project: &ProjectPaths, cfg: &Config, hunk_id: Option<&str>) -> Result<()> {
+    let skipped = session::with_session_recomputed(project, cfg, |m, _report| {
+        let target = match hunk_id {
+            Some(id) => id.to_string(),
+            None => match m.active().map(|h| h.id.clone()) {
+                Some(id) => id,
+                None => return Ok(None),
+            },
+        };
+        let h = m
+            .find_mut(&target)
+            .with_context(|| format!("no hunk {target} in this session"))?;
+        h.status = Status::Skipped;
+        let file = h.file.clone();
+        m.last_presented = Some(target);
+        Ok(Some(file))
+    })?;
 
-    let Some(id) = manifest.head_of_queue().map(|h| h.id.clone()) else {
+    let Some(file) = skipped else {
         println!("nothing to skip — the queue is empty.");
         return Ok(());
     };
-    let file = {
-        let h = manifest.find_mut(&id).expect("just found it");
-        h.status = Status::Skipped;
-        h.file.clone()
-    };
-    manifest.last_presented = Some(id);
-    save_locked(&manifest, project)?;
     println!("skipped — {file}");
     println!("it will not come back. `rote done` reports it before closing.");
     Ok(())
-}
-
-/// Hidden companion to `next --json`: set a hunk's status from outside.
-fn cmd_mark(project: &ProjectPaths, hunk_id: &str, status: &str) -> Result<()> {
-    let mut manifest = Manifest::require(project)?;
-    let parsed: Status = status.parse()?;
-    let hunk = manifest
-        .find_mut(hunk_id)
-        .with_context(|| format!("no hunk {hunk_id} in this session"))?;
-    hunk.status = parsed;
-    manifest.last_presented = Some(hunk_id.to_string());
-    save_locked(&manifest, project)?;
-    Ok(())
-}
-
-fn save_locked(manifest: &Manifest, project: &ProjectPaths) -> Result<()> {
-    let _lock = Lock::acquire(&project.lock_path())?;
-    manifest.save(project)
 }
 
 fn cmd_start(
@@ -1071,7 +1076,9 @@ fn cmd_status(project: &ProjectPaths) -> Result<()> {
 }
 
 fn cmd_abort(project: &ProjectPaths, cfg: &Config, yes: bool, quiet: bool) -> Result<()> {
-    let mut manifest = Manifest::require(project)?;
+    // Read only, and only to shape the prompt. The authoritative copy is
+    // reloaded under the lock below.
+    let manifest = Manifest::require(project)?;
 
     if !yes {
         let untyped = manifest.count(Status::Pending) + manifest.count(Status::Skipped);
@@ -1085,7 +1092,9 @@ fn cmd_abort(project: &ProjectPaths, cfg: &Config, yes: bool, quiet: bool) -> Re
         }
     }
 
+    // Reloaded under the lock — the copy read before the prompt may be stale.
     let _lock = Lock::acquire(&project.lock_path())?;
+    let mut manifest = Manifest::require(project)?;
     // Residue first, then the shadow reset that destroys the agent's copy.
     let archived = session::archive_and_clear(&mut manifest, project, cfg, Terminal::Aborted)?;
     shadow::sync(project, cfg)?;

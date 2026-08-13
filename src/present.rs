@@ -375,6 +375,7 @@ mod tests {
     fn hunk(before: &[&str], old: &[&str], new: &[&str], after: &[&str], hint: usize) -> Hunk {
         Hunk {
             id: "h-test".into(),
+            key: "k-test".into(),
             file: "f.rs".into(),
             op: Op::Replace,
             context_before: lines(before),
@@ -385,6 +386,10 @@ mod tests {
             status: Status::Pending,
             divergence: None,
             note: None,
+            pending_divergence: None,
+            curator_note: None,
+            curator_rank: None,
+            input: Default::default(),
         }
     }
 

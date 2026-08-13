@@ -204,6 +204,63 @@ fn a_manifest_from_another_version_is_refused_with_advice() {
 }
 
 #[test]
+fn concurrent_writers_do_not_lose_each_others_work() {
+    // The regression that had no test. The old pattern — load unlocked, mutate,
+    // then lock only for the write — let two processes both load the same
+    // manifest, both mutate different hunks, and both save: last writer wins and
+    // the other's mutation vanishes with nothing detecting it.
+    let (fx, cfg, mut manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+
+    // A queue with enough hunks that every thread has its own to claim.
+    for i in 0..8 {
+        fx.write(&format!("f{i}.rs"), &format!("fn f{i}() {{\n}}\n"));
+    }
+    fx.commit_all("more files");
+    for i in 0..8 {
+        std::fs::write(
+            project.shadow_dir.join(format!("f{i}.rs")),
+            format!("fn f{i}() {{\n    work();\n}}\n"),
+        )
+        .unwrap();
+    }
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+    manifest.save(&project).unwrap();
+
+    let ids: Vec<String> = manifest.pending().map(|h| h.id.clone()).collect();
+    assert!(ids.len() >= 8, "expected a real queue, got {}", ids.len());
+    let start_generation = manifest.generation;
+
+    std::thread::scope(|scope| {
+        for id in &ids {
+            let project = &project;
+            scope.spawn(move || {
+                session::with_session(project, |m| {
+                    m.find_mut(id).unwrap().status = Status::Skipped;
+                    Ok(())
+                })
+                .unwrap();
+            });
+        }
+    });
+
+    let reloaded = Manifest::load(&project).unwrap().unwrap();
+    for id in &ids {
+        assert_eq!(
+            reloaded.find(id).map(|h| h.status),
+            Some(Status::Skipped),
+            "hunk {id} lost its mutation to a concurrent writer"
+        );
+    }
+    assert_eq!(
+        reloaded.generation,
+        start_generation + ids.len() as u64,
+        "every write must bump the generation exactly once"
+    );
+}
+
+#[test]
 fn the_lock_survives_a_killed_process() {
     // kill -9 leaves the lock file behind with a PID that no longer exists.
     let fx = Fixture::new();
@@ -234,6 +291,18 @@ fn a_live_holder_blocks_a_second_invocation() {
     project.ensure_state_dir().unwrap();
 
     let _held = Lock::acquire(&project.lock_path()).unwrap();
-    let err = Lock::acquire(&project.lock_path()).unwrap_err().to_string();
+
+    // Contention is exact and immediate.
+    assert!(Lock::try_acquire(&project.lock_path()).unwrap().is_none());
+
+    // A waiter that runs out of patience names the process to go and deal with.
+    // Short timeout: the default 5s ceiling is for humans, not for tests.
+    let err = Lock::acquire_within(&project.lock_path(), std::time::Duration::from_millis(200))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("another rote process"), "{err}");
+    assert!(
+        err.contains(&format!("pid {}", std::process::id())),
+        "the holder should be named: {err}"
+    );
 }
