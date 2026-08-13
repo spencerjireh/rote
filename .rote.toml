@@ -1,0 +1,24 @@
+# rote's own configuration — the intended first dogfooding target.
+
+max_hunk_lines = 20
+strict_whitespace = false
+
+[shadow]
+copy = []
+# Cargo's build output. Preserving it keeps the agent's `cargo test` warm
+# instead of rebuilding every dependency at the top of each session.
+preserve = ["target/"]
+
+[transcribe]
+verbatim = ["Cargo.lock"]
+
+[checks]
+commands = [
+    "cargo test",
+    "cargo-clippy --all-targets -- -D warnings",
+    "cargo-fmt --check",
+]
+
+[review]
+enabled = true
+model_args = []

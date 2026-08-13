@@ -1,0 +1,109 @@
+# rote — Build Plan
+
+Sequenced milestones for implementation. Each milestone ends in a compiling, tested, demonstrable state. Read ARCHITECTURE.md and DESIGN.md fully before writing any code. Do not skip ahead: later milestones depend on the exact contracts (Hunk schema, manifest schema, sync algorithm) established earlier. When a design question arises that the docs do not answer, prefer the simplest behavior consistent with the four principles in ARCHITECTURE.md and leave a `// DESIGN:` comment.
+
+Conventions for all milestones:
+- Rust stable, edition 2021. `cargo clippy -- -D warnings` and `cargo fmt --check` must pass.
+- Errors: `anyhow::Result` at the app layer; every shelled git failure must surface git's stderr in the error message.
+- All git invocations go through `git.rs` — no raw `Command::new("git")` elsewhere.
+- All manifest writes are atomic (temp file + rename) and lock-guarded.
+- No writes to the real repo tree anywhere in the codebase except: `.rote.toml` in `rote init`. Add a debug assertion helper `assert_not_in_real_tree(path)` used by every file-writing utility, so this invariant is mechanically enforced. This survives the byte-compare gate intact: binaries and lockfiles are *compared*, never copied — the user still runs `cp` or `npm install` themselves.
+
+---
+
+## M0 — Scaffold
+
+**Goal:** project skeleton, CLI shape, config, paths.
+
+- `cargo new rote`; deps: `clap` (derive), `anyhow`, `serde`, `serde_json`, `toml`, `directories`, `sha2`, and a terminal color crate (`anstyle`/`owo-colors`) — M4 renders colored hunks and no later milestone adds it.
+- Implement `main.rs` with all subcommands from DESIGN §1 as stubs printing "not implemented" (exit 2), with real help text.
+- `paths.rs`: repo-root discovery (walk up to `.git`; error message if absent), project hash (SHA-256 of canonicalized root, first 12 hex), XDG dir resolution, lock-file acquire/release with stale-PID detection.
+- `config.rs`: load + merge global and project config per DESIGN §7 — including `strict_whitespace`, `[shadow] preserve`, and `[transcribe] verbatim`, all three of which later milestones depend on. Both claude commands parse as argument vectors, never shell strings. Defaults when files absent. Unit tests for merge precedence.
+- `rote init` fully working (writes commented `.rote.toml`, `--force` behavior).
+
+**Acceptance:** `rote --help` shows all commands; `rote init` produces the documented file; tests pass.
+
+## M1 — GitPlumbing + ShadowManager
+
+**Goal:** shadow lifecycle and sync, byte-for-byte.
+
+- `git.rs`: typed wrappers for exactly the invocations DESIGN needs (clone, fetch, reset, clean with `-e` exclusions, diff HEAD --binary, apply, ls-files --others, status --porcelain, diff --no-index, rev-parse). Each returns stdout bytes or a rich error.
+- `shadow.rs`: create (clone `--no-hardlinks`, remove **all** remotes), sync per DESIGN §3 steps 1–8, in-progress-operation detection (merge/rebase/etc.) exposed for both `start` and `done` to call.
+- Sync step 7 writes `baseline.patch`. It is not optional and not deferrable to M5: §8's session diff has no other source for the session-start state, and M5 will read a file only M1 can produce.
+- Integration test (`tests/shadow.rs`): build a fixture repo in a temp dir with committed files + staged changes + unstaged changes + untracked file + gitignored `.env` on the allowlist + a `target/` directory on the preserve list; run sync; assert shadow tree ≡ real tree byte-wise (walk both trees; compare), including the allowlisted file, excluding non-allowlisted ignored files. Assert `target/` survived and `baseline.patch` matches the real tree's `git diff HEAD --binary` byte for byte.
+
+**Acceptance:** integration test passes; re-running sync after mutating the real fixture converges again (idempotence test); preserved directories survive repeated syncs while non-preserved ignored files do not.
+
+## M2 — Diff parsing + Hunk model
+
+**Goal:** trees → structured, split, content-addressed hunks.
+
+- `diffparse.rs`: unified-diff parser per DESIGN §5. Fixture-driven tests: modify, new file (`/dev/null` old side), deleted file, no-newline-at-EOF, multiple hunks, empty diff.
+- `hunks.rs`: `Hunk` struct exactly matching the JSON schema in DESIGN §4 (serde round-trip test, lowercase enum values), content-addressed IDs, `op` derivation, splitting algorithm (blank-line preference, indentation fallback, hard cut, synthesized context) with tests at limits (hunk of exactly `max`, `max+1`, giant single block with no blank lines, **and a pure deletion over `max` lines** — splitting counts `max(old, new)`, so this must split).
+- File enumeration + per-file diffing (DESIGN §5) wired: a function `compute_hunks(real, shadow, cfg) -> Vec<Hunk>` using `status --porcelain=v1 -z` as the single enumeration source, `--no-textconv` on every diff, the binary-file heuristic, and lockfile/verbatim-glob handling per §9.4. Untypeable hunks are tagged for the byte-compare gate here; M4 consumes that tag.
+- Integration test: fixture real+shadow trees with a known set of edits → assert exact hunk list (files, ops, line contents, ordering).
+
+**Acceptance:** all fixtures produce exact expected hunks; IDs stable across runs.
+
+## M3 — SessionEngine
+
+**Goal:** state machine, manifest, recompute/reconciliation.
+
+- `session.rs`: manifest load/validate/atomic-save, state enum `idle | working | transcribing` (terminal `done`/`aborted` labels only on archived manifests), state transitions with clear errors on invalid ones, `recompute()` implementing reconciliation rules DESIGN §5 exactly (all seven numbered rules).
+- `rote start` (without the claude exec — behind `--no-launch`, a **permanently retained hidden flag**: M5's acceptance test drives a full lifecycle without a real agent and needs it), `rote status`, `rote abort` fully working, including the residue patch written before abort's sync.
+- Reconciliation unit tests, one per scenario: (a) user typed a hunk → vanishes from fresh set, terminal status preserved; (b) agent reworked a pending hunk → old dropped, new appended under a new ID; (c) `typed` hunk unexpectedly reappears → reset to pending with warning; (d) new agent work mid-session → appended; (e) baseline drift (real HEAD moved) → warning path exercised.
+- **Stickiness tests — these guard the rule the whole queue rests on:** (f) a `skipped` hunk whose region still differs stays skipped across ten consecutive recomputes and never re-enters the queue; (g) same for a `diverged` hunk after `keep mine`; (h) a hunk skipped, then reworked by the agent, appears as a *new* pending hunk while the old skipped entry stays terminal in the history.
+- Drift test: typing hunks changes the uncommitted diff on every keystroke, so assert that transcription alone never raises the drift flag — only a moved `HEAD` does.
+
+**Acceptance:** scenario tests pass; `start --no-launch` → `status` → `abort` round-trip works on the fixture repo; manifest survives kill -9 between operations (lock staleness test).
+
+## M4 — HunkPresenter
+
+**Goal:** the transcription loop.
+
+- `present.rs`: terminal rendering per DESIGN §6 (respect `--no-color`), context-based anchoring with the full fallback chain and nearest-to-hint disambiguation, editor launch (blocking, `+line file` at the anchor line itself, resolution chain `$ROTE_EDITOR` → config → `nvim` with `$EDITOR` deliberately absent, no file creation for `create_file` hunks), classification (exact / untouched / divergence), the divergence prompt loop (`k`/`r`/`s`), and the byte-compare gate for binary and verbatim hunks (no editor, no prompt).
+- `rote next`, `rote back`, `rote skip` wired end to end. `back` re-prints only — no status change, no editor. `rote next --json` and hidden `rote mark` per DESIGN §1.
+- Anchoring unit tests: file with lines inserted above the target (drift), ambiguous context (two matches, hint disambiguates), context missing entirely (falls back to hint with warning).
+- Classification tests: exact match, trailing-whitespace tolerance under both `strict_whitespace` settings, divergence storage, untouched detection, and a verbatim-glob hunk that stays pending until the fixture's lockfile is made to match byte for byte. (Editor interaction tested by substituting `editor = "true"` / a test script that applies a scripted edit.)
+
+**Acceptance:** on a fixture session, a scripted "editor" that types hunks correctly drives the queue to empty; a scripted editor that types a variant triggers the divergence path and records both versions; a session containing a skipped hunk and a kept divergence still reaches an empty queue rather than looping.
+
+## M5 — `done` pipeline + claude launch
+
+**Goal:** session close, checks, reviewer; wire the real agent launch.
+
+- `review.rs`: in-progress-operation gate (before anything expensive runs), pending-hunk gate, `[checks]` command execution in the real tree (streamed output, stop on failure, `--no-checks`), baseline materialization from `baseline.head` + `baseline.patch` + session-diff computation per DESIGN §8, payload assembly (task / session diff / divergences / skipped), `claude -p` invocation with tool-restriction flags in one named constant, timeout, and fail-soft behavior on unsupported flags, confirmation, residue patch + archive, then final sync — in that order, since sync destroys what the patch records.
+- `rote start` claude exec (DESIGN §1: lock released first, process replacement, cwd = shadow, task printed not passed); `rote talk` with `--attach`.
+- Integration test for the payload builder (assert exact payload text from a fixture session; stub the claude binary with a script that echoes stdin to a file). A second stub that exits nonzero must leave the pipeline running to completion.
+
+**Acceptance:** full lifecycle on the fixture repo with stubbed `claude` and scripted editor: `init → start --no-launch → (mutate shadow as the "agent") → next×N → done` ends `idle`, shadow ≡ real, manifest and residue patch both archived, reviewer stub received the documented payload. Re-running with a skipped hunk asserts the residue patch actually contains that hunk's change.
+
+## M6 — Polish
+
+- Error-message pass: every user-facing error names the problem and the next command to run.
+- `rote status` output design (the one screen the user sees most).
+- README.md: install (`cargo install --path .`), quickstart, the ghostty two-pane workflow, the `rm -rf ~/.cache/rote/<hash>` escape hatch, config reference, and a short note on where a session's untyped residue lands (`archive/<timestamp>.patch`) for the user who skips something and changes their mind.
+- Edge-case sweep against DESIGN §9: add a test or a manual-verification note for each of the 11 items. Where each landed:
+
+| §9 | Case | Covered by |
+|---|---|---|
+| 1 | Real repo dirty at `start` | `tests/shadow.rs::sync_produces_a_byte_identical_shadow` (staged + unstaged + untracked fixture) |
+| 2 | Repo changes commits mid-session | `tests/session.rs::a_commit_mid_session_raises_drift_but_does_not_block`, and `transcription_alone_never_raises_the_drift_flag` for the inverse |
+| 3 | Agent commits in the shadow | `tests/shadow.rs::agent_work_in_the_shadow_is_discarded_by_the_next_sync` |
+| 4 | Agent adds dependencies | `tests/transcribe.rs::a_generated_file_is_gated_on_bytes_not_typing`, `tests/hunks.rs::lockfiles_become_untypeable_hunks` |
+| 5 | File renames | `src/hunks.rs::a_moved_file_is_noted_as_a_possible_rename` (and `an_unrelated_new_file_is_not_called_a_rename`) |
+| 6 | Editor exits nonzero | `tests/transcribe.rs::an_editor_that_exits_nonzero_is_treated_as_untouched` |
+| 7 | Concurrent invocations | `src/paths.rs::lock_is_exclusive_while_held`, `tests/session.rs::the_lock_survives_a_killed_process` |
+| 8 | Shadow deleted mid-session | `tests/hunks.rs::missing_shadow_gives_an_actionable_error` |
+| 9 | Symlinks | `tests/shadow.rs::symlinks_are_reproduced_as_symlinks` |
+| 10 | Empty session | `tests/done.rs::an_empty_session_closes_without_checks_or_review` |
+| 11 | CRLF | `src/present.rs::a_stray_carriage_return_is_absorbed` |
+- Dogfood note: the intended first real use is rote's own repository — building rote's next milestone through rote.
+
+**Acceptance:** clippy/fmt clean, all tests green, README accurate against actual behavior.
+
+---
+
+## Out of scope — do not build
+
+Multi-session, non-git backends, nvim plugin, paste prevention, Windows, any Claude Code hooks/MCP/SDK integration, `rote gc`, telemetry of any kind.
