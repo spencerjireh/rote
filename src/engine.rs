@@ -1,0 +1,854 @@
+//! The watch engine: reclassify on save, advance the queue, publish snapshots.
+//!
+//! Everything that decides *when* rote acts lives here, and it is written to be
+//! testable without a filesystem or a stopwatch. Time enters through `Clock`
+//! rather than `Instant` — `Instant` has no constructor, so a fake one is
+//! impossible and every grace-window test would become a two-second sleep that
+//! is flaky under load. The divergence state machine is a separate `Watchdog`
+//! with no I/O at all.
+//!
+//! The engine is not privileged. It mutates the manifest through
+//! `session::with_session` exactly as the CLI does, and it re-verifies the hunk
+//! it is about to write is still the one it classified — classification happens
+//! outside the lock, so the queue can move underneath it.
+
+use crate::config::Config;
+use crate::hunks::{Divergence, Hunk, Status};
+use crate::paths::ProjectPaths;
+use crate::present::{self, Classification};
+use crate::session::{self, Manifest};
+use crate::state::{self, Notice};
+use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Minimum wall time between two full re-diffs of the trees.
+///
+/// The debounce collapses a burst; this bounds the damage when saves arrive
+/// steadily forever. A full recompute shells out to git once per changed file.
+pub const RECOMPUTE_FLOOR: Duration = Duration::from_millis(1500);
+
+/// How long the loop blocks waiting for an event before looking at its timers.
+pub const TICK: Duration = Duration::from_millis(250);
+
+/// The tick used when the watcher has failed and we are polling instead.
+pub const DEGRADED_TICK: Duration = Duration::from_secs(2);
+
+/// A full recompute happens at least this often even in total silence, because
+/// it is the only thing that can notice the repository moved under the session.
+pub const FLOOR_SWEEP: Duration = Duration::from_secs(30);
+
+/// Milliseconds since the engine started.
+///
+/// A plain integer rather than `Instant` so tests can name a moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Tick(pub u64);
+
+impl Tick {
+    fn since(self, earlier: Tick) -> u64 {
+        self.0.saturating_sub(earlier.0)
+    }
+}
+
+pub trait Clock: Send {
+    fn now(&self) -> Tick;
+}
+
+pub struct RealClock {
+    start: std::time::Instant,
+}
+
+impl Default for RealClock {
+    fn default() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Clock for RealClock {
+    fn now(&self) -> Tick {
+        Tick(self.start.elapsed().as_millis() as u64)
+    }
+}
+
+/// Which tree an event came from. The agent's work and the user's typing mean
+/// entirely different things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Real,
+    Shadow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineEvent {
+    /// Something under this repo-relative path may have changed. Deliberately
+    /// carries no `EventKind`: the engine re-reads from disk and decides for
+    /// itself, which is what makes atomic-rename saves and coalesced
+    /// directory-granular events harmless.
+    Changed(Origin, PathBuf),
+    Command(state::Command),
+    /// The watcher itself failed. Degrade to polling rather than dying.
+    WatchError(String),
+}
+
+/// What a save did to one hunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observation {
+    Typed,
+    /// On its way to the proposal. Never a question, however long the pause.
+    InProgress,
+    /// Finished, and different. A question, once the file stops moving.
+    Disagrees {
+        actual: Vec<String>,
+    },
+    Untouched,
+}
+
+/// Classify one hunk, splitting `Diverged` into "still typing" and "disagrees".
+///
+/// `classify` cannot make this distinction and should not: on editor exit the
+/// user had declared they were finished, so every difference was a real one.
+/// Under a watcher there is no such declaration, and the same verdict arrives
+/// after every keystroke-flush.
+pub fn observe(
+    before: &[String],
+    after: &[String],
+    hunk: &Hunk,
+    strict_whitespace: bool,
+) -> Observation {
+    match present::classify(before, after, hunk, strict_whitespace) {
+        Classification::Typed => Observation::Typed,
+        Classification::Untouched => Observation::Untouched,
+        Classification::Diverged { actual } => {
+            if present::is_in_progress(&actual, &hunk.new_lines, strict_whitespace) {
+                Observation::InProgress
+            } else {
+                Observation::Disagrees { actual }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    actual: Vec<String>,
+    armed_at: Tick,
+}
+
+/// The quiescence timer for divergence questions.
+///
+/// Pure, so the whole of the "do not interrupt someone mid-thought" behaviour
+/// is unit-testable with no filesystem and no sleeps.
+///
+/// Two layers, and both are needed. The in-progress predicate handles typing
+/// top to bottom, which is most transcription, instantly and with no delay at
+/// all. The timer handles everything else — pasting the middle, typing
+/// bottom-up, fixing a line — where no prefix relationship ever holds and only
+/// stillness can tell "wrong" from "not finished".
+#[derive(Debug, Default)]
+pub struct Watchdog {
+    armed: HashMap<String, Candidate>,
+}
+
+impl Watchdog {
+    /// Record what a save did. Re-arming on every disagreement is the point:
+    /// the window measures stillness, not elapsed time since the first mistake.
+    pub fn observe(&mut self, hunk_id: &str, outcome: &Observation, now: Tick) {
+        match outcome {
+            Observation::Disagrees { actual } => {
+                self.armed.insert(
+                    hunk_id.to_string(),
+                    Candidate {
+                        actual: actual.clone(),
+                        armed_at: now,
+                    },
+                );
+            }
+            // Anything else means there is nothing to ask about right now.
+            _ => {
+                self.armed.remove(hunk_id);
+            }
+        }
+    }
+
+    /// Questions whose file has been still for the whole window.
+    pub fn due(&self, now: Tick, grace_ms: u64) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = self
+            .armed
+            .iter()
+            .filter(|(_, c)| now.since(c.armed_at) >= grace_ms)
+            .map(|(id, c)| (id.clone(), c.actual.clone()))
+            .collect();
+        // Deterministic order: a HashMap's iteration order is not, and the
+        // questions become manifest writes.
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    pub fn disarm(&mut self, hunk_id: &str) {
+        self.armed.remove(hunk_id);
+    }
+
+    pub fn is_armed(&self, hunk_id: &str) -> bool {
+        self.armed.contains_key(hunk_id)
+    }
+}
+
+/// Why a full recompute is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    No,
+    /// Wait out the debounce, then re-diff.
+    At(Tick),
+}
+
+pub struct Engine {
+    project: ProjectPaths,
+    cfg: Config,
+    clock: Box<dyn Clock>,
+    /// Each file's lines as of the last time its hunks became answerable.
+    baselines: HashMap<String, Vec<String>>,
+    watchdog: Watchdog,
+    recompute: Pending,
+    last_recompute: Option<Tick>,
+    /// Emitted state is suppressed when nothing moved, so a quiet watcher does
+    /// not redraw the pane forever.
+    last_published: Option<u64>,
+    drift: bool,
+    degraded: bool,
+    started: bool,
+}
+
+impl Engine {
+    pub fn new(project: ProjectPaths, cfg: Config, clock: Box<dyn Clock>) -> Self {
+        Self {
+            project,
+            cfg,
+            clock,
+            baselines: HashMap::new(),
+            watchdog: Watchdog::default(),
+            recompute: Pending::No,
+            last_recompute: None,
+            last_published: None,
+            drift: false,
+            degraded: false,
+            started: false,
+        }
+    }
+
+    pub fn now(&self) -> Tick {
+        self.clock.now()
+    }
+
+    /// How long the caller should block before calling `step(None, ..)` again.
+    pub fn tick(&self) -> Duration {
+        if self.degraded {
+            DEGRADED_TICK
+        } else {
+            TICK
+        }
+    }
+
+    /// Handle one event (or a bare timer tick) and publish what changed.
+    ///
+    /// A single entry point rather than separate `handle`/`poll` methods so a
+    /// test can advance time by passing `None` and get the timers evaluated in
+    /// exactly the order the real loop evaluates them.
+    pub fn step(&mut self, ev: Option<EngineEvent>, now: Tick) -> Result<Vec<state::Event>> {
+        let mut notices: Vec<Notice> = Vec::new();
+
+        // The session ending is not an error; it is the reason to stop.
+        if Manifest::load(&self.project)?.is_none() {
+            return Ok(vec![state::Event::Closed { terminal: None }]);
+        }
+
+        if !self.started {
+            self.started = true;
+            self.recompute = Pending::At(now);
+        }
+
+        if let Some(ev) = ev {
+            match ev {
+                EngineEvent::Changed(Origin::Real, rel) => {
+                    self.on_real_change(&rel, now, &mut notices)?;
+                }
+                EngineEvent::Changed(Origin::Shadow, _) => {
+                    // The agent worked. Only a full re-diff can say what it did.
+                    self.arm_recompute(now);
+                }
+                EngineEvent::Command(cmd) => self.apply(cmd, now, &mut notices)?,
+                EngineEvent::WatchError(msg) => {
+                    if !self.degraded {
+                        self.degraded = true;
+                        notices.push(Notice::warn(format!(
+                            "the file watcher failed ({msg}). Falling back to polling every {}s.",
+                            DEGRADED_TICK.as_secs()
+                        )));
+                    }
+                }
+            }
+        } else if self.degraded {
+            // No watcher to tell us anything: re-read every file with work in it.
+            let files = self.pending_files()?;
+            for rel in files {
+                self.classify_file(&rel, now, &mut notices)?;
+            }
+        }
+
+        self.raise_due_questions(now, &mut notices)?;
+        self.run_due_recompute(now, &mut notices)?;
+
+        self.publish(notices)
+    }
+
+    /// A change under the user's tree.
+    fn on_real_change(
+        &mut self,
+        rel: &std::path::Path,
+        now: Tick,
+        notices: &mut Vec<Notice>,
+    ) -> Result<()> {
+        let rel_str = rel.to_string_lossy().to_string();
+        let manifest = Manifest::require(&self.project)?;
+        let known = manifest.hunks.iter().any(|h| h.file == rel_str);
+        if known {
+            // The fast path: pure functions and one file read, no subprocess.
+            self.classify_file(&rel_str, now, notices)?;
+        } else {
+            // A file the queue has never heard of. Only a re-diff can tell
+            // whether it is now part of the session.
+            self.arm_recompute(now);
+        }
+        Ok(())
+    }
+
+    /// Classify every pending hunk in one file against its baseline.
+    fn classify_file(&mut self, rel: &str, now: Tick, notices: &mut Vec<Notice>) -> Result<()> {
+        let manifest = Manifest::require(&self.project)?;
+        let real = self.project.repo_root.join(rel);
+        let after = present::read_lines(&real)?;
+        let strict = self.cfg.strict_whitespace;
+
+        let targets: Vec<Hunk> = manifest
+            .hunks
+            .iter()
+            .filter(|h| h.file == rel && h.status == Status::Pending)
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        // Absent baseline means this file has not been seen since the last
+        // recompute; the current contents are the honest starting point.
+        let before = self
+            .baselines
+            .entry(rel.to_string())
+            .or_insert_with(|| after.clone())
+            .clone();
+
+        let mut typed_any = false;
+        for hunk in &targets {
+            if hunk.is_untypeable() {
+                // No line-by-line typing for these; the gate is byte equality.
+                let shadow = self.project.shadow_dir.join(rel);
+                if present::classify_by_bytes(&real, &shadow) == Classification::Typed
+                    && self.commit_typed(&hunk.id, &hunk.key)?
+                {
+                    typed_any = true;
+                }
+                continue;
+            }
+
+            let outcome = observe(&before, &after, hunk, strict);
+            self.watchdog.observe(&hunk.id, &outcome, now);
+            match outcome {
+                Observation::Typed => {
+                    if self.commit_typed(&hunk.id, &hunk.key)? {
+                        typed_any = true;
+                        notices.push(Notice::info(format!("typed — {}", hunk.file)));
+                    }
+                }
+                Observation::InProgress | Observation::Untouched => {
+                    // If a question was open and the text is now on its way to
+                    // the proposal, withdraw it rather than making them answer.
+                    if hunk.pending_divergence.is_some() {
+                        self.withdraw_question(&hunk.id)?;
+                    }
+                }
+                Observation::Disagrees { .. } => {}
+            }
+        }
+
+        if typed_any {
+            // The region now matches the shadow, so the hunk must leave the
+            // fresh set and every later anchor in the file has shifted.
+            self.retake_baseline(rel)?;
+
+            // Every other hunk in this file was just judged against a baseline
+            // that predates the line we accepted, so `before != after` held for
+            // reasons that had nothing to do with them — and an untouched hunk
+            // whose old text is not a prefix of its proposal reads as a
+            // disagreement. Disarm them: typing one hunk correctly must never
+            // raise a question about its neighbour. A genuine disagreement
+            // re-arms on the next save, now against an honest baseline.
+            for hunk in &targets {
+                self.watchdog.disarm(&hunk.id);
+            }
+            self.arm_recompute(now);
+        }
+        Ok(())
+    }
+
+    /// Write a terminal status, but only if the hunk is still what we classified.
+    ///
+    /// Classification runs unlocked, so between reading the file and writing the
+    /// verdict the agent may have reworked this region — which gives it a new id
+    /// and a new key. Committing anyway would mark a hunk typed that the user
+    /// has never seen.
+    fn commit_typed(&self, id: &str, key: &str) -> Result<bool> {
+        session::with_session(&self.project, |m| {
+            let Some(h) = m.find_mut(id) else {
+                return Ok(false);
+            };
+            if h.status != Status::Pending || h.key != key {
+                return Ok(false);
+            }
+            h.status = Status::Typed;
+            h.pending_divergence = None;
+            m.last_presented = Some(id.to_string());
+            Ok(true)
+        })
+    }
+
+    fn withdraw_question(&self, id: &str) -> Result<()> {
+        session::with_session(&self.project, |m| {
+            if let Some(h) = m.find_mut(id) {
+                h.pending_divergence = None;
+            }
+            Ok(())
+        })
+    }
+
+    /// Promote candidates that have sat still for the whole grace window.
+    fn raise_due_questions(&mut self, now: Tick, notices: &mut Vec<Notice>) -> Result<()> {
+        let grace = self.cfg.watch_divergence_grace_ms;
+        let due = self.watchdog.due(now, grace);
+        for (id, actual) in due {
+            let manifest = Manifest::require(&self.project)?;
+            let Some(h) = manifest.find(&id) else {
+                self.watchdog.disarm(&id);
+                continue;
+            };
+            if h.status != Status::Pending {
+                self.watchdog.disarm(&id);
+                continue;
+            }
+            if h.pending_divergence.is_some() {
+                continue; // already asked
+            }
+            let proposed = h.new_lines.clone();
+            let key = h.key.clone();
+            let file = h.file.clone();
+            let asked = session::with_session(&self.project, |m| {
+                let Some(h) = m.find_mut(&id) else {
+                    return Ok(false);
+                };
+                if h.status != Status::Pending || h.key != key {
+                    return Ok(false);
+                }
+                h.pending_divergence = Some(Divergence { proposed, actual });
+                Ok(true)
+            })?;
+            if asked {
+                notices.push(Notice::info(format!("your version differs — {file}")));
+            }
+        }
+        Ok(())
+    }
+
+    fn arm_recompute(&mut self, now: Tick) {
+        let at = Tick(now.0 + self.cfg.watch_debounce_ms);
+        // Trailing edge: a burst of saves keeps pushing the deadline out, so a
+        // steady stream of keystrokes costs exactly one re-diff at the end.
+        self.recompute = Pending::At(at);
+    }
+
+    fn run_due_recompute(&mut self, now: Tick, notices: &mut Vec<Notice>) -> Result<()> {
+        let due = match self.recompute {
+            Pending::At(at) if now >= at => true,
+            _ => {
+                // Even in silence, sweep occasionally: HEAD can move without
+                // any file under either tree changing.
+                !matches!(self.last_recompute,
+                    Some(last) if now.since(last) < FLOOR_SWEEP.as_millis() as u64)
+            }
+        };
+        if !due {
+            return Ok(());
+        }
+        if let Some(last) = self.last_recompute {
+            if now.since(last) < RECOMPUTE_FLOOR.as_millis() as u64 {
+                return Ok(()); // too soon; the deadline stays armed
+            }
+        }
+
+        let report =
+            session::with_session_recomputed(&self.project, &self.cfg, |_m, r| Ok(r.clone()))?;
+        self.recompute = Pending::No;
+        self.last_recompute = Some(now);
+        self.drift = report.drift;
+        for w in report.warnings {
+            notices.push(Notice::warn(w));
+        }
+        self.refresh_baselines()?;
+        Ok(())
+    }
+
+    /// Take a baseline for every file with work in it that lacks one, and drop
+    /// baselines for files that no longer do.
+    fn refresh_baselines(&mut self) -> Result<()> {
+        let files = self.pending_files()?;
+        let wanted: HashSet<&String> = files.iter().collect();
+        self.baselines.retain(|k, _| wanted.contains(k));
+        for rel in &files {
+            if !self.baselines.contains_key(rel) {
+                let lines = present::read_lines(&self.project.repo_root.join(rel))?;
+                self.baselines.insert(rel.clone(), lines);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-read a file's baseline right now.
+    ///
+    /// Called the instant a hunk in it reaches a terminal status. Without this
+    /// the next hunk in the same file is compared against a snapshot that
+    /// predates the one just typed, so `before != after` holds trivially and the
+    /// user's very first keystroke on it reads as a disagreement.
+    fn retake_baseline(&mut self, rel: &str) -> Result<()> {
+        let lines = present::read_lines(&self.project.repo_root.join(rel))?;
+        self.baselines.insert(rel.to_string(), lines);
+        Ok(())
+    }
+
+    fn pending_files(&self) -> Result<Vec<String>> {
+        let manifest = Manifest::require(&self.project)?;
+        let mut files: Vec<String> = manifest.pending().map(|h| h.file.clone()).collect();
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
+    /// Apply a front-end verb.
+    pub fn apply(
+        &mut self,
+        cmd: state::Command,
+        now: Tick,
+        notices: &mut Vec<Notice>,
+    ) -> Result<()> {
+        match cmd {
+            state::Command::Skip { hunk_id } => {
+                let file = session::with_session(&self.project, |m| {
+                    let Some(h) = m.find_mut(&hunk_id) else {
+                        return Ok(None);
+                    };
+                    h.status = Status::Skipped;
+                    let file = h.file.clone();
+                    m.last_presented = Some(hunk_id.clone());
+                    Ok(Some(file))
+                })?;
+                self.watchdog.disarm(&hunk_id);
+                if let Some(file) = file {
+                    self.retake_baseline(&file)?;
+                    notices.push(Notice::info(format!("skipped — {file}")));
+                }
+            }
+            state::Command::Resolve { hunk_id, choice } => {
+                let file = session::with_session(&self.project, |m| {
+                    let Some(h) = m.find_mut(&hunk_id) else {
+                        return Ok(None);
+                    };
+                    let Some(d) = h.pending_divergence.take() else {
+                        return Ok(None);
+                    };
+                    match choice {
+                        state::Resolution::Keep => {
+                            h.status = Status::Diverged;
+                            h.divergence = Some(d);
+                        }
+                        // Retry has no editor to relaunch any more: it withdraws
+                        // the question and lets the user keep typing.
+                        state::Resolution::Retry => {}
+                    }
+                    let file = h.file.clone();
+                    m.last_presented = Some(hunk_id.clone());
+                    Ok(Some(file))
+                })?;
+                self.watchdog.disarm(&hunk_id);
+                if let Some(file) = file {
+                    self.retake_baseline(&file)?;
+                    notices.push(Notice::info(match choice {
+                        state::Resolution::Keep => format!("kept your version — {file}"),
+                        state::Resolution::Retry => format!("still watching — {file}"),
+                    }));
+                }
+            }
+            state::Command::Show { hunk_id } => {
+                if let Some(id) = hunk_id {
+                    session::with_session(&self.project, |m| {
+                        if m.find(&id).is_some() {
+                            m.last_presented = Some(id.clone());
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+            state::Command::Refresh => {
+                self.recompute = Pending::At(now);
+                self.last_recompute = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a snapshot, emitting one only when something actually moved.
+    fn publish(&mut self, notices: Vec<Notice>) -> Result<Vec<state::Event>> {
+        let manifest = Manifest::require(&self.project)?;
+        let changed = self.last_published != Some(manifest.generation);
+        if !changed && notices.is_empty() {
+            return Ok(vec![state::Event::Heartbeat {
+                generation: manifest.generation,
+            }]);
+        }
+        self.last_published = Some(manifest.generation);
+
+        let anchor = match manifest.active() {
+            Some(h) => {
+                let real = self.project.repo_root.join(&h.file);
+                let lines = present::read_lines(&real)?;
+                let a = present::find_anchor(&lines, h);
+                Some((a.line, a.via, real.to_string_lossy().into_owned()))
+            }
+            None => None,
+        };
+        let snap = state::Snapshot::build(&manifest, anchor, self.drift, notices);
+        Ok(vec![state::Event::Snapshot(Box::new(snap))])
+    }
+
+    /// Block on the channel, stepping until it closes or the session ends.
+    ///
+    /// Concrete `Receiver` rather than an injected trait: the tests drive `step`
+    /// directly, which is strictly more precise than driving a fake source, and
+    /// a trait whose only implementation is the real one is a trait that only
+    /// costs indirection.
+    pub fn run(
+        &mut self,
+        rx: &std::sync::mpsc::Receiver<EngineEvent>,
+        mut sink: impl FnMut(state::Event) -> Result<bool>,
+    ) -> Result<()> {
+        loop {
+            let ev = match rx.recv_timeout(self.tick()) {
+                Ok(ev) => Some(ev),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            };
+            let now = self.now();
+            let out = self
+                .step(ev, now)
+                .context("the watch engine failed while handling an event")?;
+            for e in out {
+                let closed = matches!(e, state::Event::Closed { .. });
+                if !sink(e)? || closed {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hunks::Op;
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn hunk(old: &[&str], new: &[&str], after: &[&str]) -> Hunk {
+        let mut h = Hunk {
+            id: "h-one".into(),
+            key: "k-one".into(),
+            file: "a.rs".into(),
+            op: Op::Replace,
+            context_before: lines(&["fn a() {"]),
+            old_lines: lines(old),
+            new_lines: lines(new),
+            context_after: lines(after),
+            anchor_hint: 2,
+            status: Status::Pending,
+            divergence: None,
+            note: None,
+            pending_divergence: None,
+            curator_note: None,
+            curator_rank: None,
+            input: Default::default(),
+        };
+        h.key = Hunk::compute_key(&h.file, &h.old_lines, &h.new_lines);
+        h
+    }
+
+    // -------------------------------------------------------- observe
+
+    #[test]
+    fn a_half_typed_hunk_is_in_progress_not_a_disagreement() {
+        // The whole reason the engine exists in this shape. `classify` calls
+        // this Diverged, and a watcher built on that alone would interrupt the
+        // user on every keystroke-flush.
+        let h = hunk(&["    one();"], &["    two();"], &["}"]);
+        let before = lines(&["fn a() {", "    one();", "}"]);
+
+        for partial in ["", "    ", "    tw"] {
+            let after = lines(&["fn a() {", partial, "}"]);
+            assert_eq!(
+                observe(&before, &after, &h, false),
+                Observation::InProgress,
+                "{partial:?} is on its way to the proposal"
+            );
+        }
+
+        let done = lines(&["fn a() {", "    two();", "}"]);
+        assert_eq!(observe(&before, &done, &h, false), Observation::Typed);
+    }
+
+    #[test]
+    fn a_finished_but_different_line_disagrees() {
+        let h = hunk(&["    one();"], &["    two();"], &["}"]);
+        let before = lines(&["fn a() {", "    one();", "}"]);
+        let mine = lines(&["fn a() {", "    my_own_thing();", "}"]);
+        assert_eq!(
+            observe(&before, &mine, &h, false),
+            Observation::Disagrees {
+                actual: lines(&["    my_own_thing();"])
+            }
+        );
+    }
+
+    // -------------------------------------------------------- watchdog
+
+    #[test]
+    fn a_long_pause_while_still_a_prefix_never_asks() {
+        // Nothing is ever armed for an in-progress region, so no amount of
+        // thinking time produces a question.
+        let mut w = Watchdog::default();
+        for t in [0, 1_000, 60_000, 3_600_000] {
+            w.observe("h-one", &Observation::InProgress, Tick(t));
+            assert!(w.due(Tick(t), 2000).is_empty(), "at {t}ms");
+        }
+    }
+
+    #[test]
+    fn a_disagreement_becomes_due_only_after_the_window() {
+        let mut w = Watchdog::default();
+        let d = Observation::Disagrees {
+            actual: lines(&["mine"]),
+        };
+        w.observe("h-one", &d, Tick(1_000));
+
+        assert!(
+            w.due(Tick(1_500), 2000).is_empty(),
+            "still inside the window"
+        );
+        assert!(w.due(Tick(2_999), 2000).is_empty(), "one ms short");
+        let due = w.due(Tick(3_000), 2000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, "h-one");
+        assert_eq!(due[0].1, lines(&["mine"]));
+    }
+
+    #[test]
+    fn a_save_inside_the_window_rearms_it() {
+        // The window measures stillness, not time since the first mistake.
+        let mut w = Watchdog::default();
+        let d = Observation::Disagrees {
+            actual: lines(&["mine"]),
+        };
+        w.observe("h-one", &d, Tick(0));
+        w.observe("h-one", &d, Tick(1_500));
+        assert!(w.due(Tick(2_000), 2000).is_empty(), "re-armed at 1500");
+        assert!(!w.due(Tick(3_500), 2000).is_empty(), "quiet since 1500");
+    }
+
+    #[test]
+    fn fixing_the_text_withdraws_the_candidate() {
+        let mut w = Watchdog::default();
+        w.observe(
+            "h-one",
+            &Observation::Disagrees {
+                actual: lines(&["wrong"]),
+            },
+            Tick(0),
+        );
+        assert!(w.is_armed("h-one"));
+        w.observe("h-one", &Observation::InProgress, Tick(100));
+        assert!(!w.is_armed("h-one"), "back on track, nothing to ask");
+        assert!(w.due(Tick(10_000), 2000).is_empty());
+    }
+
+    #[test]
+    fn a_zero_window_still_suppresses_an_in_progress_prefix() {
+        // grace = 0 means "ask at the first quiet moment", not "ask always" —
+        // layer one is what makes zero a safe setting.
+        let mut w = Watchdog::default();
+        w.observe("h-one", &Observation::InProgress, Tick(0));
+        assert!(w.due(Tick(0), 0).is_empty());
+
+        w.observe(
+            "h-one",
+            &Observation::Disagrees {
+                actual: lines(&["mine"]),
+            },
+            Tick(0),
+        );
+        assert_eq!(
+            w.due(Tick(0), 0).len(),
+            1,
+            "a real disagreement asks at once"
+        );
+    }
+
+    #[test]
+    fn typed_clears_any_armed_candidate() {
+        let mut w = Watchdog::default();
+        w.observe(
+            "h-one",
+            &Observation::Disagrees {
+                actual: lines(&["wrong"]),
+            },
+            Tick(0),
+        );
+        w.observe("h-one", &Observation::Typed, Tick(10));
+        assert!(!w.is_armed("h-one"));
+    }
+
+    #[test]
+    fn questions_come_out_in_a_deterministic_order() {
+        // They become manifest writes, and a HashMap's order is not an order.
+        let mut w = Watchdog::default();
+        let d = Observation::Disagrees {
+            actual: lines(&["x"]),
+        };
+        for id in ["h-c", "h-a", "h-b"] {
+            w.observe(id, &d, Tick(0));
+        }
+        let ids: Vec<String> = w
+            .due(Tick(5_000), 100)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ids, vec!["h-a", "h-b", "h-c"]);
+    }
+}

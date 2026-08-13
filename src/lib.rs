@@ -9,6 +9,7 @@
 pub mod config;
 pub mod detect;
 pub mod diffparse;
+pub mod engine;
 pub mod git;
 pub mod hunks;
 pub mod paths;
