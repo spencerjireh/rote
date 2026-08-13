@@ -220,7 +220,7 @@ fn the_reviewer_is_invoked_with_tool_restriction_and_the_prompt() {
         args.contains("typed in manually"),
         "the review prompt: {args}"
     );
-    assert!(args.contains("--allowedTools"), "tool restriction: {args}");
+    assert!(args.contains("--tools"), "tool restriction: {args}");
 }
 
 #[test]

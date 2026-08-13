@@ -386,8 +386,8 @@ fn present_one(
     let is_new = hunk.op == Op::CreateFile;
 
     loop {
-        let file_lines = present::read_lines(real_file)?;
-        let anchor = present::find_anchor(&file_lines, hunk);
+        let before = present::read_lines(real_file)?;
+        let anchor = present::find_anchor(&before, hunk);
         print!("{}", present::render(hunk, position, total, &anchor, color));
         println!("opening {} at {}:{} …", editor[0], hunk.file, anchor.line);
 
@@ -397,7 +397,7 @@ fn present_one(
         }
 
         let after = present::read_lines(real_file)?;
-        match present::classify(&after, hunk, cfg.strict_whitespace) {
+        match present::classify(&before, &after, hunk, cfg.strict_whitespace) {
             Classification::Diverged { actual } => {
                 print!(
                     "{}",

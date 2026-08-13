@@ -174,20 +174,30 @@ fn region<'a>(
     &file_lines[start..end]
 }
 
-/// Decide what the user did, by reading the file back. DESIGN.md §6.
-pub fn classify(file_lines: &[String], hunk: &Hunk, strict_whitespace: bool) -> Classification {
-    let anchor = find_anchor(file_lines, hunk);
-    let start = anchor.index();
-
-    // Did they type the proposal?
-    let as_new = region(file_lines, start, hunk, hunk.new_lines.len());
+/// Decide what the user did, by comparing the file before and after. DESIGN.md §6.
+///
+/// "Untouched" is decided by comparing against `before` rather than by checking
+/// whether the region still equals `old_lines`. That inference looks equivalent
+/// and is not: for a pure insert `old_lines` is empty, so on a hunk with no
+/// trailing context the check compares an empty region against an empty vector
+/// and is vacuously true — reporting every botched transcription of a trailing
+/// insert as "untouched" and silently skipping the divergence prompt.
+pub fn classify(
+    before: &[String],
+    after: &[String],
+    hunk: &Hunk,
+    strict_whitespace: bool,
+) -> Classification {
+    // Did they type the proposal? Checked first: a correct transcription is
+    // `typed` even in the odd case where it leaves the file byte-identical.
+    let anchor = find_anchor(after, hunk);
+    let as_new = region(after, anchor.index(), hunk, hunk.new_lines.len());
     if lines_eq(as_new, &hunk.new_lines, strict_whitespace) {
         return Classification::Typed;
     }
 
-    // Is it still exactly what was there before?
-    let as_old = region(file_lines, start, hunk, hunk.old_lines.len());
-    if lines_eq(as_old, &hunk.old_lines, strict_whitespace) {
+    // Nothing happened at all.
+    if before == after {
         return Classification::Untouched;
     }
 
@@ -466,22 +476,27 @@ mod tests {
     #[test]
     fn classifies_an_exact_transcription_as_typed() {
         let h = hunk(&["fn a() {"], &["    one();"], &["    two();"], &["}"], 2);
+        let before = lines(&["fn a() {", "    one();", "}"]);
         let after = lines(&["fn a() {", "    two();", "}"]);
-        assert_eq!(classify(&after, &h, false), Classification::Typed);
+        assert_eq!(classify(&before, &after, &h, false), Classification::Typed);
     }
 
     #[test]
     fn classifies_an_unopened_file_as_untouched() {
         let h = hunk(&["fn a() {"], &["    one();"], &["    two();"], &["}"], 2);
         let unchanged = lines(&["fn a() {", "    one();", "}"]);
-        assert_eq!(classify(&unchanged, &h, false), Classification::Untouched);
+        assert_eq!(
+            classify(&unchanged, &unchanged, &h, false),
+            Classification::Untouched
+        );
     }
 
     #[test]
     fn classifies_a_variant_as_divergence_and_keeps_it() {
         let h = hunk(&["fn a() {"], &["    one();"], &["    two();"], &["}"], 2);
+        let before = lines(&["fn a() {", "    one();", "}"]);
         let variant = lines(&["fn a() {", "    two_but_mine();", "}"]);
-        match classify(&variant, &h, false) {
+        match classify(&before, &variant, &h, false) {
             Classification::Diverged { actual } => {
                 assert_eq!(actual, lines(&["    two_but_mine();"]))
             }
@@ -492,11 +507,15 @@ mod tests {
     #[test]
     fn trailing_whitespace_is_tolerated_by_default() {
         let h = hunk(&["fn a() {"], &["    one();"], &["    two();"], &["}"], 2);
+        let before = lines(&["fn a() {", "    one();", "}"]);
         let with_trailing = lines(&["fn a() {", "    two();   ", "}"]);
-        assert_eq!(classify(&with_trailing, &h, false), Classification::Typed);
+        assert_eq!(
+            classify(&before, &with_trailing, &h, false),
+            Classification::Typed
+        );
         // ...but not when the user asks for strictness.
         assert!(matches!(
-            classify(&with_trailing, &h, true),
+            classify(&before, &with_trailing, &h, true),
             Classification::Diverged { .. }
         ));
     }
@@ -505,17 +524,19 @@ mod tests {
     fn a_stray_carriage_return_is_absorbed() {
         // DESIGN.md §9.11: CRLF is covered by the same tolerance.
         let h = hunk(&["fn a() {"], &["    one();"], &["    two();"], &["}"], 2);
+        let before = lines(&["fn a() {", "    one();", "}"]);
         let crlf = lines(&["fn a() {", "    two();\r", "}"]);
-        assert_eq!(classify(&crlf, &h, false), Classification::Typed);
+        assert_eq!(classify(&before, &crlf, &h, false), Classification::Typed);
     }
 
     #[test]
     fn leading_whitespace_is_never_tolerated() {
         // Indentation is meaning, not formatting.
         let h = hunk(&["fn a() {"], &["    one();"], &["    two();"], &["}"], 2);
+        let before = lines(&["fn a() {", "    one();", "}"]);
         let wrong_indent = lines(&["fn a() {", "two();", "}"]);
         assert!(matches!(
-            classify(&wrong_indent, &h, false),
+            classify(&before, &wrong_indent, &h, false),
             Classification::Diverged { .. }
         ));
     }
@@ -523,27 +544,72 @@ mod tests {
     #[test]
     fn a_multi_line_insertion_classifies_as_typed() {
         let h = hunk(&["start"], &[], &["one", "two", "three"], &["end"], 2);
+        let before = lines(&["start", "end"]);
         let after = lines(&["start", "one", "two", "three", "end"]);
-        assert_eq!(classify(&after, &h, false), Classification::Typed);
+        assert_eq!(classify(&before, &after, &h, false), Classification::Typed);
     }
 
     #[test]
     fn a_deletion_is_typed_once_the_lines_are_gone() {
         let h = hunk(&["keep"], &["remove me", "and me"], &[], &["also keep"], 2);
-        let after = lines(&["keep", "also keep"]);
-        assert_eq!(classify(&after, &h, false), Classification::Typed);
-        // Before deleting, it reads as untouched.
         let before = lines(&["keep", "remove me", "and me", "also keep"]);
-        assert_eq!(classify(&before, &h, false), Classification::Untouched);
+        let after = lines(&["keep", "also keep"]);
+        assert_eq!(classify(&before, &after, &h, false), Classification::Typed);
+        // Before deleting, it reads as untouched.
+        assert_eq!(
+            classify(&before, &before, &h, false),
+            Classification::Untouched
+        );
     }
 
     #[test]
     fn a_new_file_classifies_from_empty() {
         let mut h = hunk(&[], &[], &["line one", "line two"], &[], 1);
         h.op = Op::CreateFile;
-        assert_eq!(classify(&[], &h, false), Classification::Untouched);
+        assert_eq!(classify(&[], &[], &h, false), Classification::Untouched);
         let created = lines(&["line one", "line two"]);
-        assert_eq!(classify(&created, &h, false), Classification::Typed);
+        assert_eq!(classify(&[], &created, &h, false), Classification::Typed);
+    }
+
+    #[test]
+    fn a_botched_trailing_insert_is_a_divergence_not_untouched() {
+        // No context_after (the insert lands at end of file) and no old_lines.
+        // The old "does the region still equal old_lines" check compared two
+        // empty vectors here and always said untouched, so a mistyped insert
+        // skipped the divergence prompt entirely.
+        let h = hunk(
+            &["def add(a, b):", "    return a + b"],
+            &[],
+            &["", "def sub(a, b):", "    return a - b"],
+            &[],
+            3,
+        );
+        let before = lines(&["def add(a, b):", "    return a + b"]);
+        let mistyped = lines(&[
+            "def add(a, b):",
+            "    return a + b",
+            "",
+            "def sub(a, b):",
+            "    return a + b",
+        ]);
+        match classify(&before, &mistyped, &h, false) {
+            Classification::Diverged { actual } => {
+                assert!(actual.iter().any(|l| l.contains("a + b")), "{actual:?}");
+            }
+            other => panic!("a mistyped insert must diverge, got {other:?}"),
+        }
+        // The correct transcription still reads as typed.
+        let correct = lines(&[
+            "def add(a, b):",
+            "    return a + b",
+            "",
+            "def sub(a, b):",
+            "    return a - b",
+        ]);
+        assert_eq!(
+            classify(&before, &correct, &h, false),
+            Classification::Typed
+        );
     }
 
     #[test]

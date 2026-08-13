@@ -29,7 +29,7 @@ so in one line.";
 ///
 /// Principle 1 is unaffected — that governs the *session* agent, which rote
 /// launches completely unconfigured.
-pub const REVIEWER_TOOL_FLAGS: &[&str] = &["--allowedTools", ""];
+pub const REVIEWER_TOOL_FLAGS: &[&str] = &["--tools", ""];
 
 /// How long the reviewer gets before rote gives up and moves on.
 pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(300);
