@@ -3,9 +3,11 @@
 # Builds from source rather than shipping a bottle: no release artifacts to
 # maintain, no checksums to chase, and it works the moment the tag exists.
 #
-# Install locally, without publishing a tap:
+# Homebrew 6 refuses formulae given as a loose file path — they must live in a
+# tap. Tapping this repo by URL works without a separate homebrew-rote repo:
 #
-#     brew install --formula ./Formula/rote.rb
+#     brew tap spencerjireh/rote https://github.com/spencerjireh/rote
+#     brew install spencerjireh/rote/rote
 #
 # On a new release: tag it, push the tag, then `just formula-sha <tag>` and
 # update both the url and the sha256 below. The hash covers GitHub's generated

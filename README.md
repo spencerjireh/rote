@@ -15,11 +15,16 @@ usually means crippling the agent. This doesn't.
 
 ## Install
 
-Via Homebrew, from the formula in this repo:
+Via Homebrew:
 
 ```
-brew install --formula ./Formula/rote.rb
+brew tap spencerjireh/rote https://github.com/spencerjireh/rote
+brew install spencerjireh/rote/rote
 ```
+
+The tap points straight at this repository — Homebrew requires formulae to live
+in a tap rather than a loose file, but it does not require a separate
+`homebrew-rote` repo when you give it the URL.
 
 Or from source:
 

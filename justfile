@@ -46,9 +46,20 @@ formula-sha version="v0.1.0":
     echo "paste into Formula/rote.rb:" >&2
     echo "  sha256 \"$sha\"" >&2
 
-# Install the local formula through Homebrew.
-brew-install:
-    brew install --formula ./Formula/rote.rb
+# Tap this repo and install through Homebrew.
+#
+# Homebrew 6 rejects `brew install --formula ./path.rb`: formulae must come
+# from a tap. Tapping by URL avoids needing a separate homebrew-rote repo.
+brew-tap:
+    brew tap {{owner}}/{{repo}} https://github.com/{{owner}}/{{repo}}
+
+brew-install: brew-tap
+    brew install {{owner}}/{{repo}}/{{repo}}
+
+# Pick up a formula change after pushing it.
+brew-reinstall:
+    brew update --quiet
+    brew reinstall {{owner}}/{{repo}}/{{repo}}
 
 # Syntax-check the formula. Deliberately NOT `brew audit`.
 #
