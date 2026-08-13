@@ -3,11 +3,11 @@
 Use Claude Code at full capability, and type every line in yourself.
 
 `rote` runs Claude Code inside a shadow clone of your repository. The agent works
-completely normally — editing files, installing dependencies, running tests — and
-is never told anything unusual is happening, because from its perspective nothing
-is. Your real working tree is never touched by it. What the session produces is a
-*diff*, which rote serves back to you hunk by hunk, anchored in your editor, for
-you to type in by hand.
+normally: editing files, installing dependencies, running tests. It is never told
+anything unusual is happening, because from its perspective nothing is. Your real
+working tree is never touched by it. What the session produces is a *diff*, which
+rote serves back to you hunk by hunk, anchored in your editor, for you to type in
+by hand.
 
 The idea comes from Ankur Sethi's essay on cognitive debt: retyping generated code
 is what keeps it in your head. The problem with doing that by hand is that it
@@ -22,9 +22,9 @@ brew tap spencerjireh/rote https://github.com/spencerjireh/rote
 brew install spencerjireh/rote/rote
 ```
 
-The tap points straight at this repository — Homebrew requires formulae to live
-in a tap rather than a loose file, but it does not require a separate
-`homebrew-rote` repo when you give it the URL.
+The tap points straight at this repository. Homebrew requires formulae to live in
+a tap rather than a loose file, but it does not need a separate `homebrew-rote`
+repo when you give it the URL.
 
 Or from source:
 
@@ -32,7 +32,7 @@ Or from source:
 cargo install --path .          # or: just install
 ```
 
-Requires `git`, and — for real use — `claude` on PATH. Linux and macOS only.
+Requires `git`, plus `claude` on PATH for real use. Linux and macOS only.
 
 ## First run
 
@@ -42,16 +42,15 @@ rote doctor     # confirms this machine is ready
 ```
 
 `doctor` checks git, claude, the reviewer's tool-restriction flag, your editor,
-the global config, and — when you are in a repo — the repository, the shadow
+the global config, and (when you are in a repo) the repository, the shadow
 location, and the project config. Every line either passes or names the command
 that fixes it, and it exits non-zero if anything needs attention, so it works as
-a script gate. It runs outside a repository too, which is usually where you are
-when you first install something.
+a script gate. It also runs outside a repository, which is where you are right
+after installing.
 
-`rote doctor --deep` additionally makes one real `claude` call to prove the
-reviewer path works end to end. That costs a token spend, which is why it is
-opt-in — but it is the only check that catches a flag that exists and behaves
-differently than expected.
+`rote doctor --deep` also makes one real `claude` call, which proves the reviewer
+path works end to end. It is opt-in because that costs an API call, but it is the
+only check that catches a flag that exists and behaves differently than expected.
 
 ## Quickstart
 
@@ -62,12 +61,12 @@ rote start "add tagging to posts"
 ```
 
 `rote init` detects what kind of project this is and prefills `[checks]` with
-commands it has verified actually run here — so `rote done` verifies something
-from the start rather than silently checking nothing. It prints what it chose.
+commands it has verified will run here, so `rote done` checks something from the
+start instead of passing silently. It prints what it chose.
 
-`start` syncs the shadow and hands your pane to claude. Argue with it, iterate,
-run its tests — all inside the shadow. When you have what you want, quit claude
-(or flip to a second pane) and start transcribing:
+`start` syncs the shadow and hands your pane to claude. Argue with it and run its
+tests, all inside the shadow. When you have what you want, quit claude (or flip
+to a second pane) and start transcribing:
 
 ```
 rote next      # shows one hunk, opens your editor on it
@@ -90,10 +89,10 @@ pane, rote in the right.
 └─────────────────────────┴─────────────────────────┘
 ```
 
-You can go back to the agent at any point — `rote talk --attach` resumes the
-session — ask for rework, and carry on. The next `rote next` absorbs whatever
-changed. Hunks you already typed stay typed; hunks the agent reworked are
-re-offered as new ones.
+You can go back to the agent at any point: `rote talk --attach` resumes the
+session, so you can ask for rework and carry on. The next `rote next` absorbs
+whatever changed. Hunks you already typed stay typed; hunks the agent reworked
+are re-offered as new ones.
 
 ## Commands
 
@@ -124,13 +123,13 @@ your version differs from the proposal:
 [k]eep mine   [r]etry (reopen editor)   [s]how full hunk again
 ```
 
-`k` records both versions and moves on — and that decision sticks. The proposal
-will not be offered again, this recompute or any later one. `r` reopens your
+`k` records both versions and moves on. The proposal will not be offered again,
+this recompute or any later one. `r` reopens your
 editor to try again.
 
-Files you can't meaningfully type — binaries, lockfiles — are never opened in an
-editor. rote shows the path and a note, then simply checks whether the file
-matches. Run `cargo add` or `npm install` yourself and it clears.
+Files you can't meaningfully type (binaries, lockfiles) are never opened in an
+editor. rote shows the path and a note, then checks whether the file matches. Run
+`cargo add` or `npm install` yourself and it clears.
 
 ## Configuration
 
@@ -180,7 +179,7 @@ inheriting a pager is a worse failure than an explicit setting.
 <repo>/.rote.toml
 ```
 
-XDG paths on both Linux and macOS, so the escape hatch below is literally true
+XDG paths on both Linux and macOS, so the escape hatch below works as written
 everywhere. rote refuses to run if those directories would land inside the
 repository it is shadowing — which happens by default when the repository *is*
 your home directory, as with a dotfiles repo. Point `XDG_CACHE_HOME` elsewhere
@@ -204,15 +203,15 @@ The shadow is disposable by design. If it ever gets into a state you don't like:
 rm -rf ~/.cache/rote/<hash>
 ```
 
-The next `rote start` rebuilds it. Nothing in your real repository is affected —
-by construction, rote never writes source into it.
+The next `rote start` rebuilds it. Nothing in your real repository is affected:
+rote never writes source into it.
 
 ## What it will not do
 
 No hooks, no MCP servers, no SDK, no prompt injection. rote's entire coupling to
 Claude Code is the working directory it launches the agent in, plus tool-
 restriction flags on the separate headless reviewer at `done`. The session agent
-is completely unconfigured and cannot tell it is being shadowed.
+is unconfigured and cannot tell it is being shadowed.
 
 Also out of scope for v0: multiple concurrent sessions, non-git projects, the
 nvim ghost-text plugin (`rote next --json` is the seam it will use), paste
