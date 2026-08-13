@@ -9,6 +9,9 @@ use rote::paths::{self, Lock, ProjectPaths};
 use rote::present::{self, Classification};
 use rote::review;
 use rote::session::{self, Manifest, Terminal};
+use rote::shadow;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 /// How to answer a divergence question, on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -18,9 +21,6 @@ enum Resolution {
     /// Withdraw the question and carry on typing.
     Retry,
 }
-use rote::shadow;
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -70,7 +70,7 @@ enum Command {
     /// Show session state, task, and hunk counts.
     Status,
 
-    /// Present the next pending hunk and open your editor on it.
+    /// Print the hunk at the head of the queue. Display only.
     Next {
         /// Emit the next pending hunk as one JSON line instead of presenting it.
         #[arg(long, hide = true)]
@@ -382,16 +382,22 @@ fn cmd_doctor(cli: &Cli, cfg: &Config, deep: bool, color: bool) -> Result<ExitCo
     }
 
     // editor
+    // The editor is informational now, never a failure. rote does not launch
+    // one as part of the loop — it only offers to, from the `o` key in the
+    // watch pane — so a machine without one is a machine that transcribes
+    // perfectly well, and `doctor` must not exit non-zero over it.
     let editor = detect::probe_editor(cfg);
     match &editor.resolved {
         Some(p) => checks.push(Check::ok(
             "editor",
             format!("{} ({})", editor.command.join(" "), tilde(p)),
         )),
-        None => checks.push(Check::failed(
+        None => checks.push(Check::skipped(
             "editor",
-            format!("{} not on PATH", editor.command.join(" ")),
-            "set ROTE_EDITOR, or `editor` via `rote setup`",
+            format!(
+                "{} not on PATH — the open action in `rote watch` will not work",
+                editor.command.join(" ")
+            ),
         )),
     }
 
@@ -554,20 +560,10 @@ fn cmd_setup(cfg: &Config, force: bool, quiet: bool) -> Result<()> {
     // to answer — a non-tty takes the detected values.
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
-    let editor_cmd = if editor.found() || !interactive {
-        editor.command.join(" ")
-    } else {
-        println!(
-            "editor `{}` was not found on PATH.",
-            editor.command.join(" ")
-        );
-        let answer = prompt_line("which editor should rote open? [nvim] ")?;
-        if answer.trim().is_empty() {
-            "nvim".into()
-        } else {
-            answer.trim().to_string()
-        }
-    };
+    // Written unconditionally, and never prompted for. rote does not launch an
+    // editor as part of the loop any more, so stopping setup to ask about one
+    // would be blocking on an answer nothing needs.
+    let editor_cmd = editor.command.join(" ");
 
     let claude_cmd = if claude.found() || !interactive {
         cfg.claude_cmd.join(" ")
@@ -585,7 +581,8 @@ fn cmd_setup(cfg: &Config, force: bool, quiet: bool) -> Result<()> {
         r#"# rote global configuration.
 # Per-project .rote.toml files override anything set here.
 
-# Invoked as: editor +LINE FILE
+# Optional. rote never opens this on its own; it is what the `o` key in
+# `rote watch` runs, as: editor +LINE FILE
 editor = {editor}
 
 # The session agent. An argument vector, not a shell string.
@@ -696,7 +693,7 @@ fn cmd_done(
             println!("{p}");
         }
         if !force && !confirm("close anyway, marking them skipped? [y/N] ")? {
-            println!("left the session open. `rote next` continues.");
+            println!("left the session open. `rote watch` continues.");
             return Ok(());
         }
         session::with_session(project, |m| {

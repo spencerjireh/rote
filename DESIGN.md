@@ -8,17 +8,17 @@ Read ARCHITECTURE.md first. This document specifies component behavior, data sch
 
 Binary name: `rote`. All commands run from anywhere inside the real repo (repo root discovered by walking up to `.git`). Running outside a git repo is an error with a clear message.
 
-Two commands — `doctor` and `setup` — deliberately do **not** require a repository. They concern machine-level state (the claude binary, the editor, the global config), and `doctor` is the command you reach for when something is wrong, which may well be before you have a repo. Repo discovery is therefore per-command, not a precondition of dispatch.
+Two commands — `doctor` and `setup` — deliberately do **not** require a repository. They concern machine-level state (the claude binary, the global config), and `doctor` is the command you reach for when something is wrong, which may well be before you have a repo. Repo discovery is therefore per-command, not a precondition of dispatch.
 
 ### `rote doctor [--deep]`
-Read-only diagnosis of whether this machine can run rote. One aligned line per check — git, claude, the reviewer's tool-restriction flag, the editor, the global config, the repository, the shadow location, the project config — each either passing or naming the command that fixes it. Repository-scoped lines report `not in a git repository` rather than failing when run outside one. **Exits non-zero if any check fails**, so it can gate a script.
+Read-only diagnosis of whether this machine can run rote. One aligned line per check — git, claude, the reviewer's tool-restriction flag, the global config, the repository, the shadow location, the project config — each either passing or naming the command that fixes it. Repository-scoped lines report `not in a git repository` rather than failing when run outside one. **Exits non-zero if any check fails**, so it can gate a script.
 
 The reviewer check parses `claude --help` for the flag in `REVIEWER_TOOL_FLAGS` (§8): free, offline, and enough to catch a rename. `--deep` additionally runs one real `claude -p` invocation, which is the only check that catches a flag that exists but behaves differently than assumed. It is opt-in because it costs a token spend.
 
 `doctor` never writes anything.
 
 ### `rote setup [--force]`
-The only writer of `~/.config/rote/config.toml`, which nothing else creates. Runs the same detection as `doctor`, prompts only where detection is ambiguous, and refuses an existing file without `--force`. On a non-tty it takes the detected values without prompting, so it stays scriptable.
+The only writer of `~/.config/rote/config.toml`, which nothing else creates. Runs the same detection as `doctor`, prompts only where detection is ambiguous, and refuses an existing file without `--force`. It never prompts about the editor: rote does not launch one as part of the loop, so blocking on that answer would block on something nothing needs. On a non-tty it takes the detected values without prompting, so it stays scriptable.
 
 ### `rote init`
 Creates `.rote.toml` in the repo root (see §7). Idempotent; refuses to overwrite an existing file without `--force`.
@@ -28,7 +28,7 @@ Creates `.rote.toml` in the repo root (see §7). Idempotent; refuses to overwrit
 ### `rote start [TASK...]`
 - Errors if a session is already active (message: show `rote status`, suggest `done` or `abort`).
 - Errors if the real repo is in a merge/rebase/cherry-pick/bisect state (detect via `.git/MERGE_HEAD`, `.git/rebase-merge`, `.git/rebase-apply`, `.git/CHERRY_PICK_HEAD`, `.git/BISECT_LOG`).
-- **Preflights `claude_cmd` only**, and only when it is actually going to launch: if the binary does not resolve on PATH, fail naming it and suggesting `rote doctor`. Deliberately narrow — the editor is not needed until `next` and the reviewer not until `done`, so each command validates its own prerequisites at the point it needs them rather than every command running a full diagnostic.
+- **Preflights `claude_cmd` only**, and only when it is actually going to launch: if the binary does not resolve on PATH, fail naming it and suggesting `rote doctor`. Deliberately narrow — the reviewer is not needed until `done`, so each command validates its own prerequisites at the point it needs them rather than every command running a full diagnostic.
 - Creates the shadow clone if absent; syncs real → shadow (§3).
 - Writes the manifest: state `working`, `task` = joined TASK args (may be empty), `baseline` = snapshot info (§4).
 - **Releases the manifest lock before exec.** The lock records a PID and treats a live PID as held (§9.7); after `exec` that PID belongs to the claude process, which lives for the whole session. Failing to release here wedges every subsequent `rote` invocation until the user quits claude.
@@ -38,23 +38,33 @@ Creates `.rote.toml` in the repo root (see §7). Idempotent; refuses to overwrit
 ### `rote status`
 Prints: state, task, session age, shadow path, and if `transcribing`/`working`: files changed, hunk counts by status (pending / typed / diverged / skipped). Exit code 0 always (informational).
 
+### `rote watch`
+The transcription loop, and the only command in it. Watches the real tree and the shadow, reclassifies on save (§6), advances the queue, and redraws a full-screen pane. There is no command between a keystroke and the queue moving.
+
+Refuses while the repository is mid-merge or mid-rebase: every classification would be nonsense and the pane would report it confidently. Holds `watch.lock` for its lifetime, so two panes cannot fight over one queue — that lock is separate from the manifest lock, which the pane takes and releases around every write.
+
+Keys: `s` skip, `o` open the configured editor at the anchor, `g` refresh, `q` quit; `k`/`r` answer an open question. Hidden flags `--exit-when-empty` and `--timeout` exist for tests and scripts, so a wedged watcher fails rather than hangs.
+
 ### `rote next`
 - Errors if state is `idle`.
-- If state is `working`, transitions to `transcribing` on first call.
-- Runs **recompute** (§5), takes the first `pending` hunk, renders it (§6), launches the editor, classifies the outcome, updates the manifest, prints one-line progress (`[4/11] typed — src/models.py`).
+- Runs **recompute** (§5), takes the first `pending` hunk, renders it (§6), prints a `file:line` jump target, and exits. A printer, not a step in the loop: it classifies nothing and launches nothing. It exists so a plain shell, a script, or a `--json` consumer can see what is outstanding without a pane.
+- Untypeable hunks keep their byte gate here, because `classify_by_bytes` is two file reads and no subprocess — the one honest verdict a printer can still reach on its own.
 - Progress is position within the queue *as it stands after this recompute*, not a fixed target. The denominator moves when the agent reworks something or adds new work; that is expected, and the display should not pretend otherwise.
 - If the queue is empty: prints "nothing to transcribe" and, if all hunks are terminal, suggests `rote done`.
-- Hidden flag `--json`: instead of rendering + launching the editor, emit the next pending hunk as one JSON line (schema = the Hunk object in §4) and exit. This is the front-end seam. `--json` performs no classification.
+- Hidden flag `--json`: instead of rendering, emit the next pending hunk as one JSON line (schema = the Hunk object in §4) and exit. This is the front-end seam. `--json` performs no classification.
 
   There is deliberately **no verb that sets a hunk's status to `typed`**. The hidden `rote mark` did exactly that and has been removed. `Typed` is producible only by the classifier, whose input is the hunk's own `new_lines` — which came from the shadow. Three layers hold the line: no verb exists, the engine is the only producer, and reconcile rule 3 returns a `typed` hunk to the queue the moment the trees disagree again. A front end cannot assert its way to a finished session.
 
   Status changes a front end *may* make are the ones that record a human decision rather than a fact about the trees: `rote skip [HUNK_ID]`, and (from Stage 1) resolving a divergence. Both are addressed by hunk id, never by queue position — the head of the queue can move between the moment a front end renders a hunk and the moment the user acts on it.
 
-### `rote back`
-Re-prints the most recently presented hunk (`last_presented`) for reference. **It does not change the hunk's status and does not open the editor.** This is a display command, not an undo: rote never writes the real tree, so it cannot un-type keystrokes, and a correctly typed hunk has already vanished from the fresh diff (§5 rule 7) — there is nothing to restore. To re-edit a region, open it yourself; the next recompute will notice. One level of history is sufficient for v0.
+### `rote show [HUNK_ID]`
+Re-prints a hunk, defaulting to the most recently presented one (`last_presented`). **It changes nothing.** This is a display command, not an undo: rote never writes the real tree, so it cannot un-type keystrokes, and a correctly typed hunk has already vanished from the fresh diff (§5 rule 7) — there is nothing to restore. To re-edit a region, open it yourself; the watcher will notice.
 
-### `rote skip`
-Marks the current head-of-queue hunk `skipped` without opening the editor. Skip is **durable**: a skipped hunk stays skipped across recomputes (§5 rule 4), even though its region still differs between the trees. Skipped hunks are reported at `done` time and require explicit confirmation to close the session.
+### `rote resolve <HUNK_ID> keep|retry`
+Answers an open divergence question (§6). `keep` records both versions and makes the decision final; `retry` withdraws the question and lets the watcher carry on classifying as the user keeps typing. The id is required for both: unlike `skip` there is no sensible default, because the queue moves on past an unanswered question rather than blocking on it, so the hunk carrying one is usually not the active hunk.
+
+### `rote skip [HUNK_ID]`
+Marks a hunk `skipped`, defaulting to the active one. Skip is **durable**: a skipped hunk stays skipped across recomputes (§5 rule 4), even though its region still differs between the trees. Skipped hunks are reported at `done` time and require explicit confirmation to close the session.
 
 ### `rote talk`
 Prints the shadow path and, with `--attach`, execs `claude --continue` (configurable) in the shadow so the user can resume arguing with the session agent.
@@ -241,23 +251,21 @@ Untypeable hunks (binary, `[transcribe] verbatim`) render as path + `note` only,
 ### Anchoring
 `anchor_hint` is advisory. Real anchor at presentation time = search the current real file for the `context_before` block (exact line match); if found, anchor = line after it. Fallbacks, in order: search for `context_after` (anchor = line before it); fuzzy search (strip leading/trailing whitespace per line); finally fall back to `anchor_hint` with a warning line. Ambiguity (context matches at multiple positions): choose the match nearest `anchor_hint`.
 
-### Editor launch
-`$ROTE_EDITOR`, else `config.toml editor`, else `nvim`. **`$EDITOR` and `$VISUAL` are deliberately not consulted** — transcription wants a specific editor with a specific `+LINE` calling convention, and silently inheriting whatever `$EDITOR` happens to be (including `ed`, or a pager, or something with no `+LINE` support) is a worse failure than the explicit chain. ARCHITECTURE.md's data-flow sketch says `$EDITOR`; this document wins.
+### The open action (optional)
+rote does not launch an editor as part of the loop. It offers to, from the `o` key in the watch pane, and that is the only place an editor is ever invoked.
 
-Invocation: `<editor> +<anchor_line> <real_file_abs_path>`. Blocking wait on exit. (For `create_file` hunks: touch nothing; open `<editor> <path>` and let the user create it — the editor invocation must not create the file itself.)
+Resolution is `$ROTE_EDITOR`, else `config.toml editor`, else `nvim`. **`$EDITOR` and `$VISUAL` are deliberately not consulted** — the invocation uses a specific `+LINE` calling convention, and silently inheriting whatever `$EDITOR` happens to be (including `ed`, or a pager, or something with no `+LINE` support) is a worse failure than the explicit chain.
 
-### Classification (on editor exit)
+Invocation: `<editor> +<anchor_line> <real_file_abs_path>`. The pane leaves the alternate screen and restores cooked mode first, and the exit status is ignored — rote is not waiting on the editor to decide anything. Events queue while it has the terminal, so the user returns to a hunk that has already been classified. A machine with no editor is fully usable; `doctor` reports this as informational, never a failure.
+
+### Classification (on save)
 Re-locate the region via context matching as above, extract the lines between the context blocks, compare to `new_lines`:
 - Exact match (modulo trailing whitespace per line — configurable `strict_whitespace = false` default) → `typed`.
-- Region unchanged from before (still equals `old_lines`) → remains `pending`; print "untouched — run `rote next` to retry or `rote skip`".
-- Anything else → **divergence prompt** (user chose prompt-every-time):
-  ```
-  your version differs from the proposal:
-    proposal │ yours
-    (side-by-side or unified mini-diff of new_lines vs actual)
-  [k]eep mine   [r]etry (reopen editor)   [s]how full hunk again
-  ```
-  `keep` → status `diverged`, store both versions in `divergence`. `retry` → reopen editor, reclassify. The prompt loops until `k` or a successful retry.
+- **The region unchanged since the last baseline → `untouched`.** Per region, not per file: a file usually holds several hunks, so an edit to any one of them would otherwise make every other hunk in it look touched.
+- **A line-wise prefix of the proposal, last line allowed to be a character prefix → in progress.** No question is ever raised for it, however long the pause. A prefix cannot be a disagreement; it can only be an unfinished agreement. This is the contract that makes a watcher usable at all: without it, every keystroke-flush mid-hunk reads as a divergence.
+- Anything else → a **question**, but only after the file has been still for `watch.divergence_grace_ms` (default 2000). Any further save to that file restarts the window: it measures stillness, not time since the first mistake. The two layers are both needed — the prefix rule handles typing top to bottom, which is most transcription, and the timer handles pasting the middle or typing bottom-up, where no prefix relationship ever holds.
+
+A raised question sets `pending_divergence` and leaves the hunk `pending`; **the queue advances past it** rather than blocking. It is answered by `rote resolve` or by `k`/`r` in the pane. `keep` → status `diverged`, both versions stored in `divergence`. `retry` → withdraw the question and keep watching. Typing the proposal correctly while a question is open withdraws it too — the question is moot.
 
 ---
 
@@ -353,11 +361,13 @@ The flag names are the one place rote touches Claude Code's surface, so keep the
 3. **Agent commits in the shadow** — irrelevant; diffs compare working trees, not history. Sync at `done`/`start` resets shadow history regardless.
 4. **Agent adds dependencies** (`Cargo.toml`, `package-lock.json`, etc.) — these are ordinary file hunks; lockfiles will produce huge diffs. Mitigation: `[transcribe] verbatim` in `.rote.toml` (§7, defaulting to the common lockfiles) — files matching these globs are presented as a single hunk with `note: "generated file — run the generating command instead"` and classified by the byte-compare gate (§5), not by typing and not by a prompt. The expected workflow is that the user runs `cargo add` / `npm install` themselves in the real tree; the gate stays pending until the resulting lockfile matches the shadow's byte for byte, which is what catches the case where the user forgets to run it at all. Note that `Cargo.toml` itself is a hand-edited file and stays an ordinary typed hunk — only the generated lockfile is gated.
 5. **File renames** — appear as delete_file + create_file pairs (no rename detection in `--no-index` mode). Acceptable for v0; note in output when a deleted and created file have >80% identical lines: `note: "possible rename from X"`.
-6. **Editor exits nonzero** — treat as untouched; do not classify.
-7. **Concurrent `rote` invocations** — a lock file (`session.json.lock`, PID + timestamp, stale after crash detection via PID liveness) guards manifest writes; second invocation errors politely. The lock is held for the duration of a manifest write, never for the duration of a session: `rote start` must release it before `exec`ing claude (§1), or the recorded PID becomes the long-lived claude process and every later invocation sees a live holder.
-8. **Shadow deleted or corrupted mid-session** — `next` detects missing shadow dir → error instructing `rote abort` then `rote start` again.
+6. **Half-typed saves** — a watcher sees the file mid-hunk, and the region matches neither the original nor the proposal. Treat a line-wise prefix of the proposal (last line allowed to be a character prefix) as *in progress*, never as a disagreement, and require `watch.divergence_grace_ms` of stillness before raising a question about anything else. Both layers are load-bearing: without the prefix rule the user is interrupted on every keystroke-flush, and without the timer someone who pastes the middle of a hunk can never reach a question at all. See §6.
+7. **Concurrent `rote` invocations** — `session.json.lock` is an `flock(2)`, taken across a whole read-modify-write cycle and released at its end. The kernel drops it when a holder dies, so there is no stale-lock machinery to get wrong; a contended acquirer waits rather than failing, because a daemon and a CLI invocation contend routinely and failing fast on a lock held for three milliseconds would make the CLI unusable. `rote start` must still release it before `exec`ing claude (§1). A separate `watch.lock` is held for a whole pane's lifetime, which is why it cannot be the same file.
+
+   The lock guards the *cycle*, not just the write. Loading outside it and saving inside is a TOCTOU: two processes both load, both mutate different hunks, both save, and the second silently discards the first's work.
+8. **Shadow deleted or corrupted mid-session** — recompute detects a missing shadow dir → error instructing `rote abort` then `rote start` again.
 9. **Symlinks in the repo** — copy as symlinks during untracked-file sync; diffing follows git's behavior (link target as content).
-10. **Empty session** (agent changed nothing) — `next` reports queue empty; `done` short-circuits checks/review with "no changes".
+10. **Empty session** (agent changed nothing) — the pane and `next` report the queue empty; `done` short-circuits checks/review with "no changes".
 11. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
 
 ---
@@ -426,3 +436,45 @@ Canonicalizing the whole path fails on a missing directory; comparing raw
 strings misses macOS's `/var` → `/private/var` symlink.
 
 ---
+
+---
+
+## 12. The wire types
+
+`src/state.rs` is a public contract in the same sense as the `Hunk` schema in §4,
+and for the same reason: three front ends will be written against it — the
+terminal pane, an nvim plugin, a browser — and they will not all be updated on
+the same day. Field names and variant tags are pinned by tests so that changing
+one is a decision rather than an accident.
+
+It is a thin envelope over types that are *already* contracts rather than a
+parallel view schema. `Hunk`, `Status`, `Op` and `State` all serialize lowercase
+and already cross the `--json` seam; a second set of types would be two schemas
+to keep in agreement forever, and they would disagree.
+
+- `Snapshot` — `wire_version`, `generation`, session state, counts, the active
+  `Presented` hunk, the pending queue as summaries, and notices.
+- `Presented` — the hunk, its position, and **`anchor_line`, resolved by the
+  engine against the real file**. That field is what lets a client be a pure
+  client: without it, rendering a jump target means reading the file, and a
+  browser front end cannot.
+- `QueueItem` — a summary with no line bodies, so a snapshot stays small at two
+  hundred pending hunks. Full text is fetched by id.
+- `Event` — `snapshot` | `notice` | `heartbeat` | `closed`, tagged on `type`.
+  **Every change carries a whole snapshot, never a delta.** A delta protocol
+  needs a resync story, and a client that misses one frame is silently wrong
+  from then on, which is the worst failure mode available because nothing looks
+  broken. `generation` is already the resync token.
+- `Command` — `skip` | `resolve` | `show` | `refresh`, tagged on `verb`.
+  Deliberately excludes `done`, `abort` and `start`: those confirm interactively
+  and `exec`, so they stay CLI-only. And there is no verb that sets a hunk to
+  `typed` (§1).
+- `Request`/`Response` — a request may carry the `generation` it was looking at;
+  when present and stale, the response is `stale` with the current generation
+  attached, so a client can re-read and re-issue without a round trip to
+  discover it. This matters most for `resolve`: answering a question about a
+  hunk that has since been reworked must not land.
+
+`WIRE_VERSION` bumps only when a change would break a client written against the
+old shape. New optional fields and new event variants are additive.
+

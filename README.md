@@ -6,8 +6,8 @@ Use Claude Code at full capability, and type every line in yourself.
 normally: editing files, installing dependencies, running tests. It is never told
 anything unusual is happening, because from its perspective nothing is. Your real
 working tree is never touched by it. What the session produces is a *diff*, which
-rote serves back to you hunk by hunk, anchored in your editor, for you to type in
-by hand.
+rote serves back to you hunk by hunk, in a pane beside your editor, for you to
+type in by hand. It watches you type and keeps score itself.
 
 The idea comes from Ankur Sethi's essay on cognitive debt: retyping generated code
 is what keeps it in your head. The problem with doing that by hand is that it
@@ -41,10 +41,11 @@ rote setup      # writes ~/.config/rote/config.toml
 rote doctor     # confirms this machine is ready
 ```
 
-`doctor` checks git, claude, the reviewer's tool-restriction flag, your editor,
-the global config, and (when you are in a repo) the repository, the shadow
-location, and the project config. Every line either passes or names the command
-that fixes it, and it exits non-zero if anything needs attention, so it works as
+`doctor` checks git, claude, the reviewer's tool-restriction flag, the global
+config, and (when you are in a repo) the repository, the shadow location, and
+the project config. It reports your editor too, but never fails over it: rote
+does not launch one as part of the loop. Every line either passes or names the
+command that fixes it, and it exits non-zero if anything needs attention, so it works as
 a script gate. It also runs outside a repository, which is where you are right
 after installing.
 
@@ -66,33 +67,39 @@ start instead of passing silently. It prints what it chose.
 
 `start` syncs the shadow and hands your pane to claude. Argue with it and run its
 tests, all inside the shadow. When you have what you want, quit claude (or flip
-to a second pane) and start transcribing:
+to a second pane) and open the watcher:
 
 ```
-rote next      # shows one hunk, opens your editor on it
-rote next      # ...and the next
-rote status    # where you are
-rote done      # checks, review, close
+rote watch     # the loop: shows a hunk, and watches you type it
 ```
 
-### The two-pane workflow
+That is the whole loop. There is no command between typing a line and the queue
+moving: rote watches your tree, notices the save, checks what you typed against
+the proposal, and advances to the next hunk on its own.
 
-The intended shape, in ghostty or any splittable terminal: claude in the left
-pane, rote in the right.
+### The three-pane workflow
+
+The intended shape, in ghostty or any splittable terminal: claude on the left,
+`rote watch` in the middle, your editor on the right.
 
 ```
-┌─────────────────────────┬─────────────────────────┐
-│ rote start "add tags"   │ rote next               │
-│ → claude, in the shadow │ → hunk 3/11, nvim opens │
-│                         │                         │
-│ (argue, iterate, test)  │ (type it in)            │
-└─────────────────────────┴─────────────────────────┘
+┌───────────────────┬────────────────────┬───────────────────┐
+│ rote start        │ rote watch         │ nvim              │
+│ → claude, in the  │ → hunk 3/11        │                   │
+│   shadow          │   src/posts.py:48  │ (you type)        │
+│                   │   - tags = Mgr()   │                   │
+│ (argue, iterate)  │   + tags = TagMgr()│                   │
+└───────────────────┴────────────────────┴───────────────────┘
 ```
+
+Nothing about that layout is enforced. The pane prints `file:line`, so most
+terminals will take you there on a click, and `o` in the pane opens your editor
+if you have one configured.
 
 You can go back to the agent at any point: `rote talk --attach` resumes the
-session, so you can ask for rework and carry on. The next `rote next` absorbs
-whatever changed. Hunks you already typed stay typed; hunks the agent reworked
-are re-offered as new ones.
+session, so you can ask for rework and carry on. The pane notices without being
+told. Hunks you already typed stay typed; hunks the agent reworked are
+re-offered as new ones.
 
 ## Commands
 
@@ -100,10 +107,12 @@ are re-offered as new ones.
 |---|---|
 | `rote init` | Write a commented `.rote.toml`. `--force` overwrites. |
 | `rote start [TASK…]` | Sync the shadow, open a session, exec claude in it. |
+| `rote watch` | The loop. Watch your tree, classify as you type, advance. |
 | `rote status` | State, task, age, shadow path, hunk counts. |
-| `rote next` | Present the next hunk and open your editor on it. |
-| `rote back` | Re-print the last hunk. Display only — changes nothing. |
+| `rote next` | Print the hunk at the head of the queue. Display only. |
+| `rote show [HUNK_ID]` | Re-print a hunk, defaulting to the last presented. Display only. |
 | `rote skip [HUNK_ID]` | Leave a hunk untyped, defaulting to the active one. Durable: it will not come back. |
+| `rote resolve <HUNK_ID> keep\|retry` | Answer an open divergence question. |
 | `rote talk` | Print the shadow path; `--attach` resumes the agent there. |
 | `rote done` | Run checks, review the session, close it. |
 | `rote abort` | Discard the session. Your real tree is untouched. |
@@ -112,31 +121,40 @@ are re-offered as new ones.
 
 Global flags: `--project <path>`, `-q/--quiet`, `--no-color`.
 
+In the pane: `s` skip, `o` open your editor, `g` refresh, `q` quit. When a
+question is open, `k` keeps your version and `r` withdraws the question.
+
 ### What happens when you type something different
 
-If what you type doesn't match the proposal, rote shows both and asks:
+Half-typed lines are not disagreements. While what you have written is still on
+its way to the proposal, rote says nothing, however long you pause — a prefix
+can only be an unfinished agreement.
+
+When you stop somewhere else, and the file has been still for a couple of
+seconds, the pane asks:
 
 ```
 your version differs from the proposal:
   proposal │     tags = Manager()
   yours    │     tags = TaggableManager()
-[k]eep mine   [r]etry (reopen editor)   [s]how full hunk again
+[k]eep mine  [r]etry  [s]kip  [o]pen  [q]uit
 ```
 
-`k` records both versions and moves on. The proposal will not be offered again,
-this recompute or any later one. `r` reopens your
-editor to try again.
+`k` records both versions and moves on; the proposal will not be offered again,
+this recompute or any later one. `r` withdraws the question and keeps watching,
+so you can simply carry on typing. The queue does not block on an unanswered
+question — it moves to the next hunk and leaves the question open.
 
-Files you can't meaningfully type (binaries, lockfiles) are never opened in an
-editor. rote shows the path and a note, then checks whether the file matches. Run
-`cargo add` or `npm install` yourself and it clears.
+Files you can't meaningfully type (binaries, lockfiles) are gated on a byte
+comparison instead. rote shows the path and a note; run `cargo add` or
+`npm install` yourself and it clears.
 
 ## Configuration
 
 Global, `~/.config/rote/config.toml`:
 
 ```toml
-editor = "nvim"                  # invoked as: editor +LINE FILE
+editor = "nvim"                  # optional; what the `o` key opens
 claude_cmd = ["claude"]
 claude_continue_cmd = ["claude", "--continue"]
 color = true
@@ -160,10 +178,18 @@ commands = ["cargo test"]             # run in the REAL tree at `rote done`
 [review]
 enabled = true
 model_args = []
+
+[watch]
+divergence_grace_ms = 2000       # stillness before rote asks about a difference
+debounce_ms = 400                # before re-diffing the trees
+ignore = []                      # extra globs the watcher never wakes for
 ```
 
+Both `[review]` and `[watch]` are project-only sections: the global config takes
+flat keys only, so a table there is a parse error.
+
 `$ROTE_EDITOR` overrides `editor`. `$EDITOR` is deliberately *not* consulted —
-transcription needs a specific `+LINE` calling convention, and silently
+the open action uses a specific `+LINE` calling convention, and silently
 inheriting a pager is a worse failure than an explicit setting.
 
 ## Where things live
@@ -172,6 +198,7 @@ inheriting a pager is a worse failure than an explicit setting.
 ~/.cache/rote/<hash>/shadow/          the shadow clone
 ~/.local/share/rote/<hash>/
     session.json                      the active session
+    watch.lock                        held while a pane is running
     baseline.patch                    the real tree at session start
     archive/<timestamp>.json          finished sessions
     archive/<timestamp>.patch         the agent's work you never typed
@@ -213,9 +240,10 @@ Claude Code is the working directory it launches the agent in, plus tool-
 restriction flags on the separate headless reviewer at `done`. The session agent
 is unconfigured and cannot tell it is being shadowed.
 
-Also out of scope for v0: multiple concurrent sessions, non-git projects, the
-nvim ghost-text plugin (`rote next --json` is the seam it will use), paste
-prevention (honor system), Windows, and telemetry of any kind.
+Also out of scope for now: multiple concurrent sessions, non-git projects, paste
+prevention (honor system), Windows, and telemetry of any kind. The nvim plugin
+and the browser front end are planned, and will speak the same protocol
+`rote watch` already renders from.
 
 ## Development
 

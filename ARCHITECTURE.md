@@ -4,14 +4,14 @@
 
 `rote` is a Rust CLI that lets a developer use Claude Code at full capability while guaranteeing that every line of code entering the real repository is typed in by hand. It implements the "manually retype LLM-generated code" workflow (per Ankur Sethi's essay on cognitive debt) without degrading the agent.
 
-Core idea: **the shadow workspace.** Claude Code runs inside a sandbox twin of the repository and works completely normally — editing files, installing dependencies, running tests. It is never told anything unusual is happening, because from its perspective nothing is. The user's real working tree is never touched by the agent. The deliverable of an agent session is the *diff* between shadow and real, which `rote` serves to the user hunk by hunk as a transcription queue anchored in their editor (nvim).
+Core idea: **the shadow workspace.** Claude Code runs inside a sandbox twin of the repository and works completely normally — editing files, installing dependencies, running tests. It is never told anything unusual is happening, because from its perspective nothing is. The user's real working tree is never touched by the agent. The deliverable of an agent session is the *diff* between shadow and real, which `rote` serves to the user hunk by hunk as a transcription queue, in a pane beside their editor. rote watches the tree and keeps score itself; it does not drive the editor.
 
 ## Principles (non-negotiable)
 
 1. **Agent unawareness.** No hooks, no restricted tools, no special instructions injected into the Claude Code session. Claude must behave exactly as it would in a normal repo. `rote` has zero coupling to Claude Code internals; it only sets the working directory Claude is launched in.
-2. **Real tree is sacred.** No code path in `rote` ever writes source files into the real repository. The only writes to the real tree are the user's keystrokes in their editor. (`rote` may write its own per-project config `.rote.toml` if the user runs `rote init`, and nothing else.)
+2. **Real tree is sacred.** No code path in `rote` ever writes source files into the real repository. The only writes to the real tree are the user's keystrokes in their editor. rote never opens one as part of the loop — the watch pane offers to, and that is the only invocation. (`rote` may write its own per-project config `.rote.toml` if the user runs `rote init`, and nothing else.)
 3. **Git is plumbing, never surface.** Git provides snapshots, diffs, and file enumeration. The user never sees or types a git command through this tool. All git usage is shelled out and hidden. `rote`'s own state lives outside git.
-4. **The interface is the product.** Sessions, hunks, progress, divergence tracking — all first-class concepts owned by `rote`'s own state, so the plumbing (git) or the frontend (terminal today, an nvim ghost-text plugin later) can be swapped without changing the workflow contract.
+4. **The interface is the product.** Sessions, hunks, progress, divergence tracking — all first-class concepts owned by `rote`'s own state, so the plumbing (git) or the frontend can be swapped without changing the workflow contract. Front ends render from one `state::Snapshot` (DESIGN.md §12) and send back verbs; the terminal pane is simply the first one.
 
 ## Tech stack
 
@@ -42,7 +42,7 @@ Given a real repo at `/home/user/proj` (project identity = hash of canonicalized
     baseline.patch                     # real tree's uncommitted diff at last sync
     archive/<timestamp>.json           # completed/aborted sessions
     archive/<timestamp>.patch          # the agent's work that was never typed
-~/.config/rote/config.toml            # global config (editor cmd, defaults)
+~/.config/rote/config.toml            # global config (defaults; editor is optional)
 <repo>/.rote.toml                     # per-project config (check commands, env allowlist, hunk size)
 ```
 
@@ -67,25 +67,26 @@ After sync, shadow working tree ≡ real working tree, byte for byte, across all
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ CLI layer (clap)                                        │
-│ init | start | status | next | back | skip | talk |     │
-│ done | abort                                            │
-└───────┬────────────────┬───────────────┬────────────────┘
-        │                │               │
-┌───────▼──────┐ ┌───────▼───────┐ ┌─────▼──────────┐
-│ ShadowManager│ │ SessionEngine │ │ HunkPresenter  │
-│ create/sync/ │ │ state machine │ │ render, editor │
-│ teardown     │ │ manifest,     │ │ launch,        │
-│              │ │ diff/recompute│ │ divergence     │
-└───────┬──────┘ └───────┬───────┘ └─────┬──────────┘
-        │                │               │
-┌───────▼────────────────▼───────────────▼────────────────┐
+│ init | start | status | watch | next | show | skip |    │
+│ resolve | talk | done | abort                           │
+└───────┬───────────┬────────────┬────────────┬───────────┘
+        │           │            │            │
+┌───────▼──────┐ ┌──▼────────┐ ┌─▼─────────┐ ┌▼──────────┐
+│ ShadowManager│ │ Session   │ │WatchEngine│ │HunkPresen-│
+│ create/sync/ │ │ Engine    │ │ watcher,  │ │ter        │
+│ teardown     │ │ manifest, │ │ classify, │ │ render,   │
+│              │ │ recompute │ │ advance   │ │ anchor    │
+└───────┬──────┘ └──┬────────┘ └─┬─────────┘ └┬──────────┘
+        │           │            │            │
+┌───────▼───────────▼────────────▼────────────▼───────────┐
 │ GitPlumbing (subprocess wrapper) + DiffParser           │
 └─────────────────────────────────────────────────────────┘
 ```
 
 - **ShadowManager** — owns the clone lifecycle and the sync algorithm above. Refuses to operate if the real repo is mid-merge/rebase/cherry-pick.
 - **SessionEngine** — the state machine (`idle → working → transcribing → idle`; `done`/`aborted` are labels on archived sessions, not live states) and the manifest. Its key operation is **recompute**: re-diff shadow vs. real and reconcile the hunk queue against hunks already typed/diverged/skipped, which is what allows the user to flip back to the Claude session mid-transcription, ask for rework, and continue. Terminal statuses are sticky by hunk ID (DESIGN.md §5) — the trees are the source of truth about content, the manifest about the user's decisions.
-- **HunkPresenter** — renders one hunk to the terminal, launches the editor at a context-derived anchor, and on editor exit classifies the outcome (typed exactly / diverged / untouched). Divergence policy: **prompt every time** — show a mini-diff of user version vs. proposal and ask keep / retry. Files that cannot meaningfully be typed (binaries, lockfiles) skip the editor entirely and are classified by byte comparison against the shadow.
+- **WatchEngine** — watches both trees, reclassifies the pending hunks in a saved file, commits terminal statuses, and advances the queue. The fast path shells out to nothing: one file read and pure functions. A full re-diff runs only when the hunk *set* can change, behind a debounce. Time enters through an injected clock, so the whole "do not interrupt someone mid-thought" behaviour is unit-tested with no sleeps.
+- **HunkPresenter** — the pure core: anchoring, region extraction, classification, and rendering. It has no I/O beyond reading files, which is what lets both the engine and the pane share it. Divergence policy: a line-wise prefix of the proposal is *in progress* and never a question; anything else becomes one after the file has been still for a configured window. Files that cannot meaningfully be typed (binaries, lockfiles) are classified by byte comparison against the shadow instead.
 - **GitPlumbing + DiffParser** — thin `Command` wrappers over the ~8 git invocations rote needs, and a unified-diff parser producing structured hunks.
 
 ## Data flow (one session)
@@ -98,13 +99,18 @@ rote start "add tagging"
 
 user exits claude (or flips to a second pane)
 
-rote next
+rote watch                                    [in a second pane]
   → SessionEngine.recompute(): enumerate files, per-file git diff --no-index
     real/<f> shadow/<f>, parse, split into ≤ max_hunk_lines units, reconcile
     with manifest
-  → HunkPresenter: print hunk, spawn editor +<anchor_line> <real_file>
-  → on exit: re-read region, classify, prompt on divergence, update manifest
-  (repeat until queue empty)
+  → WatchEngine: draw the active hunk, then watch both trees
+
+user types in their editor                    [in a third pane]
+  → watcher event → re-read the file → classify its pending hunks
+  → typed: commit, retake the baseline, advance, redraw
+  → still a prefix of the proposal: say nothing
+  → settled and different: raise a question after the grace window
+  (no command anywhere in this loop)
 
 rote done
   → run check commands from .rote.toml in the REAL tree
@@ -128,11 +134,11 @@ These are independent invocations; nothing links them.
 
 - Multiple concurrent sessions per project
 - Non-git projects
-- The nvim ghost-text plugin (v2; it will consume the same hunk stream `next` produces — keep the hunk model serializable with that in mind)
+- The nvim plugin and the browser front end (they will consume the same `state::Snapshot` the watch pane renders from — see DESIGN.md §12)
 - Paste prevention (honor system in v0)
 - Windows support (Linux/macOS only)
 - Any Claude Code hooks, MCP servers, or SDK usage
 
 ## v2 seam
 
-The HunkPresenter's terminal rendering must be separated from hunk selection/classification logic so a future nvim plugin (ghost-text typing surface) can drive the same SessionEngine over a JSON-lines protocol (`rote next --json` is specced in DESIGN.md as a hidden flag from day one).
+Rendering is a pure function of a `state::Snapshot` (DESIGN.md §12). The watch pane reads no files and consults no manifest — everything it draws arrives in one value, and its keystrokes go out as `state::Command` verbs. Putting a daemon and a socket between the two is therefore a transport swap rather than a rewrite, and any front end that can render a snapshot and send a verb is already a peer.

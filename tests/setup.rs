@@ -87,6 +87,41 @@ fn doctor_passes_when_everything_resolves() {
 }
 
 #[test]
+fn a_missing_editor_no_longer_fails_doctor() {
+    // rote does not launch an editor as part of the loop any more — it only
+    // offers to, from the `o` key in the watch pane. A machine without one
+    // transcribes perfectly well, so this must not be a failure.
+    let r = Cli::new();
+    r.fx.write("a.rs", "fn a() {}\n");
+    r.fx.commit_all("initial");
+    r.fx.write(".rote.toml", "[checks]\ncommands = [\"true\"]\n");
+
+    let stub = claude_stub(&r.bin);
+    std::fs::create_dir_all(r.global_config().parent().unwrap()).unwrap();
+    std::fs::write(
+        r.global_config(),
+        format!(
+            "claude_cmd = [\"{}\"]\neditor = \"definitely-not-a-real-editor-xyz\"\n",
+            stub.display()
+        ),
+    )
+    .unwrap();
+
+    let out = r.run(&["doctor"]);
+    let text = stdout(&out);
+
+    assert!(out.status.success(), "{text}\n{}", stderr(&out));
+    assert!(text.contains("editor"), "still reported: {text}");
+    // Doctor truncates the detail column from the left, so match a fragment
+    // that survives it.
+    assert!(
+        text.contains("open action"),
+        "and says what is actually lost: {text}"
+    );
+    assert!(!text.contains("FAIL"), "{text}");
+}
+
+#[test]
 fn doctor_flags_a_repo_with_no_commits() {
     let r = Cli::new();
     let stub = claude_stub(&r.bin);

@@ -62,7 +62,7 @@ Conventions for all milestones:
 **Goal:** the transcription loop.
 
 - `present.rs`: terminal rendering per DESIGN §6 (respect `--no-color`), context-based anchoring with the full fallback chain and nearest-to-hint disambiguation, editor launch (blocking, `+line file` at the anchor line itself, resolution chain `$ROTE_EDITOR` → config → `nvim` with `$EDITOR` deliberately absent, no file creation for `create_file` hunks), classification (exact / untouched / divergence), the divergence prompt loop (`k`/`r`/`s`), and the byte-compare gate for binary and verbatim hunks (no editor, no prompt).
-- `rote next`, `rote back`, `rote skip` wired end to end. `back` re-prints only — no status change, no editor. `rote next --json` and hidden `rote mark` per DESIGN §1.
+- `rote next`, `rote back`, `rote skip` wired end to end. `back` re-prints only — no status change, no editor. `rote next --json` and hidden `rote mark` per DESIGN §1. *(Superseded by M8: `back` became `show`, `mark` was deleted, and `next` stopped launching an editor.)*
 - Anchoring unit tests: file with lines inserted above the target (drift), ambiguous context (two matches, hint disambiguates), context missing entirely (falls back to hint with warning).
 - Classification tests: exact match, trailing-whitespace tolerance under both `strict_whitespace` settings, divergence storage, untouched detection, and a verbatim-glob hunk that stays pending until the fixture's lockfile is made to match byte for byte. (Editor interaction tested by substituting `editor = "true"` / a test script that applies a scripted edit.)
 
@@ -124,3 +124,37 @@ Conventions for all milestones:
 ## Out of scope — do not build
 
 Multi-session, non-git backends, nvim plugin, paste prevention, Windows, any Claude Code hooks/MCP/SDK integration, `rote gc`, telemetry of any kind. From M7: a TUI wizard, publishing the tap, prebuilt binaries, GitHub Releases, or release CI.
+
+---
+
+## M8 — the watch engine
+
+Retire the editor launch. rote watches the real tree, reclassifies on save, and
+advances the queue itself; a full-screen `rote watch` pane is the reading
+surface. Wire types are defined now so a daemon and a browser front end are a
+transport swap rather than a rewrite.
+
+Scope:
+- `present::is_in_progress` / `is_subrun`, and `region_of` for per-region
+  comparison.
+- `reconcile` gains `strict_whitespace` plus two suppression rules: an
+  unanswered divergence survives recompute, and a whitespace-tolerated `typed`
+  hunk stops reappearing as a phantom.
+- `src/state.rs` — the wire contract (DESIGN §12), field names pinned by tests.
+- `src/engine.rs` — injected clock, pure `Watchdog`, baselines, fast path.
+- `src/watcher.rs` — `notify`, both trees, directories not files, event kind
+  discarded.
+- `src/pane.rs` — alternate screen, termios raw mode via `libc`, pure
+  `render_frame`.
+- Verbs: `next` becomes a printer, `back` becomes `show`, new `resolve`.
+- `[watch]` config; doctor's editor row becomes informational.
+
+Acceptance: with a session open and `rote watch` running, writing the proposal
+into the real file marks the hunk typed and advances the queue with no command
+issued. Half-typing raises no question however long the pause; a settled
+difference raises one after the grace window and the queue moves on past it.
+
+Edge cases this milestone adds to §9: half-typed saves (6), and the per-region
+untouched rule — an edit anywhere in a file must not accuse the other hunks in
+it.
+
