@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::cli::{scripted_editor, stderr, stdout, stub_claude, Cli};
+use common::cli::{stderr, stdout, stub_claude, Cli};
 use common::Fixture;
 
 #[test]
@@ -11,7 +11,7 @@ fn the_full_lifecycle_ends_idle_with_shadow_matching_real() {
     let fx = Fixture::new();
     fx.write("a.rs", "fn a() {\n}\n");
     fx.commit_all("initial");
-    let mut cli = Cli::with_fixture(fx);
+    let cli = Cli::with_fixture(fx);
 
     let (stub, payload_path) =
         stub_claude(cli.fx.root.path(), "claude-stub", "no issues found.", 0);
@@ -25,14 +25,23 @@ fn the_full_lifecycle_ends_idle_with_shadow_matching_real() {
     assert!(start.status.success(), "{}", stderr(&start));
     std::fs::write(cli.shadow().join("a.rs"), "fn a() {\n    work();\n}\n").unwrap();
 
-    // next, with an editor that types it correctly
-    cli.set_editor(scripted_editor(
-        cli.fx.root.path(),
-        "type.sh",
-        "fn a() {\n    work();\n}\n",
-    ));
-    let next = cli.run(&["next"]);
-    assert!(stdout(&next).contains("typed"), "{}", stdout(&next));
+    // The user types it. No editor launch and no command: `rote watch` sees the
+    // write and classifies it, exiting once the queue drains.
+    let watcher = cli.spawn(&[
+        "watch",
+        "--headless",
+        "--exit-when-empty",
+        "--timeout",
+        "20000",
+    ]);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    cli.fx.write("a.rs", "fn a() {\n    work();\n}\n");
+    let watched = watcher.wait_with_output().unwrap();
+    assert!(
+        watched.status.success(),
+        "watch did not drain the queue: {}",
+        String::from_utf8_lossy(&watched.stderr)
+    );
 
     // done
     let done = cli.run_with_input(&["done"], "y\n");

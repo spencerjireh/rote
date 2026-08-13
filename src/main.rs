@@ -3,12 +3,21 @@ use clap::{Parser, Subcommand};
 use rote::config::{self, Config};
 use rote::detect;
 use rote::git;
-use rote::hunks::{Divergence, Op, Status};
+use rote::hunks::Status;
 use rote::pane;
 use rote::paths::{self, Lock, ProjectPaths};
 use rote::present::{self, Classification};
 use rote::review;
-use rote::session::{self, Manifest, State, Terminal};
+use rote::session::{self, Manifest, Terminal};
+
+/// How to answer a divergence question, on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Resolution {
+    /// Record what you typed; the proposal is not offered again.
+    Keep,
+    /// Withdraw the question and carry on typing.
+    Retry,
+}
 use rote::shadow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -68,8 +77,18 @@ enum Command {
         json: bool,
     },
 
-    /// Re-print the most recently presented hunk. Display only; changes nothing.
-    Back,
+    /// Re-print a hunk, defaulting to the last one presented. Display only.
+    Show {
+        /// Which hunk. Omit for the most recently presented one.
+        hunk_id: Option<String>,
+    },
+
+    /// Answer an open divergence question.
+    Resolve {
+        hunk_id: String,
+        #[arg(value_enum)]
+        choice: Resolution,
+    },
 
     /// Watch your tree and classify as you type. The transcription loop.
     Watch {
@@ -218,8 +237,12 @@ fn run() -> Result<ExitCode> {
             cmd_next(&project, &cfg, json, color)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Back => {
-            cmd_back(&project, color)?;
+        Command::Show { hunk_id } => {
+            cmd_show(&project, hunk_id.as_deref(), color)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Resolve { hunk_id, choice } => {
+            cmd_resolve(&project, &hunk_id, choice)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Watch {
@@ -752,23 +775,22 @@ fn cmd_watch(project: &ProjectPaths, cfg: &Config, opts: pane::Options) -> Resul
     pane::run(project, cfg, opts)
 }
 
-/// Recompute, then present the head of the queue.
+/// Recompute, then print the hunk at the head of the queue.
+///
+/// A printer, not a step in the loop. `rote watch` is what advances the queue;
+/// this exists so a plain shell, a script, or a `--json` consumer can see what
+/// is outstanding without a pane. It classifies nothing and launches nothing.
 fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Result<()> {
-    // Phase 1, under the lock: recompute, advance the state machine, and take a
-    // copy of the hunk to present.
     let picked = session::with_session_recomputed(project, cfg, |m, report| {
         for w in &report.warnings {
             eprintln!("warning: {w}");
-        }
-        // First `next` is what turns a working session into a transcribing one.
-        if m.state == State::Working {
-            m.state = State::Transcribing;
         }
         let Some(hunk) = m.active().cloned() else {
             return Ok(None);
         };
         let position = m.queue_position(&hunk.id).unwrap_or(1);
         let total = m.pending().count();
+        m.last_presented = Some(hunk.id.clone());
         Ok(Some((hunk, position, total)))
     })?;
 
@@ -787,137 +809,59 @@ fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Re
         return Ok(());
     }
 
-    // Phase 2, unlocked: the editor blocks on a human and can sit here for
-    // minutes. Holding the lock across it would wedge every other invocation,
-    // which is exactly the mistake the old `Lock` was shaped to avoid making.
     let real_file = project.repo_root.join(&hunk.file);
-    let outcome = present_one(&hunk, project, cfg, position, total, color, &real_file)?;
 
-    let label = match &outcome {
-        Classification::Typed => "typed",
-        Classification::Untouched => "untouched",
-        Classification::Diverged { .. } => "diverged",
-    };
-
-    // Phase 3, under the lock again: record what the user did.
-    session::with_session(project, |m| {
-        let entry = m
-            .find_mut(&hunk.id)
-            .context("the hunk vanished from the manifest mid-command")?;
-        match &outcome {
-            Classification::Typed => entry.status = Status::Typed,
-            Classification::Untouched => {} // stays pending
-            Classification::Diverged { actual } => {
-                entry.status = Status::Diverged;
-                entry.divergence = Some(Divergence {
-                    proposed: hunk.new_lines.clone(),
-                    actual: actual.clone(),
-                });
-            }
-        }
-        m.last_presented = Some(hunk.id.clone());
-        Ok(())
-    })?;
-
-    println!("[{position}/{total}] {label} — {}", hunk.file);
-    if matches!(outcome, Classification::Untouched) {
-        println!("run `rote next` to try again, or `rote skip` to leave it.");
-    }
-    Ok(())
-}
-
-/// Render a hunk, get the user's version into the file, and classify it.
-fn present_one(
-    hunk: &rote::hunks::Hunk,
-    project: &ProjectPaths,
-    cfg: &Config,
-    position: usize,
-    total: usize,
-    color: bool,
-    real_file: &std::path::Path,
-) -> Result<Classification> {
-    // Untypeable hunks never reach an editor: the gate is a byte comparison.
+    // Untypeable hunks are gated on bytes rather than typing, and that gate is
+    // two file reads and no subprocess — the one honest verdict a printer can
+    // still reach on its own.
     if hunk.is_untypeable() {
         let anchor = present::Anchor {
             line: 1,
             via: present::AnchorVia::NoContext,
         };
-        print!("{}", present::render(hunk, position, total, &anchor, color));
+        print!(
+            "{}",
+            present::render(&hunk, position, total, &anchor, color)
+        );
         let shadow_file = project.shadow_dir.join(&hunk.file);
-        let outcome = present::classify_by_bytes(real_file, &shadow_file);
-        if outcome == Classification::Untouched {
-            println!("still differs from the shadow — do that, then run `rote next` again.");
+        if present::classify_by_bytes(&real_file, &shadow_file) == Classification::Untouched {
+            println!("still differs from the shadow — do that, and `rote watch` will notice.");
         }
-        return Ok(outcome);
-    }
-
-    let editor = present::editor_command(&cfg.editor);
-    let is_new = hunk.op == Op::CreateFile;
-
-    loop {
-        let before = present::read_lines(real_file)?;
-        let anchor = present::find_anchor(&before, hunk);
-        print!("{}", present::render(hunk, position, total, &anchor, color));
-        println!("opening {} at {}:{} …", editor[0], hunk.file, anchor.line);
-
-        if !present::launch_editor(&editor, real_file, anchor.line, is_new)? {
-            // A nonzero exit means the user bailed out (DESIGN.md §9.6).
-            return Ok(Classification::Untouched);
-        }
-
-        let after = present::read_lines(real_file)?;
-        match present::classify(&before, &after, hunk, cfg.strict_whitespace) {
-            Classification::Diverged { actual } => {
-                print!(
-                    "{}",
-                    present::render_divergence(&hunk.new_lines, &actual, color)
-                );
-                match prompt_divergence()? {
-                    Divergent::Keep => return Ok(Classification::Diverged { actual }),
-                    Divergent::Retry => continue,
-                    Divergent::Show => continue,
-                }
-            }
-            other => return Ok(other),
-        }
-    }
-}
-
-enum Divergent {
-    Keep,
-    Retry,
-    Show,
-}
-
-fn prompt_divergence() -> Result<Divergent> {
-    use std::io::Write as _;
-    loop {
-        print!("[k]eep mine   [r]etry (reopen editor)   [s]how full hunk again: ");
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
-            // No one is there to answer; keeping what is already on disk is the
-            // only choice that does not discard the user's work.
-            return Ok(Divergent::Keep);
-        }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "k" | "keep" => return Ok(Divergent::Keep),
-            "r" | "retry" => return Ok(Divergent::Retry),
-            "s" | "show" => return Ok(Divergent::Show),
-            _ => continue,
-        }
-    }
-}
-
-/// Re-print the last presented hunk. Display only — it changes nothing.
-fn cmd_back(project: &ProjectPaths, color: bool) -> Result<()> {
-    let manifest = Manifest::require(project)?;
-    let Some(id) = manifest.last_presented.clone() else {
-        println!("nothing presented yet in this session.");
         return Ok(());
+    }
+
+    let file_lines = present::read_lines(&real_file)?;
+    let anchor = present::find_anchor(&file_lines, &hunk);
+    print!(
+        "{}",
+        present::render(&hunk, position, total, &anchor, color)
+    );
+    println!("{}:{}", hunk.file, anchor.line);
+    if let Some(d) = &hunk.pending_divergence {
+        print!(
+            "{}",
+            present::render_divergence(&d.proposed, &d.actual, color)
+        );
+        println!("answer with `rote resolve {} keep|retry`.", hunk.id);
+    }
+    Ok(())
+}
+
+/// Re-print a hunk. Display only — it changes nothing.
+fn cmd_show(project: &ProjectPaths, hunk_id: Option<&str>, color: bool) -> Result<()> {
+    let manifest = Manifest::require(project)?;
+    let id = match hunk_id {
+        Some(id) => id.to_string(),
+        None => match manifest.last_presented.clone() {
+            Some(id) => id,
+            None => {
+                println!("nothing presented yet in this session.");
+                return Ok(());
+            }
+        },
     };
-    let Some(hunk) = manifest.hunks.iter().find(|h| h.id == id) else {
-        println!("the last presented hunk is no longer in the queue (the agent reworked it).");
+    let Some(hunk) = manifest.find(&id) else {
+        println!("no hunk {id} in this session (the agent may have reworked it).");
         return Ok(());
     };
 
@@ -925,13 +869,58 @@ fn cmd_back(project: &ProjectPaths, color: bool) -> Result<()> {
     let anchor = present::find_anchor(&file_lines, hunk);
     print!("{}", present::render(hunk, 0, 0, &anchor, color));
     println!("status: {}", hunk.status);
-    if let Some(d) = &hunk.divergence {
+    if let Some(d) = hunk
+        .divergence
+        .as_ref()
+        .or(hunk.pending_divergence.as_ref())
+    {
         print!(
             "{}",
             present::render_divergence(&d.proposed, &d.actual, color)
         );
     }
-    println!("\n(display only — `rote back` changes nothing)");
+    println!("\n(display only — `rote show` changes nothing)");
+    Ok(())
+}
+
+/// Answer an open divergence question.
+///
+/// The id is required for both choices. Unlike `skip` there is no sensible
+/// default: the hunk carrying the question is often not the active one, because
+/// the queue moves on past an unanswered question rather than blocking on it.
+fn cmd_resolve(project: &ProjectPaths, hunk_id: &str, choice: Resolution) -> Result<()> {
+    let file = session::with_session(project, |m| {
+        let h = m
+            .find_mut(hunk_id)
+            .with_context(|| format!("no hunk {hunk_id} in this session"))?;
+        let Some(d) = h.pending_divergence.take() else {
+            return Ok(None);
+        };
+        match choice {
+            Resolution::Keep => {
+                h.status = Status::Diverged;
+                h.divergence = Some(d);
+            }
+            // There is no editor to reopen. Retry withdraws the question and
+            // lets `rote watch` keep classifying as the user keeps typing.
+            Resolution::Retry => {}
+        }
+        let file = h.file.clone();
+        m.last_presented = Some(hunk_id.to_string());
+        Ok(Some(file))
+    })?;
+
+    match (file, choice) {
+        (None, _) => println!("hunk {hunk_id} has no open question."),
+        (Some(f), Resolution::Keep) => {
+            println!("kept your version — {f}");
+            println!("the proposal will not be offered again.");
+        }
+        (Some(f), Resolution::Retry) => {
+            println!("withdrew the question — {f}");
+            println!("`rote watch` keeps classifying as you type.");
+        }
+    }
     Ok(())
 }
 
@@ -1079,11 +1068,6 @@ fn cmd_status(project: &ProjectPaths) -> Result<()> {
         }
     }
 
-    if manifest.hunks.is_empty() {
-        println!("\nno hunks computed yet — `rote next` builds the queue.");
-        return Ok(());
-    }
-
     let pending = manifest.count(Status::Pending);
     let typed = manifest.count(Status::Typed);
     let diverged = manifest.count(Status::Diverged);
@@ -1104,10 +1088,15 @@ fn cmd_status(project: &ProjectPaths) -> Result<()> {
         println!("files:  {}", files.join(", "));
     }
 
+    // `rote watch` is the loop now, so that is what "next" means — including
+    // when the queue is empty, because the agent may still be working and the
+    // pane picks that up on its own.
     println!(
         "\nnext:   {}",
-        if pending > 0 {
-            "rote next"
+        if manifest.hunks.is_empty() {
+            "rote watch  (waiting for the agent's work)"
+        } else if pending > 0 {
+            "rote watch"
         } else {
             "rote done"
         }
