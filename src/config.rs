@@ -246,8 +246,43 @@ fn read_if_exists(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// The commented `.rote.toml` written by `rote init`.
-pub const INIT_TEMPLATE: &str = r#"# rote per-project configuration.
+/// Render a TOML array of strings across lines, or `[]` when empty.
+fn toml_list(items: &[String]) -> String {
+    if items.is_empty() {
+        return "[]".into();
+    }
+    let body: String = items
+        .iter()
+        .map(|s| format!("    {},\n", toml_string(s)))
+        .collect();
+    format!("[\n{body}]")
+}
+
+/// Quote a string for TOML, escaping what the basic-string form requires.
+fn toml_string(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// The `.rote.toml` written by `rote init`, shaped to the detected project.
+///
+/// Checks are prefilled and active rather than commented out: a `[checks]` block
+/// that is empty by default means `rote done` silently verifies nothing, which
+/// is the wrong default for the one safety net in the close-out pipeline.
+pub fn init_template(detected: &crate::detect::Detected) -> String {
+    let checks_note = if detected.checks.is_empty() {
+        "# No project type detected, so no checks were guessed. Add the commands\n\
+         # that must pass before a session can close, e.g. [\"make test\"].\n"
+            .to_string()
+    } else {
+        format!(
+            "# Detected a {} project. These were verified to run on this machine.\n",
+            detected.kind.label()
+        )
+    };
+
+    format!(
+        r#"# rote per-project configuration.
 # Values here override the global ~/.config/rote/config.toml.
 
 # Maximum lines per transcription hunk. Larger raw diffs are split.
@@ -262,31 +297,28 @@ copy = [".env"]
 
 # Paths that survive the shadow's clean, so the agent's builds stay warm.
 # Build output ONLY -- never source, never anything the diff reads.
-preserve = ["target/", "node_modules/", ".venv/", "dist/", "build/"]
+preserve = {preserve}
 
 [transcribe]
 # Generated files. Presented whole and gated on a byte comparison rather than
 # typed line by line -- run the generating command instead.
-verbatim = [
-    "Cargo.lock",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "poetry.lock",
-    "uv.lock",
-    "*.lock",
-]
+verbatim = {verbatim}
 
 [checks]
 # Run in the REAL tree at `rote done`, in order, stopping on the first failure.
-commands = []
+{checks_note}commands = {checks}
 
 [review]
 # Headless reviewer pass over the session diff at `rote done`.
 enabled = true
 # Extra args appended to `claude -p`, e.g. ["--model", "claude-haiku-4-5"]
 model_args = []
-"#;
+"#,
+        preserve = toml_list(&default_preserve()),
+        verbatim = toml_list(&detected.verbatim),
+        checks = toml_list(&detected.checks),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -373,13 +405,59 @@ mod tests {
     }
 
     #[test]
-    fn init_template_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = write(dir.path(), ".rote.toml", INIT_TEMPLATE);
-        let cfg = Config::load(&dir.path().join("absent.toml"), &p).unwrap();
-        assert_eq!(cfg.max_hunk_lines, 20);
-        assert!(cfg.review_enabled);
-        assert_eq!(cfg.check_commands, Vec::<String>::new());
+    fn generated_template_round_trips_for_every_project_kind() {
+        use crate::detect::{Detected, ProjectKind};
+        // Whatever detection produces must parse back into the config it claims
+        // to be — including the empty-checks case for an unknown project.
+        for kind in [
+            ProjectKind::Rust,
+            ProjectKind::Node,
+            ProjectKind::Python,
+            ProjectKind::Go,
+            ProjectKind::Unknown,
+        ] {
+            let detected = Detected {
+                kind,
+                checks: match kind {
+                    ProjectKind::Unknown => Vec::new(),
+                    _ => vec!["cmd one".into(), "cmd \"two\"".into()],
+                },
+                verbatim: crate::detect::verbatim_for(kind),
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let p = write(dir.path(), ".rote.toml", &init_template(&detected));
+            let cfg = Config::load(&dir.path().join("absent.toml"), &p)
+                .unwrap_or_else(|e| panic!("{kind:?} template does not parse: {e}"));
+            assert_eq!(cfg.max_hunk_lines, 20);
+            assert!(cfg.review_enabled);
+            assert_eq!(cfg.check_commands, detected.checks, "for {kind:?}");
+            assert_eq!(cfg.verbatim, detected.verbatim, "for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_template_names_what_was_detected() {
+        use crate::detect::{Detected, ProjectKind};
+        let rust = init_template(&Detected {
+            kind: ProjectKind::Rust,
+            checks: vec!["cargo test".into()],
+            verbatim: vec!["Cargo.lock".into()],
+        });
+        assert!(rust.contains("Detected a Rust project"), "{rust}");
+
+        let unknown = init_template(&Detected {
+            kind: ProjectKind::Unknown,
+            checks: Vec::new(),
+            verbatim: vec!["*.lock".into()],
+        });
+        assert!(unknown.contains("No project type detected"), "{unknown}");
+        assert!(unknown.contains("commands = []"), "{unknown}");
+    }
+
+    #[test]
+    fn quoting_survives_a_command_containing_quotes() {
+        assert_eq!(toml_string(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(toml_list(&[]), "[]");
     }
 
     #[test]

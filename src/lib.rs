@@ -7,6 +7,7 @@
 //! See ARCHITECTURE.md for the shape and DESIGN.md for the contracts.
 
 pub mod config;
+pub mod detect;
 pub mod diffparse;
 pub mod git;
 pub mod hunks;

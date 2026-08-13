@@ -1,18 +1,36 @@
-# rote's own configuration — the intended first dogfooding target.
+# rote per-project configuration.
+# Values here override the global ~/.config/rote/config.toml.
 
+# Maximum lines per transcription hunk. Larger raw diffs are split.
 max_hunk_lines = 20
+
+# true = trailing whitespace differences count as divergence when classifying.
 strict_whitespace = false
 
 [shadow]
-copy = []
-# Cargo's build output. Preserving it keeps the agent's `cargo test` warm
-# instead of rebuilding every dependency at the top of each session.
-preserve = ["target/"]
+# Gitignored files the agent needs; copied real -> shadow on every sync.
+copy = [".env"]
+
+# Paths that survive the shadow's clean, so the agent's builds stay warm.
+# Build output ONLY -- never source, never anything the diff reads.
+preserve = [
+    "target/",
+    "node_modules/",
+    ".venv/",
+    "dist/",
+    "build/",
+]
 
 [transcribe]
-verbatim = ["Cargo.lock"]
+# Generated files. Presented whole and gated on a byte comparison rather than
+# typed line by line -- run the generating command instead.
+verbatim = [
+    "Cargo.lock",
+]
 
 [checks]
+# Run in the REAL tree at `rote done`, in order, stopping on the first failure.
+# Detected a Rust project. These were verified to run on this machine.
 commands = [
     "cargo test",
     "cargo-clippy --all-targets -- -D warnings",
@@ -20,5 +38,7 @@ commands = [
 ]
 
 [review]
+# Headless reviewer pass over the session diff at `rote done`.
 enabled = true
+# Extra args appended to `claude -p`, e.g. ["--model", "claude-haiku-4-5"]
 model_args = []

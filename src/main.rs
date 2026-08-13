@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rote::config::{Config, INIT_TEMPLATE};
+use rote::config::{self, Config};
+use rote::detect;
 use rote::git;
 use rote::hunks::{Divergence, Op, Status};
 use rote::paths::{self, Lock, ProjectPaths};
@@ -8,7 +9,7 @@ use rote::present::{self, Classification};
 use rote::review;
 use rote::session::{self, Manifest, State, Terminal};
 use rote::shadow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
@@ -102,6 +103,31 @@ enum Command {
     /// Set a hunk's status directly (companion to `next --json`).
     #[command(hide = true)]
     Mark { hunk_id: String, status: String },
+
+    /// Check that this machine is set up to run rote.
+    Doctor {
+        /// Also invoke claude once to prove the reviewer path really works.
+        #[arg(long)]
+        deep: bool,
+    },
+
+    /// Write the global config at ~/.config/rote/config.toml.
+    Setup {
+        /// Overwrite an existing global config.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+impl Command {
+    /// Whether this command needs to be inside a git repository.
+    ///
+    /// `doctor` and `setup` are about machine-level state — claude, the editor,
+    /// the global config — and `doctor` is the command you reach for when
+    /// something is wrong, which may well be before you have a repo.
+    fn needs_repo(&self) -> bool {
+        !matches!(self, Command::Doctor { .. } | Command::Setup { .. })
+    }
 }
 
 fn main() -> ExitCode {
@@ -114,19 +140,48 @@ fn main() -> ExitCode {
     }
 }
 
+/// Locate the repository, if we are in one.
+fn find_repo(cli: &Cli) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    match &cli.project {
+        Some(p) => paths::discover_repo_root(p),
+        None => paths::discover_repo_root(&cwd),
+    }
+}
+
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
-    // Resolved for every command: all of them operate on a repo.
-    let cwd = std::env::current_dir().context("cannot determine current directory")?;
-    let repo_root = match &cli.project {
-        Some(p) => paths::discover_repo_root(p)?,
-        None => paths::discover_repo_root(&cwd)?,
+    // Most commands operate on a repo; `doctor` and `setup` do not require one,
+    // so resolution is per-command rather than unconditional.
+    let resolved = if cli.command.needs_repo() {
+        let repo_root = find_repo(&cli)?;
+        let project = ProjectPaths::resolve(&repo_root)?;
+        let cfg = Config::load(&paths::global_config_path()?, &project.project_config())?;
+        Some((project, cfg))
+    } else {
+        None
     };
-    let project = ProjectPaths::resolve(&repo_root)?;
-    let cfg = Config::load(&paths::global_config_path()?, &project.project_config())?;
+
+    // Fall back to a repo-less config for the two commands that allow it.
+    let cfg = match &resolved {
+        Some((_, cfg)) => cfg.clone(),
+        None => Config::load(&paths::global_config_path()?, Path::new("/nonexistent"))?,
+    };
     // --no-color wins over config; NO_COLOR is honored as the de facto standard.
     let color = cfg.color && !cli.no_color && std::env::var_os("NO_COLOR").is_none();
+
+    // Commands that do not need a repo run before the unwrap below.
+    match &cli.command {
+        Command::Doctor { deep } => return cmd_doctor(&cli, &cfg, *deep, color),
+        Command::Setup { force } => {
+            cmd_setup(&cfg, *force, cli.quiet)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        _ => {}
+    }
+
+    let (project, cfg) = resolved.expect("every other command requires a repo");
 
     match cli.command {
         Command::Init { force } => {
@@ -165,6 +220,8 @@ fn run() -> Result<ExitCode> {
             cmd_talk(&project, &cfg, attach)?;
             Ok(ExitCode::SUCCESS)
         }
+        // Both are dispatched above, before the repo is required.
+        Command::Doctor { .. } | Command::Setup { .. } => unreachable!(),
         Command::Done {
             force,
             no_checks,
@@ -174,6 +231,369 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// One line of `rote doctor` output.
+struct Check {
+    label: &'static str,
+    detail: String,
+    state: CheckState,
+    /// What to run to fix it.
+    fix: Option<String>,
+}
+
+enum CheckState {
+    Ok,
+    Failed,
+    /// Not applicable here — reported, but never a failure.
+    Skipped,
+}
+
+impl Check {
+    fn ok(label: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            label,
+            detail: detail.into(),
+            state: CheckState::Ok,
+            fix: None,
+        }
+    }
+    fn failed(label: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self {
+            label,
+            detail: detail.into(),
+            state: CheckState::Failed,
+            fix: Some(fix.into()),
+        }
+    }
+    fn skipped(label: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            label,
+            detail: detail.into(),
+            state: CheckState::Skipped,
+            fix: None,
+        }
+    }
+}
+
+/// Diagnose this machine. Read-only, and works outside a repository.
+fn cmd_doctor(cli: &Cli, cfg: &Config, deep: bool, color: bool) -> Result<ExitCode> {
+    let mut checks = Vec::new();
+
+    // git
+    match std::process::Command::new("git").arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let v = String::from_utf8_lossy(&out.stdout);
+            checks.push(Check::ok(
+                "git",
+                v.trim().trim_start_matches("git version "),
+            ));
+        }
+        _ => checks.push(Check::failed("git", "not found", "install git")),
+    }
+
+    // claude, and the reviewer flag it will be handed
+    let mut claude = detect::probe_claude(cfg);
+    if deep && claude.found() {
+        detect::deep_probe_claude(cfg, &mut claude);
+    }
+    match &claude.resolved {
+        Some(path) => {
+            checks.push(Check::ok("claude", tilde(path)));
+            let flag = review::REVIEWER_TOOL_FLAGS
+                .first()
+                .copied()
+                .unwrap_or("--tools");
+            match claude.tool_flag_supported {
+                Some(true) => checks.push(Check::ok(
+                    "reviewer tools",
+                    format!("{flag} present in --help"),
+                )),
+                _ => checks.push(Check::failed(
+                    "reviewer tools",
+                    format!("{flag} not found in --help"),
+                    "review will fail soft; rote done still works with --no-review",
+                )),
+            }
+            match claude.deep_ok {
+                Some(true) => checks.push(Check::ok("reviewer probe", "ran end to end")),
+                Some(false) => checks.push(Check::failed(
+                    "reviewer probe",
+                    "invocation failed",
+                    "check `claude -p` works, or run rote done --no-review",
+                )),
+                None => {}
+            }
+        }
+        None => checks.push(Check::failed(
+            "claude",
+            format!("{} not on PATH", cfg.claude_cmd.join(" ")),
+            "install claude, or set claude_cmd via `rote setup`",
+        )),
+    }
+
+    // editor
+    let editor = detect::probe_editor(cfg);
+    match &editor.resolved {
+        Some(p) => checks.push(Check::ok(
+            "editor",
+            format!("{} ({})", editor.command.join(" "), tilde(p)),
+        )),
+        None => checks.push(Check::failed(
+            "editor",
+            format!("{} not on PATH", editor.command.join(" ")),
+            "set ROTE_EDITOR, or `editor` via `rote setup`",
+        )),
+    }
+
+    // global config
+    let global = paths::global_config_path()?;
+    if global.is_file() {
+        checks.push(Check::ok("global config", tilde(&global)));
+    } else {
+        checks.push(Check::failed("global config", "missing", "rote setup"));
+    }
+
+    // Repository-scoped checks degrade when we are not in one.
+    match find_repo(cli) {
+        Ok(repo_root) => {
+            let commits = git::head_commit(&repo_root)
+                .map(|_| "has commits".to_string())
+                .unwrap_or_else(|_| "no commits yet".to_string());
+            let has_commits = commits == "has commits";
+            if has_commits {
+                checks.push(Check::ok(
+                    "repository",
+                    format!("{}  ({commits})", tilde(&repo_root)),
+                ));
+            } else {
+                checks.push(Check::failed(
+                    "repository",
+                    format!("{}  ({commits})", tilde(&repo_root)),
+                    "make a commit — rote needs one to anchor the shadow",
+                ));
+            }
+
+            match ProjectPaths::resolve(&repo_root) {
+                Ok(project) => {
+                    checks.push(Check::ok("shadow location", tilde(&project.shadow_dir)));
+                    let pc = project.project_config();
+                    if pc.is_file() {
+                        let cfg_here =
+                            Config::load(&paths::global_config_path()?, &pc).unwrap_or_default();
+                        let n = cfg_here.check_commands.len();
+                        let detail = if n == 0 {
+                            format!("{}  (no checks configured)", tilde(&pc))
+                        } else {
+                            format!("{}  ({n} check(s))", tilde(&pc))
+                        };
+                        checks.push(Check::ok("project config", detail));
+                    } else {
+                        checks.push(Check::failed("project config", "missing", "rote init"));
+                    }
+                }
+                Err(e) => checks.push(Check::failed(
+                    "shadow location",
+                    first_line(&format!("{e:#}")),
+                    "set XDG_CACHE_HOME outside the repository",
+                )),
+            }
+        }
+        Err(_) => {
+            checks.push(Check::skipped("repository", "not in a git repository"));
+            checks.push(Check::skipped("shadow location", "n/a"));
+            checks.push(Check::skipped("project config", "n/a"));
+        }
+    }
+
+    // Render.
+    let width = checks.iter().map(|c| c.label.len()).max().unwrap_or(0);
+    let mut failures = 0;
+    for c in &checks {
+        let (mark, painted) = match c.state {
+            CheckState::Ok => ("ok", paint_green("ok", color)),
+            CheckState::Failed => {
+                failures += 1;
+                ("FAIL", paint_red("FAIL", color))
+            }
+            CheckState::Skipped => ("--", paint_dim("--", color)),
+        };
+        let _ = mark;
+        println!(
+            "  {:<width$}  {:<44}  {}",
+            c.label,
+            truncate(&c.detail, 44),
+            painted,
+            width = width
+        );
+        if let Some(fix) = &c.fix {
+            println!("  {:<width$}  → {fix}", "", width = width);
+        }
+    }
+
+    if failures == 0 {
+        println!("\nall good.");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!("\n{failures} check(s) need attention.");
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or(s).to_string()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep: String = s.chars().skip(s.chars().count() - max + 1).collect();
+    format!("…{keep}")
+}
+
+/// Shorten a path under $HOME to `~/…` for display.
+fn tilde(path: &Path) -> String {
+    let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+fn paint_green(s: &str, color: bool) -> String {
+    use owo_colors::OwoColorize;
+    if color {
+        s.green().to_string()
+    } else {
+        s.to_string()
+    }
+}
+fn paint_red(s: &str, color: bool) -> String {
+    use owo_colors::OwoColorize;
+    if color {
+        s.red().to_string()
+    } else {
+        s.to_string()
+    }
+}
+fn paint_dim(s: &str, color: bool) -> String {
+    use owo_colors::OwoColorize;
+    if color {
+        s.dimmed().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Write the global config. The only command that does.
+fn cmd_setup(cfg: &Config, force: bool, quiet: bool) -> Result<()> {
+    let target = paths::global_config_path()?;
+    if target.exists() && !force {
+        bail!(
+            "{} already exists.\nRe-run with --force to overwrite it, or edit it by hand.",
+            target.display()
+        );
+    }
+
+    let claude = detect::probe_claude(cfg);
+    let editor = detect::probe_editor(cfg);
+
+    // Prompt only where detection is ambiguous, and only when someone is there
+    // to answer — a non-tty takes the detected values.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+
+    let editor_cmd = if editor.found() || !interactive {
+        editor.command.join(" ")
+    } else {
+        println!(
+            "editor `{}` was not found on PATH.",
+            editor.command.join(" ")
+        );
+        let answer = prompt_line("which editor should rote open? [nvim] ")?;
+        if answer.trim().is_empty() {
+            "nvim".into()
+        } else {
+            answer.trim().to_string()
+        }
+    };
+
+    let claude_cmd = if claude.found() || !interactive {
+        cfg.claude_cmd.join(" ")
+    } else {
+        println!("`{}` was not found on PATH.", cfg.claude_cmd.join(" "));
+        let answer = prompt_line("path to the claude binary? [claude] ")?;
+        if answer.trim().is_empty() {
+            "claude".into()
+        } else {
+            answer.trim().to_string()
+        }
+    };
+
+    let body = format!(
+        r#"# rote global configuration.
+# Per-project .rote.toml files override anything set here.
+
+# Invoked as: editor +LINE FILE
+editor = {editor}
+
+# The session agent. An argument vector, not a shell string.
+claude_cmd = {claude}
+claude_continue_cmd = {claude_continue}
+
+color = true
+
+# Defaults for every project; override per-project in .rote.toml.
+max_hunk_lines = 20
+strict_whitespace = false
+"#,
+        editor = toml_str(&editor_cmd),
+        claude = toml_vec(&split_ws(&claude_cmd)),
+        claude_continue = toml_vec(&{
+            let mut v = split_ws(&claude_cmd);
+            v.push("--continue".into());
+            v
+        }),
+    );
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    paths::write_atomic(&target, body.as_bytes())?;
+
+    if !quiet {
+        println!("wrote {}", target.display());
+        if !claude.found() {
+            println!("note: claude still does not resolve — `rote doctor` will tell you.");
+        }
+        println!("next: rote doctor");
+    }
+    Ok(())
+}
+
+fn split_ws(s: &str) -> Vec<String> {
+    s.split_whitespace().map(String::from).collect()
+}
+
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn toml_vec(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| toml_str(s)).collect();
+    format!("[{}]", inner.join(", "))
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::Write as _;
+    print!("{prompt}");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line)
 }
 
 fn cmd_talk(project: &ProjectPaths, cfg: &Config, attach: bool) -> Result<()> {
@@ -520,6 +940,17 @@ fn cmd_start(
     }
     shadow::ensure_no_operation_in_progress(project)?;
 
+    // Preflight only what `start` needs. The editor is not required until
+    // `next`, nor the reviewer until `done`, so each command checks its own
+    // prerequisites where it needs them rather than running a full diagnostic.
+    if !no_launch && detect::find_on_path(&cfg.claude_cmd[0]).is_none() {
+        bail!(
+            "`{}` is not on PATH, so there is nothing to hand the session to.\n\
+             Run `rote doctor` to see what is missing.",
+            cfg.claude_cmd.join(" ")
+        );
+    }
+
     if !quiet {
         println!("syncing shadow …");
     }
@@ -691,12 +1122,26 @@ fn cmd_init(project: &ProjectPaths, force: bool, quiet: bool) -> Result<()> {
             target.display()
         );
     }
+    let detected = detect::detect_project(&project.repo_root);
     // The one documented write into the real tree (ARCHITECTURE.md, Principle 2),
     // so it deliberately does not route through the guarded writers.
-    std::fs::write(&target, INIT_TEMPLATE)
+    std::fs::write(&target, config::init_template(&detected))
         .with_context(|| format!("cannot write {}", target.display()))?;
+
     if !quiet {
         println!("wrote {}", target.display());
+        if detected.checks.is_empty() {
+            println!(
+                "no project type detected — add your own commands to [checks] so \
+                 `rote done` can verify the session."
+            );
+        } else {
+            println!(
+                "detected a {} project; checks set to: {}",
+                detected.kind.label(),
+                detected.checks.join(", ")
+            );
+        }
         println!("next: rote start \"what you're working on\"");
     }
     Ok(())

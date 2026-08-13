@@ -8,12 +8,27 @@ Read ARCHITECTURE.md first. This document specifies component behavior, data sch
 
 Binary name: `rote`. All commands run from anywhere inside the real repo (repo root discovered by walking up to `.git`). Running outside a git repo is an error with a clear message.
 
+Two commands — `doctor` and `setup` — deliberately do **not** require a repository. They concern machine-level state (the claude binary, the editor, the global config), and `doctor` is the command you reach for when something is wrong, which may well be before you have a repo. Repo discovery is therefore per-command, not a precondition of dispatch.
+
+### `rote doctor [--deep]`
+Read-only diagnosis of whether this machine can run rote. One aligned line per check — git, claude, the reviewer's tool-restriction flag, the editor, the global config, the repository, the shadow location, the project config — each either passing or naming the command that fixes it. Repository-scoped lines report `not in a git repository` rather than failing when run outside one. **Exits non-zero if any check fails**, so it can gate a script.
+
+The reviewer check parses `claude --help` for the flag in `REVIEWER_TOOL_FLAGS` (§8): free, offline, and enough to catch a rename. `--deep` additionally runs one real `claude -p` invocation, which is the only check that catches a flag that exists but behaves differently than assumed. It is opt-in because it costs a token spend.
+
+`doctor` never writes anything.
+
+### `rote setup [--force]`
+The only writer of `~/.config/rote/config.toml`, which nothing else creates. Runs the same detection as `doctor`, prompts only where detection is ambiguous, and refuses an existing file without `--force`. On a non-tty it takes the detected values without prompting, so it stays scriptable.
+
 ### `rote init`
-Creates `.rote.toml` in the repo root with commented defaults (see §7). Idempotent; refuses to overwrite an existing file without `--force`.
+Creates `.rote.toml` in the repo root (see §7). Idempotent; refuses to overwrite an existing file without `--force`.
+
+**Checks are prefilled from project detection (§11) and left active, not commented out.** A `[checks]` block that is empty by default means `rote done` silently verifies nothing — the wrong default for the one safety net in the close-out pipeline. `init` prints one line naming what it detected and what it chose; an unrecognized project gets `commands = []` with a comment explaining what to add.
 
 ### `rote start [TASK...]`
 - Errors if a session is already active (message: show `rote status`, suggest `done` or `abort`).
 - Errors if the real repo is in a merge/rebase/cherry-pick/bisect state (detect via `.git/MERGE_HEAD`, `.git/rebase-merge`, `.git/rebase-apply`, `.git/CHERRY_PICK_HEAD`, `.git/BISECT_LOG`).
+- **Preflights `claude_cmd` only**, and only when it is actually going to launch: if the binary does not resolve on PATH, fail naming it and suggesting `rote doctor`. Deliberately narrow — the editor is not needed until `next` and the reviewer not until `done`, so each command validates its own prerequisites at the point it needs them rather than every command running a full diagnostic.
 - Creates the shadow clone if absent; syncs real → shadow (§3).
 - Writes the manifest: state `working`, `task` = joined TASK args (may be empty), `baseline` = snapshot info (§4).
 - **Releases the manifest lock before exec.** The lock records a PID and treats a live PID as held (§9.7); after `exec` that PID belongs to the claude process, which lives for the whole session. Failing to release here wedges every subsequent `rote` invocation until the user quits claude.
@@ -355,8 +370,55 @@ src/
   diffparse.rs     # unified diff parser → Vec<RawHunk>
   hunks.rs         # splitting, IDs, Hunk model (serde)
   session.rs       # SessionEngine: manifest, state machine, recompute
+  detect.rs        # environment + project detection (doctor/setup/init)
   present.rs       # HunkPresenter: render, anchor, editor, classify
   review.rs        # done-pipeline: checks, reviewer payload + invocation
 ```
 
 Unit-test targets (minimum): diffparse (fixture diffs incl. new/deleted/binary/no-newline), hunk splitting, anchor matching (drifted files), reconciliation scenarios (typed/diverged/reworked/new), sync round-trip on a fixture repo (integration test using a temp git repo).
+
+---
+
+## 11. Project detection and the path-collision guard
+
+### Detection (`detect.rs`)
+
+One shared surface, so `doctor`, `setup`, and `init` cannot disagree about what
+they found. It probes and returns values; it never prints and never writes.
+
+Project kind is decided by manifest file, in a fixed order so a polyglot repo
+gets one answer rather than an arbitrary one: `Cargo.toml` → Rust,
+`package.json` → Node, `pyproject.toml` → Python, `go.mod` → Go, else unknown.
+
+Check commands are **verified to run on this machine before being written**,
+which is the whole reason detection probes rather than hardcodes. A Homebrew
+Rust with no rustup has `cargo-clippy` and `cargo-fmt` on PATH but no
+`cargo clippy` subcommand, so the obvious defaults would be written into every
+`.rote.toml` and fail at the first `rote done`. The Node case reads the scripts
+actually declared in `package.json` before falling back to `npm test`. An
+unrecognized project gets no commands at all — rote does not invent checks.
+
+`verbatim` globs follow the same ecosystem mapping, so a Rust project is not
+told to watch for `pnpm-lock.yaml`.
+
+### The path-collision guard
+
+`ProjectPaths::resolve` refuses, **at runtime in every build**, when the shadow
+or state directory would land inside the repository being shadowed. The error
+names the collision and the environment variable that fixes it.
+
+This is not the same thing as `assert_not_in_real_tree`, which is a
+`debug_assert` and therefore compiled out of exactly the build `cargo install`
+produces. The realistic trigger is not a misconfigured `XDG_CACHE_HOME` but an
+ordinary one: when `$HOME` is itself a git repository — a dotfiles repo —
+`~/.cache/rote/<hash>/shadow` is inside the real tree by definition, and rote
+would clone the home directory into a subdirectory of itself. The debug
+assertions remain as a second layer, for a future writer that constructs a
+target without going through `ProjectPaths` at all.
+
+Comparison detail: the XDG roots routinely do not exist on first run, so
+canonicalize the deepest ancestor that *does* exist and re-attach the remainder.
+Canonicalizing the whole path fails on a missing directory; comparing raw
+strings misses macOS's `/var` → `/private/var` symlink.
+
+---

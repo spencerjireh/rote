@@ -94,9 +94,24 @@ impl ProjectPaths {
             .canonicalize()
             .with_context(|| format!("cannot resolve repo root {}", repo_root.display()))?;
         let hash = project_hash(&repo_root)?;
+
+        let shadow_dir = cache_root.join("rote").join(&hash).join("shadow");
+        let state_dir = data_root.join("rote").join(&hash);
+
+        // Principle 2, enforced at runtime rather than only in debug builds.
+        //
+        // `cargo install` builds in release, where `debug_assert!` compiles to
+        // nothing — so the guarded writers alone would leave the installed
+        // binary unprotected. This is not a hypothetical: when $HOME is itself a
+        // git repo (a dotfiles repo), ~/.cache/rote/<hash>/shadow is inside the
+        // real tree by definition, and rote would clone the home directory into
+        // a subdirectory of itself.
+        ensure_outside_repo(&shadow_dir, &repo_root, "shadow", "XDG_CACHE_HOME")?;
+        ensure_outside_repo(&state_dir, &repo_root, "state", "XDG_DATA_HOME")?;
+
         Ok(Self {
-            shadow_dir: cache_root.join("rote").join(&hash).join("shadow"),
-            state_dir: data_root.join("rote").join(&hash),
+            shadow_dir,
+            state_dir,
             hash,
             repo_root,
         })
@@ -129,12 +144,68 @@ impl ProjectPaths {
     }
 }
 
+/// Normalize a path that may not exist yet.
+///
+/// `canonicalize` fails on a missing directory, and rote's state dirs routinely
+/// do not exist on first run — but a raw string comparison would miss macOS's
+/// `/var` → `/private/var` symlink, the exact mismatch that already caught the
+/// test fixtures out. So: canonicalize the deepest ancestor that does exist, and
+/// re-attach the rest.
+fn normalize_possibly_missing(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(real) = cursor.canonicalize() {
+            let mut out = real;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (cursor.file_name(), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cursor = parent;
+            }
+            // Nothing along the path exists; the best we can do is the input.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Refuse a rote-owned directory that would sit inside the user's repository.
+fn ensure_outside_repo(
+    candidate: &Path,
+    repo_root: &Path,
+    what: &str,
+    env_var: &str,
+) -> Result<()> {
+    let normalized = normalize_possibly_missing(candidate);
+    if !normalized.starts_with(repo_root) {
+        return Ok(());
+    }
+    bail!(
+        "rote's {what} directory would sit inside the repository it is shadowing.\n\
+         \n  {what} directory: {}\n  repository:      {}\n\n\
+         rote never writes into your real tree, so it will not proceed. This usually \
+         means the repository is your home directory (a dotfiles repo), or that \
+         {env_var} points inside the project.\n\
+         Set {env_var} to a location outside {}, then try again.",
+        normalized.display(),
+        repo_root.display(),
+        repo_root.display()
+    )
+}
+
 /// Principle 2, mechanically enforced: no rote code path writes source into the
 /// real tree. `rote init` writing `.rote.toml` is the single documented
 /// exception and does not route through the guarded writers.
 ///
-/// Debug-only by design — it catches the mistake during development and tests
-/// without adding a syscall to every write in release.
+/// A second layer, not the primary defence. `ProjectPaths::resolve_in` refuses
+/// at runtime, in every build, when rote's directories would land inside the
+/// repository — this catches the narrower case of a writer that constructs a
+/// target without going through `ProjectPaths` at all. Debug-only is adequate
+/// for that: it is a coding mistake, caught in development and tests.
 pub fn assert_not_in_real_tree(path: &Path, repo_root: &Path) {
     debug_assert!(
         !path.starts_with(repo_root),
@@ -299,6 +370,76 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = discover_repo_root(dir.path()).unwrap_err().to_string();
         assert!(err.contains("not inside a git repository"), "got: {err}");
+    }
+
+    #[test]
+    fn shadow_inside_the_repo_is_refused() {
+        // The dotfiles-repo case: the repository *is* the home directory, so the
+        // XDG cache root lives underneath it.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        fs::create_dir_all(home.join(".git")).unwrap();
+        let cache = home.join(".cache");
+        let data = home.join(".local/share");
+
+        let err = ProjectPaths::resolve_in(&home, &cache, &data)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inside the repository"), "got: {err}");
+        assert!(err.contains("XDG_CACHE_HOME"), "names the fix: {err}");
+    }
+
+    #[test]
+    fn state_dir_inside_the_repo_is_refused_too() {
+        // Cache outside, data inside — the guard must check both.
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let err = ProjectPaths::resolve_in(&repo, &base.join("cache"), &repo.join("state"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("XDG_DATA_HOME"), "got: {err}");
+    }
+
+    #[test]
+    fn roots_outside_the_repo_resolve_normally() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let p = ProjectPaths::resolve_in(&repo, &base.join("cache"), &base.join("data")).unwrap();
+        assert!(p.shadow_dir.starts_with(base.join("cache")));
+        assert!(p.state_dir.starts_with(base.join("data")));
+        assert!(!p.shadow_dir.starts_with(&repo));
+    }
+
+    #[test]
+    fn a_sibling_directory_sharing_a_name_prefix_is_not_inside() {
+        // `/x/repo-cache` must not read as inside `/x/repo`. starts_with works
+        // on components, but this is the classic way to get it wrong.
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        assert!(
+            ProjectPaths::resolve_in(&repo, &base.join("repo-cache"), &base.join("repo-data"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn normalization_survives_a_missing_tail() {
+        // The state dir usually does not exist on first run, but the symlinked
+        // prefix still has to be resolved or the comparison is meaningless.
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().canonicalize().unwrap();
+        let missing = base.path().join("not/created/yet");
+        let normalized = normalize_possibly_missing(&missing);
+        assert!(normalized.starts_with(&real), "{normalized:?} vs {real:?}");
+        assert!(normalized.ends_with("not/created/yet"));
     }
 
     #[test]

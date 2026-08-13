@@ -102,8 +102,25 @@ Conventions for all milestones:
 
 **Acceptance:** clippy/fmt clean, all tests green, README accurate against actual behavior.
 
+## M7 — Install and setup UX
+
+**Goal:** a first run that diagnoses itself, and the release-mode hole closed.
+
+- **The guard, first — it is a bug.** `assert_not_in_real_tree` is a `debug_assert`, and `cargo install` builds in release, so the guard protecting Principle 2 is absent from exactly the binary people use. `ProjectPaths::resolve` gains a real runtime check refusing a shadow or state directory inside the repository (DESIGN §11). The realistic trigger is ordinary: a dotfiles repo at `$HOME` puts `~/.cache/rote/…` inside the real tree by definition.
+- `detect.rs`: one shared detection surface for `doctor`, `setup`, and `init` — PATH resolution, the claude/reviewer-flag probe, editor resolution, project kind, and check commands *verified to run on this machine* before being written.
+- `rote doctor [--deep]` per DESIGN §1: read-only, works outside a repo with repository-scoped lines degrading, exits non-zero on failure.
+- `rote setup [--force]`: the only writer of the global config, which nothing previously created.
+- `rote init`: prefills `[checks]` and `[transcribe] verbatim` from detection and says what it chose. Empty checks meant `rote done` verified nothing by default.
+- `rote start`: preflights `claude_cmd` only, and only when launching.
+- Dispatch restructure so repo discovery is per-command rather than a precondition.
+- `Formula/rote.rb` (build from source, tagged) and a `justfile` (`install`, `gate`, `formula-sha`).
+
+**Acceptance:** `doctor` passes on a correctly configured machine and fails with an actionable line on a broken one; it runs outside a repository without erroring. `setup` writes a config the real loader round-trips, and refuses without `--force`. `init` in a Rust fixture writes checks whose commands exist on PATH; an unrecognized project gets empty checks and says so. `start` refuses with `run rote doctor` when claude is missing, but `--no-launch` still works without it. A repo whose XDG dirs sit inside itself is refused through the CLI.
+
+---
+
 ---
 
 ## Out of scope — do not build
 
-Multi-session, non-git backends, nvim plugin, paste prevention, Windows, any Claude Code hooks/MCP/SDK integration, `rote gc`, telemetry of any kind.
+Multi-session, non-git backends, nvim plugin, paste prevention, Windows, any Claude Code hooks/MCP/SDK integration, `rote gc`, telemetry of any kind. From M7: a TUI wizard, publishing the tap, prebuilt binaries, GitHub Releases, or release CI.

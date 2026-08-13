@@ -15,20 +15,50 @@ usually means crippling the agent. This doesn't.
 
 ## Install
 
+Via Homebrew, from the formula in this repo:
+
 ```
-cargo install --path .
+brew install --formula ./Formula/rote.rb
 ```
 
-Requires a stable Rust toolchain, `git`, and — for real use — `claude` on PATH.
-Linux and macOS only.
+Or from source:
+
+```
+cargo install --path .          # or: just install
+```
+
+Requires `git`, and — for real use — `claude` on PATH. Linux and macOS only.
+
+## First run
+
+```
+rote setup      # writes ~/.config/rote/config.toml
+rote doctor     # confirms this machine is ready
+```
+
+`doctor` checks git, claude, the reviewer's tool-restriction flag, your editor,
+the global config, and — when you are in a repo — the repository, the shadow
+location, and the project config. Every line either passes or names the command
+that fixes it, and it exits non-zero if anything needs attention, so it works as
+a script gate. It runs outside a repository too, which is usually where you are
+when you first install something.
+
+`rote doctor --deep` additionally makes one real `claude` call to prove the
+reviewer path works end to end. That costs a token spend, which is why it is
+opt-in — but it is the only check that catches a flag that exists and behaves
+differently than expected.
 
 ## Quickstart
 
 ```
 cd your-repo
-rote init                       # writes a commented .rote.toml
+rote init                       # writes .rote.toml, shaped to your project
 rote start "add tagging to posts"
 ```
+
+`rote init` detects what kind of project this is and prefills `[checks]` with
+commands it has verified actually run here — so `rote done` verifies something
+from the start rather than silently checking nothing. It prints what it chose.
 
 `start` syncs the shadow and hands your pane to claude. Argue with it, iterate,
 run its tests — all inside the shadow. When you have what you want, quit claude
@@ -73,6 +103,8 @@ re-offered as new ones.
 | `rote talk` | Print the shadow path; `--attach` resumes the agent there. |
 | `rote done` | Run checks, review the session, close it. |
 | `rote abort` | Discard the session. Your real tree is untouched. |
+| `rote doctor` | Check this machine is set up. `--deep` proves the reviewer path. |
+| `rote setup` | Write the global config. The only command that does. |
 
 Global flags: `--project <path>`, `-q/--quiet`, `--no-color`.
 
@@ -144,7 +176,10 @@ inheriting a pager is a worse failure than an explicit setting.
 ```
 
 XDG paths on both Linux and macOS, so the escape hatch below is literally true
-everywhere.
+everywhere. rote refuses to run if those directories would land inside the
+repository it is shadowing — which happens by default when the repository *is*
+your home directory, as with a dotfiles repo. Point `XDG_CACHE_HOME` elsewhere
+in that case.
 
 ### If you skip something and change your mind
 
@@ -181,10 +216,20 @@ prevention (honor system), Windows, and telemetry of any kind.
 ## Development
 
 ```
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+just gate      # test + lint + fmt-check
 ```
+
+Or individually:
+
+```
+cargo test
+cargo-clippy --all-targets -- -D warnings
+cargo-fmt --check
+```
+
+Note the hyphens: a Homebrew Rust ships `cargo-clippy` and `cargo-fmt` as
+binaries but has no rustup shim, so `cargo clippy` does not resolve. `rote init`
+detects the same thing when writing a project's checks.
 
 Design documents, in reading order: `ARCHITECTURE.md` for the shape and the four
 non-negotiable principles, `DESIGN.md` for the contracts and edge cases,
