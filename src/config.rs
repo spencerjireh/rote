@@ -19,6 +19,13 @@ pub const DEFAULT_DIVERGENCE_GRACE_MS: u64 = 2000;
 /// git once per changed file; a burst of saves must collapse into one.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 400;
 
+/// Whether `rote start` leaves a daemon watching in the background.
+///
+/// On by default because the queue advancing while you type — with or without
+/// a pane open — is most of what the tool does. Turn it off and every front end
+/// starts one on demand instead.
+pub const DEFAULT_DAEMON_AUTOSTART: bool = true;
+
 fn default_editor() -> String {
     "nvim".into()
 }
@@ -81,6 +88,8 @@ struct ProjectFile {
     review: Option<ReviewFile>,
     #[serde(default)]
     watch: Option<WatchFile>,
+    #[serde(default)]
+    daemon: Option<DaemonFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -107,6 +116,12 @@ struct ChecksFile {
 struct ReviewFile {
     enabled: Option<bool>,
     model_args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonFile {
+    autostart: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -142,6 +157,8 @@ pub struct Config {
     /// Extra globs the watcher ignores, on top of `.git`, `shadow.preserve`,
     /// and rote's own state directory.
     pub watch_ignore: Vec<String>,
+    /// Whether `rote start` leaves a daemon watching in the background.
+    pub daemon_autostart: bool,
 }
 
 impl Default for Config {
@@ -162,6 +179,7 @@ impl Default for Config {
             watch_divergence_grace_ms: DEFAULT_DIVERGENCE_GRACE_MS,
             watch_debounce_ms: DEFAULT_DEBOUNCE_MS,
             watch_ignore: Vec::new(),
+            daemon_autostart: DEFAULT_DAEMON_AUTOSTART,
         }
     }
 }
@@ -238,6 +256,11 @@ impl Config {
                 }
                 if let Some(v) = w.ignore {
                     cfg.watch_ignore = v;
+                }
+            }
+            if let Some(d) = p.daemon {
+                if let Some(v) = d.autostart {
+                    cfg.daemon_autostart = v;
                 }
             }
         }
@@ -373,6 +396,11 @@ debounce_ms = 400
 # Extra globs the watcher ignores, on top of .git, shadow.preserve, and
 # rote's own state directory.
 ignore = []
+
+[daemon]
+# Whether `rote start` leaves a daemon watching in the background. With it off,
+# `rote watch` starts one on demand instead.
+autostart = true
 "#,
         preserve = toml_list(&default_preserve()),
         verbatim = toml_list(&detected.verbatim),
@@ -454,7 +482,8 @@ mod tests {
              [transcribe]\nverbatim = [\"*.lock\"]\n\
              [checks]\ncommands = [\"cargo test\"]\n\
              [review]\nenabled = false\nmodel_args = [\"--model\", \"claude-haiku-4-5\"]\n\
-             [watch]\ndivergence_grace_ms = 0\ndebounce_ms = 50\nignore = [\"*.log\"]\n",
+             [watch]\ndivergence_grace_ms = 0\ndebounce_ms = 50\nignore = [\"*.log\"]\n\
+             [daemon]\nautostart = false\n",
         );
         let cfg = Config::load(&dir.path().join("absent.toml"), &p).unwrap();
         assert_eq!(cfg.shadow_copy, vec![".env", ".envrc"]);
@@ -467,6 +496,7 @@ mod tests {
         assert_eq!(cfg.watch_divergence_grace_ms, 0);
         assert_eq!(cfg.watch_debounce_ms, 50);
         assert_eq!(cfg.watch_ignore, vec!["*.log"]);
+        assert!(!cfg.daemon_autostart, "the project may turn the daemon off");
     }
 
     #[test]
@@ -504,6 +534,10 @@ mod tests {
                 "for {kind:?}"
             );
             assert_eq!(cfg.watch_debounce_ms, DEFAULT_DEBOUNCE_MS, "for {kind:?}");
+            assert_eq!(
+                cfg.daemon_autostart, DEFAULT_DAEMON_AUTOSTART,
+                "for {kind:?}"
+            );
         }
     }
 

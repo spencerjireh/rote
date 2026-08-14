@@ -125,11 +125,43 @@ impl ProjectPaths {
         self.state_dir.join("session.json.lock")
     }
 
-    /// Held for a whole `rote watch` session, unlike `lock_path`, which is
-    /// taken and released around each manifest write. They must be separate
-    /// files: the pane writes through the manifest lock constantly.
+    /// **The engine token.** Whoever holds this flock owns the watch engine for
+    /// this project, and holds it unbroken for that engine's whole lifetime.
+    ///
+    /// This is the invariant the whole design rests on, because two engines do
+    /// not merely duplicate work — they corrupt each other. An engine's
+    /// authority lives in private in-process state (its baselines, its watchdog,
+    /// its recompute schedule) that no other process can see or invalidate. Two
+    /// of them classify the same keystroke, one wins the compare-and-swap, and
+    /// the loser never retakes its baseline — so it goes on to raise a
+    /// divergence question about a hunk the user never touched, and that
+    /// question survives every recompute.
+    ///
+    /// So it is also the routing decision for every mutation: acquire it and
+    /// there is no engine to desynchronize, so mutate directly; fail to acquire
+    /// it and an engine exists, so send it a verb instead. The check *is* the
+    /// exclusion, which is why it beats asking `daemon.json` — that file is an
+    /// address book and can be stale, while the kernel maintains this.
+    ///
+    /// Necessarily a different file from `lock_path`, which is taken and
+    /// released around each manifest write and which the engine uses constantly.
     pub fn watch_lock_path(&self) -> PathBuf {
         self.state_dir.join("watch.lock")
+    }
+
+    /// Where a running daemon publishes its port and token. An address book,
+    /// never an authority: it outlives a `kill -9`, and a `--local` pane owns
+    /// the engine without writing one at all.
+    pub fn daemon_json(&self) -> PathBuf {
+        self.state_dir.join("daemon.json")
+    }
+
+    /// The detached daemon's stdout and stderr.
+    ///
+    /// Without it a daemon that dies during startup leaves nothing to debug:
+    /// its parent has already `exec`ed into claude.
+    pub fn daemon_log(&self) -> PathBuf {
+        self.state_dir.join("daemon.log")
     }
 
     pub fn baseline_patch(&self) -> PathBuf {
@@ -145,9 +177,19 @@ impl ProjectPaths {
         self.repo_root.join(".rote.toml")
     }
 
+    /// Create the state directory, owner-only.
+    ///
+    /// 0700 because a bearer token lives in here. Set unconditionally rather
+    /// than only at creation: the directory predates that requirement on any
+    /// machine that ran an earlier rote.
     pub fn ensure_state_dir(&self) -> Result<()> {
         fs::create_dir_all(&self.state_dir)
-            .with_context(|| format!("cannot create {}", self.state_dir.display()))
+            .with_context(|| format!("cannot create {}", self.state_dir.display()))?;
+        fs::set_permissions(
+            &self.state_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .with_context(|| format!("cannot secure {}", self.state_dir.display()))
     }
 }
 
@@ -225,6 +267,19 @@ pub fn assert_not_in_real_tree(path: &Path, repo_root: &Path) {
 
 /// Atomic write: temp file in the same directory, then rename.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomic_mode(path, contents, 0o644)
+}
+
+/// `write_atomic`, with the permissions set before the file has any content.
+///
+/// The mode is applied at creation rather than afterwards, so the contents are
+/// never briefly readable by anyone who should not see them. `write_atomic`
+/// creates 0644 under a normal umask, which is right for a manifest and wrong
+/// for a file holding a bearer token on a shared machine.
+pub fn write_atomic_mode(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
@@ -233,7 +288,20 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         ".{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
-    fs::write(&tmp, contents).with_context(|| format!("cannot write {}", tmp.display()))?;
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        f.write_all(contents)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+    }
+    // An existing target keeps its own mode through a rename, so set it again.
+    fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode))
+        .with_context(|| format!("cannot set permissions on {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("cannot rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
@@ -629,6 +697,38 @@ mod tests {
         let held = Lock::acquire(&p).unwrap();
         assert!(Lock::try_acquire(&p).unwrap().is_none());
         drop(held);
+    }
+
+    #[test]
+    fn write_atomic_mode_sets_permissions_before_any_content_lands() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("secret");
+
+        write_atomic_mode(&p, b"a bearer token", 0o600).unwrap();
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Overwriting an existing file keeps the requested mode: a rename
+        // carries the temp file's permissions, not the target's, but a target
+        // that already exists with a laxer mode must not survive.
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic_mode(&p, b"a new token", 0o600).unwrap();
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&p).unwrap(), b"a new token");
+
+        // And the default wrapper is unchanged for everything else.
+        let q = dir.path().join("ordinary");
+        write_atomic(&q, b"x").unwrap();
+        assert_eq!(
+            fs::metadata(&q).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[test]

@@ -43,6 +43,47 @@ pub struct Snapshot {
     pub notices: Vec<Notice>,
 }
 
+/// What a daemon says about itself.
+///
+/// The handshake: a front end reads this first and can refuse politely rather
+/// than misinterpreting a payload it does not understand. `project_hash` is the
+/// one field a client must check — it is what proves the daemon on this port is
+/// serving the repository the client thinks it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Health {
+    pub ok: bool,
+    pub wire_version: u32,
+    pub manifest_version: u32,
+    pub rote_version: String,
+    pub pid: u32,
+    pub port: u16,
+    pub project_hash: String,
+    pub repo_root: String,
+    pub shadow_dir: String,
+    /// `None` when the session has been archived and the daemon is winding up.
+    pub session_state: Option<State>,
+    pub task: String,
+    /// `None` before the engine's first publish.
+    pub generation: Option<u64>,
+    pub subscribers: usize,
+    pub uptime_ms: u64,
+}
+
+/// One hunk in full, for a client that has a summary and wants the text.
+///
+/// `QueueItem` carries no line bodies so a snapshot stays small; this is the
+/// other half of that trade. Not a `Presented`: `position` and `total` are
+/// meaningless for a hunk that is typed or skipped, and zero would be a lie a
+/// front end will happily render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HunkDetail {
+    pub generation: u64,
+    pub hunk: Hunk,
+    pub anchor_line: usize,
+    pub anchor_via: AnchorVia,
+    pub real_path: String,
+}
+
 /// The active hunk, resolved against the real file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presented {
