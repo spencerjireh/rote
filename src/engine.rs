@@ -421,28 +421,36 @@ impl Engine {
     /// verdict the agent may have reworked this region — which gives it a new id
     /// and a new key. Committing anyway would mark a hunk typed that the user
     /// has never seen.
+    /// A miss here writes nothing, so it does not move the generation and does
+    /// not invalidate any client's view of the world.
     fn commit_typed(&self, id: &str, key: &str) -> Result<bool> {
-        session::with_session(&self.project, |m| {
+        let (out, _) = session::with_session_maybe(&self.project, |m| {
             let Some(h) = m.find_mut(id) else {
-                return Ok(false);
+                return Ok(None);
             };
             if h.status != Status::Pending || h.key != key {
-                return Ok(false);
+                return Ok(None);
             }
             h.status = Status::Typed;
             h.pending_divergence = None;
             m.last_presented = Some(id.to_string());
-            Ok(true)
-        })
+            Ok(Some(()))
+        })?;
+        Ok(out.is_some())
     }
 
     fn withdraw_question(&self, id: &str) -> Result<()> {
-        session::with_session(&self.project, |m| {
-            if let Some(h) = m.find_mut(id) {
-                h.pending_divergence = None;
+        session::with_session_maybe(&self.project, |m| {
+            // Only a hunk that actually carries a question is a write.
+            match m.find_mut(id) {
+                Some(h) if h.pending_divergence.is_some() => {
+                    h.pending_divergence = None;
+                    Ok(Some(()))
+                }
+                _ => Ok(None),
             }
-            Ok(())
-        })
+        })?;
+        Ok(())
     }
 
     /// Promote candidates that have sat still for the whole grace window.

@@ -222,15 +222,41 @@ pub fn with_session<T>(
     project: &ProjectPaths,
     f: impl FnOnce(&mut Manifest) -> Result<T>,
 ) -> Result<T> {
+    let (out, _) = with_session_maybe(project, |m| f(m).map(Some))?;
+    Ok(out.expect("the closure always returns Some"))
+}
+
+/// `with_session`, for a cycle that may decide not to write anything.
+///
+/// The closure returns `None` to mean "I looked, and there is nothing to do".
+/// In that case the manifest is not saved and **the generation does not move**.
+///
+/// That distinction is not bookkeeping. `generation` is the staleness token a
+/// front end echoes back with every verb, and the engine suppresses publishing
+/// a snapshot when it has not changed. Bumping it for a cycle that wrote
+/// nothing invalidates every client's view for no reason: a `commit_typed`
+/// whose compare-and-swap *failed* would rewrite `session.json` and cost one
+/// full snapshot — including a real-file read for the anchor — per subscriber.
+///
+/// It is also what makes a rejected stale command harmless. A verb that arrives
+/// with an out-of-date generation writes nothing and moves nothing, so the
+/// client can re-read and re-issue exactly once and be sure of the outcome.
+pub fn with_session_maybe<T>(
+    project: &ProjectPaths,
+    f: impl FnOnce(&mut Manifest) -> Result<Option<T>>,
+) -> Result<(Option<T>, u64)> {
     project.ensure_state_dir()?;
     let _lock = crate::paths::Lock::acquire(&project.lock_path())?;
 
     // Loaded *inside* the lock. Loading outside it is the bug this exists to fix.
     let mut manifest = Manifest::require(project)?;
     let out = f(&mut manifest)?;
+    if out.is_none() {
+        return Ok((None, manifest.generation));
+    }
     manifest.generation += 1;
     manifest.save(project)?;
-    Ok(out)
+    Ok((out, manifest.generation))
 }
 
 /// `with_session`, with a recompute between the load and the closure.

@@ -261,6 +261,90 @@ fn concurrent_writers_do_not_lose_each_others_work() {
 }
 
 #[test]
+fn a_cycle_that_writes_nothing_leaves_the_generation_where_it_was() {
+    // `generation` is the staleness token every front end echoes back, and the
+    // engine suppresses publishing when it has not moved. Bumping it for a
+    // cycle that decided to do nothing invalidates every client's view for no
+    // reason — one wasted full snapshot per subscriber, each with a real-file
+    // read for the anchor.
+    let (fx, _cfg, manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+    manifest.save(&project).unwrap();
+    let before = Manifest::load(&project).unwrap().unwrap().generation;
+
+    let (out, generation) = session::with_session_maybe(&project, |_m| Ok(None::<()>)).unwrap();
+
+    assert!(out.is_none());
+    assert_eq!(generation, before, "a declined cycle does not move it");
+    assert_eq!(
+        Manifest::load(&project).unwrap().unwrap().generation,
+        before,
+        "and does not move it on disk either"
+    );
+
+    // The writing case still bumps exactly once.
+    let (out, generation) = session::with_session_maybe(&project, |m| {
+        m.task = "changed".into();
+        Ok(Some(7))
+    })
+    .unwrap();
+    assert_eq!(out, Some(7));
+    assert_eq!(generation, before + 1);
+    let reloaded = Manifest::load(&project).unwrap().unwrap();
+    assert_eq!(reloaded.generation, before + 1);
+    assert_eq!(reloaded.task, "changed");
+}
+
+#[test]
+fn a_declined_cycle_does_not_rewrite_the_session_file() {
+    // Not just the number: the file must not be touched at all. A rewrite is
+    // what a watcher would see, and rote watches its own state directory's
+    // parent — the filter drops it, but relying on that would be relying on a
+    // filter to hide a write that should never have happened.
+    let (fx, _cfg, manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+    manifest.save(&project).unwrap();
+
+    let path = project.session_json();
+    let before = std::fs::read(&path).unwrap();
+
+    session::with_session_maybe(&project, |_m| Ok(None::<()>)).unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), before, "byte-identical");
+}
+
+#[test]
+fn a_failed_commit_does_not_invalidate_a_clients_generation() {
+    // The reason this matters in practice. The engine's compare-and-swap misses
+    // whenever the agent reworked a region between classification and commit;
+    // under the old code every miss rewrote the manifest.
+    let (fx, cfg, mut manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+    manifest.save(&project).unwrap();
+
+    let id = manifest.active().unwrap().id.clone();
+    let before = Manifest::load(&project).unwrap().unwrap().generation;
+
+    // Stand in for the engine's CAS with a key that no longer matches.
+    let (out, generation) = session::with_session_maybe(&project, |m| {
+        let h = m.find_mut(&id).unwrap();
+        if h.key != "k-a-key-from-a-reworked-hunk" {
+            return Ok(None);
+        }
+        h.status = Status::Typed;
+        Ok(Some(()))
+    })
+    .unwrap();
+
+    assert!(out.is_none(), "the swap should miss");
+    assert_eq!(generation, before, "and cost a client nothing");
+}
+
+#[test]
 fn the_lock_survives_a_killed_process() {
     // kill -9 leaves the lock file behind with a PID that no longer exists.
     let fx = Fixture::new();
