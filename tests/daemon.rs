@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::cli::{stderr, Cli};
+use common::cli::{stderr, stdout, Cli};
 use common::daemon::{wait_until, Daemon};
 use common::Fixture;
 use rote::daemon::Endpoint;
@@ -563,6 +563,180 @@ fn a_second_daemon_refuses_because_the_first_owns_the_engine() {
         err.contains("already owns this project's queue"),
         "and says what is holding it: {err}"
     );
+}
+
+// ------------------------------------------------------------ spawn and reap
+
+#[test]
+fn start_leaves_a_daemon_watching_in_the_background() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    // A claude that exits immediately, so `start` runs its whole path
+    // including the exec.
+    let (stub, _) = common::cli::stub_claude(cli.fx.root.path(), "claude-stub", "", 0);
+    cli.use_claude_stub(&stub);
+
+    let out = cli.run(&["start", "add work"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("watching in the background"),
+        "{}",
+        stdout(&out)
+    );
+
+    let ep = common::daemon::wait_for("a live daemon", || {
+        rote::daemon::discover(&cli.fx.project())
+    });
+    // And it survived the process that started it exec'ing away.
+    assert!(rote::paths::pid_is_live(ep.pid));
+
+    // Clean up: nothing else in this test reaps it.
+    let _ = cli.run_with_input(&["abort", "--yes"], "");
+    common::daemon::wait_until("the daemon to be reaped", || {
+        !rote::paths::pid_is_live(ep.pid)
+    });
+}
+
+#[test]
+fn no_launch_does_not_spawn_a_daemon() {
+    // Every existing test uses `--no-launch`. Spawning there would leak a
+    // background process into the whole suite.
+    let cli = session();
+    assert!(
+        rote::daemon::Endpoint::read(&cli.fx.project()).is_none(),
+        "a session prepared without an agent needs no daemon"
+    );
+}
+
+#[test]
+fn done_reaps_the_daemon_and_tells_it_why_before_the_shadow_is_reset() {
+    let cli = session();
+    let mut d = Daemon::start(&cli);
+    let mut stream = d.events();
+    stream.next_named("snapshot");
+
+    let out = cli.run_with_input(&["done", "--force", "--no-checks", "--no-review"], "y\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // The pane learns *how* it ended, which is what separates "session closed"
+    // from "the daemon vanished".
+    let ev: state::Event = serde_json::from_str(&stream.next_named("closed").data).unwrap();
+    match ev {
+        state::Event::Closed { terminal } => assert_eq!(
+            terminal,
+            Some(rote::session::Terminal::Done),
+            "the reaper is the only thing that knows the reason"
+        ),
+        other => panic!("expected closed, got {other:?}"),
+    }
+
+    // And it had already exited before `done` returned, so the `git clean` that
+    // resets the shadow landed on a tree nobody was watching.
+    //
+    // Asserted through `try_wait` rather than `pid_is_live`: here the daemon is
+    // a direct child of the test process, so after exiting it is a zombie until
+    // this reaps it, and `kill(pid, 0)` cannot tell a zombie from a live
+    // process. In use the daemon is `setsid`-detached and reparented, so the
+    // process running `rote done` sees a real exit.
+    let status = d
+        .child
+        .try_wait()
+        .expect("waitable")
+        .expect("the daemon should already have exited");
+    assert!(status.success(), "and exited cleanly: {status:?}");
+    assert!(rote::daemon::Endpoint::read(&cli.fx.project()).is_none());
+}
+
+#[test]
+fn abort_reaps_with_the_reason_it_was_aborted() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let mut stream = d.events();
+    stream.next_named("snapshot");
+
+    let out = cli.run(&["abort", "--yes"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let ev: state::Event = serde_json::from_str(&stream.next_named("closed").data).unwrap();
+    match ev {
+        state::Event::Closed { terminal } => {
+            assert_eq!(terminal, Some(rote::session::Terminal::Aborted))
+        }
+        other => panic!("expected closed, got {other:?}"),
+    }
+}
+
+#[test]
+fn declining_to_close_leaves_the_daemon_alone() {
+    // The reap sits below every early return, so "left the session open" never
+    // takes the daemon with it. That is satisfied by placement rather than by a
+    // flag someone can forget.
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let pid = d.endpoint.pid;
+
+    let out = cli.run_with_input(&["done", "--no-checks", "--no-review"], "n\n");
+    assert!(
+        stdout(&out).contains("left the session open"),
+        "{}",
+        stdout(&out)
+    );
+
+    assert!(
+        rote::paths::pid_is_live(pid),
+        "the daemon should still be up"
+    );
+    assert_eq!(d.get("/health").status, 200);
+}
+
+#[test]
+fn a_stale_endpoint_from_a_dead_daemon_is_not_believed() {
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+
+    // A pid that is genuinely gone, on a port nothing is listening to.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    Endpoint::new(&project, dead, 1, "deadbeef".into())
+        .write(&project)
+        .unwrap();
+
+    assert!(
+        rote::daemon::discover(&project).is_none(),
+        "an address book entry is not evidence that anything is there"
+    );
+}
+
+#[test]
+fn reap_refuses_to_signal_a_pid_belonging_to_another_project() {
+    // After a kill -9 and a reboot, a stale file can name a pid that now
+    // belongs to something else entirely.
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = victim.id();
+
+    let mut ep = Endpoint::new(&project, pid, 1, "deadbeef".into());
+    ep.project_hash = "0123456789ab".into(); // a different project
+    ep.write(&project).unwrap();
+
+    rote::daemon::reap(&project, Some(rote::session::Terminal::Done));
+
+    assert!(
+        rote::paths::pid_is_live(pid),
+        "rote must not kill a process it cannot prove is its own"
+    );
+    let _ = victim.kill();
+    let _ = victim.wait();
 }
 
 #[test]

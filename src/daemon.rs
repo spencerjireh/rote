@@ -148,6 +148,187 @@ fn read_exact(path: &Path, buf: &mut [u8]) -> std::io::Result<()> {
     std::fs::File::open(path)?.read_exact(buf)
 }
 
+// ------------------------------------------------- finding, starting, ending
+
+/// How long to wait for a freshly spawned daemon to answer.
+pub const SPAWN_WAIT: Duration = Duration::from_secs(3);
+
+/// Poll interval while waiting for one. House style: `review::wait_with_timeout`.
+const SPAWN_POLL: Duration = Duration::from_millis(25);
+
+/// How long a reaped daemon gets to exit on its own before it is signalled.
+pub const REAP_WAIT: Duration = Duration::from_secs(3);
+
+/// A short ceiling for probes: a daemon that cannot answer promptly is one a
+/// caller should stop waiting on.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Find a live daemon for this project, if there is one.
+///
+/// Both halves matter. The endpoint file can outlive its author — a `kill -9`
+/// leaves it behind — so it is believed only after something answers on the
+/// port and says it serves this project. A pid check alone would not do either:
+/// pids are recycled.
+pub fn discover(project: &ProjectPaths) -> Option<Endpoint> {
+    let ep = Endpoint::read(project)?;
+    if !ep.matches(project) {
+        return None;
+    }
+    let health: state::Health =
+        http::send(ep.port, &ep.token, "GET", "/health", None, PROBE_TIMEOUT)
+            .ok()
+            .filter(|r| r.is_ok())?
+            .json()
+            .ok()?;
+    if health.project_hash != project.hash {
+        // Something else is listening on a port we remembered.
+        return None;
+    }
+    Some(ep)
+}
+
+/// Start a daemon in the background and wait until it answers.
+///
+/// Detached with `setsid` so it outlives the terminal that started it. Without
+/// that it shares claude's session, and the SIGHUP when that pty closes takes
+/// the daemon with it — which is precisely when the user is most likely to
+/// still be typing.
+pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
+    use std::os::unix::process::CommandExt as _;
+
+    project.ensure_state_dir()?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(project.daemon_log())
+        .with_context(|| format!("cannot open {}", project.daemon_log().display()))?;
+    let log_err = log.try_clone()?;
+
+    let exe = std::env::current_exe().context("cannot find the rote binary")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--project")
+        .arg(&project.repo_root)
+        .arg("daemon")
+        .arg("--foreground")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+
+    // Safety: `setsid` is async-signal-safe and is on the POSIX list of calls
+    // permitted between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().context("cannot start the rote daemon")?;
+    let pid = child.id();
+
+    // Wait for *this child's* endpoint. A file left by a previous run would
+    // otherwise look exactly like success.
+    let start = Instant::now();
+    loop {
+        if let Some(ep) = Endpoint::read(project).filter(|e| e.pid == pid && e.matches(project)) {
+            if http::send(ep.port, &ep.token, "GET", "/health", None, PROBE_TIMEOUT)
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+            {
+                return Ok(ep);
+            }
+        }
+        if start.elapsed() >= SPAWN_WAIT {
+            anyhow::bail!(
+                "the rote daemon did not start within {}s.\nIts output is in {}.",
+                SPAWN_WAIT.as_secs(),
+                project.daemon_log().display()
+            );
+        }
+        std::thread::sleep(SPAWN_POLL);
+    }
+}
+
+/// A daemon for this project, starting one if necessary.
+pub fn ensure_running(project: &ProjectPaths) -> Result<Endpoint> {
+    match discover(project) {
+        Some(ep) => Ok(ep),
+        None => spawn_detached(project),
+    }
+}
+
+/// Stop the daemon, if there is one, before the caller tears the session down.
+///
+/// Must happen **before** `shadow::sync` resets the shadow: that runs
+/// `git reset --hard` and `git clean -fdx`, which the daemon's watcher is
+/// watching recursively, and it would be classifying against a session that no
+/// longer exists. Before the manifest lock is taken, too — the daemon may be
+/// mid-write, and waiting five seconds behind a process we are about to stop is
+/// five seconds of nothing.
+pub fn reap(project: &ProjectPaths, terminal: Option<Terminal>) {
+    let Some(ep) = Endpoint::read(project) else {
+        return;
+    };
+    // Never signal a pid we cannot prove is ours. After a `kill -9` and a
+    // reboot a stale file can name a pid that now belongs to something else
+    // entirely, and a tool that kills strangers is a tool nobody trusts.
+    if !ep.matches(project) {
+        Endpoint::remove(project);
+        return;
+    }
+
+    let reason = match terminal {
+        Some(Terminal::Done) => "done",
+        Some(Terminal::Aborted) => "aborted",
+        None => "idle",
+    };
+    let body = serde_json::json!({ "reason": reason });
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    // Asking is what lets it tell every attached pane *how* the session ended
+    // before it goes; after `archive_and_clear` the live manifest is gone and
+    // the daemon would have nothing left to read.
+    let _ = http::send(
+        ep.port,
+        &ep.token,
+        "POST",
+        "/shutdown",
+        Some(&bytes),
+        PROBE_TIMEOUT,
+    );
+
+    if !wait_for_exit(ep.pid, REAP_WAIT) {
+        signal(ep.pid, libc::SIGTERM);
+        if !wait_for_exit(ep.pid, REAP_WAIT) {
+            signal(ep.pid, libc::SIGKILL);
+            let _ = wait_for_exit(ep.pid, REAP_WAIT);
+        }
+    }
+    Endpoint::remove(project);
+    // `watch.lock` is deliberately never unlinked, per the doctrine in paths.rs:
+    // removing a lock file another process may hold open is the classic race.
+}
+
+fn wait_for_exit(pid: u32, ceiling: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if !crate::paths::pid_is_live(pid) {
+            return true;
+        }
+        if start.elapsed() >= ceiling {
+            return false;
+        }
+        std::thread::sleep(SPAWN_POLL);
+    }
+}
+
+fn signal(pid: u32, sig: libc::c_int) {
+    // Safety: a plain kill(2) on a pid we have just proved belongs to this
+    // project's daemon.
+    unsafe {
+        libc::kill(pid as libc::pid_t, sig);
+    }
+}
+
 // ---------------------------------------------------------------- the hub
 
 /// What the hub can be asked to do.
@@ -447,6 +628,7 @@ fn handle(ctx: &Ctx, request: Request) {
         ("GET", "/state") => snapshot(ctx),
         ("GET", p) if p.starts_with("/hunk/") => hunk_detail(ctx, &p["/hunk/".len()..]),
         ("POST", "/command") => command(ctx, &mut request),
+        ("POST", "/shutdown") => shutdown(ctx, &mut request),
         ("GET", _) | ("POST", _) => error(404, "not_found"),
         _ => Response::from_data(Vec::new())
             .with_status_code(405)
@@ -562,6 +744,29 @@ fn event_name(ev: &state::Event) -> &'static str {
         state::Event::Heartbeat { .. } => "heartbeat",
         state::Event::Closed { .. } => "closed",
     }
+}
+
+/// Stop, telling every attached client how the session ended.
+///
+/// The reaper is the only thing that knows the reason, and it knows it before
+/// the archive exists — so it says so rather than leaving the daemon to guess
+/// from a directory listing after the fact.
+fn shutdown(ctx: &Ctx, request: &mut Request) -> ResponseBox {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        reason: String,
+    }
+    let body: Body = match read_json_body(request) {
+        Ok(v) => v,
+        Err(rejection) => return rejection,
+    };
+    let terminal = match body.reason.as_str() {
+        "done" => Some(Terminal::Done),
+        "aborted" => Some(Terminal::Aborted),
+        _ => None,
+    };
+    let _ = ctx.hub.send(HubMsg::Close(terminal));
+    json(202, &serde_json::json!({ "ok": true }))
 }
 
 /// A verb. The engine answers; this thread only carries the reply back.

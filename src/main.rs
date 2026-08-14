@@ -672,6 +672,13 @@ fn cmd_talk(project: &ProjectPaths, cfg: &Config, attach: bool) -> Result<()> {
     if !attach {
         return Ok(());
     }
+    // Coming back to a session in a new pane. Same window as `start`: this
+    // execs, so anything worth reporting has to be reported first.
+    if cfg.daemon_autostart && Manifest::load(project)?.is_some() {
+        if let Err(e) = daemon::ensure_running(project) {
+            eprintln!("warning: could not start the rote daemon ({e:#}).");
+        }
+    }
     use std::os::unix::process::CommandExt;
     let (program, args) = cfg
         .claude_continue_cmd
@@ -771,8 +778,15 @@ fn cmd_done(
         }
     }
 
-    // 6. Residue first, then archive, then the sync that destroys the shadow's copy.
-    //    Reloaded under the lock: the copy above predates the prompts, and
+    // 6. Stop the daemon first. Before the lock rather than merely before the
+    //    sync: it may be mid-write, and waiting five seconds behind a process we
+    //    are about to stop is five seconds of nothing. Telling it the reason is
+    //    what lets it say "session closed" to every attached pane — after the
+    //    archive there is no live manifest left for it to read.
+    daemon::reap(project, Some(Terminal::Done));
+
+    //    Residue first, then archive, then the sync that destroys the shadow's
+    //    copy. Reloaded under the lock: the copy above predates the prompts, and
     //    archiving a stale manifest would file the wrong record.
     let _lock = Lock::acquire(&project.lock_path())?;
     let mut manifest = Manifest::require(project)?;
@@ -1031,7 +1045,30 @@ fn cmd_start(
             println!("session open (not launching claude).");
             println!("shadow: {}", project.shadow_dir.display());
         }
+        // Deliberately no daemon here. This is the "prepare a session with no
+        // agent" path that every test uses, and leaking a background process
+        // into a whole suite is how a suite becomes unreliable.
         return Ok(());
+    }
+
+    // The only window: after the manifest is written and the lock released,
+    // before `exec` replaces this process. Nothing after `launch_claude` runs,
+    // so a failure has to be reportable here or not at all.
+    if cfg.daemon_autostart {
+        match daemon::ensure_running(project) {
+            Ok(ep) => {
+                if !quiet {
+                    println!("watching in the background (port {}).", ep.port);
+                }
+            }
+            // Warn and carry on. A session without a daemon is still a session,
+            // and refusing to launch the agent over a background process is the
+            // wrong trade.
+            Err(e) => eprintln!(
+                "warning: could not start the rote daemon ({e:#}).
+                 `rote watch` will start one when you need it."
+            ),
+        }
     }
 
     launch_claude(project, cfg)
@@ -1142,6 +1179,8 @@ fn cmd_abort(project: &ProjectPaths, cfg: &Config, yes: bool, quiet: bool) -> Re
             return Ok(());
         }
     }
+
+    daemon::reap(project, Some(Terminal::Aborted));
 
     // Reloaded under the lock — the copy read before the prompt may be stale.
     let _lock = Lock::acquire(&project.lock_path())?;
