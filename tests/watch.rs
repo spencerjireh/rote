@@ -81,20 +81,45 @@ fn the_pane_draws_a_jump_target_for_the_active_hunk() {
 }
 
 #[test]
-fn a_second_pane_is_refused() {
-    // Two panes would fight over one queue, and each would see the other's
-    // writes as the world moving underneath it.
+fn two_panes_over_one_daemon_both_see_the_same_hunk() {
+    // The inversion this stage is for. Two panes used to be refused, because
+    // each would have run its own engine and they would have corrupted each
+    // other. Now neither runs one: they are both clients of the daemon that
+    // does, so a second pane is ordinary rather than dangerous.
     let cli = session("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
-    let mut first = cli.spawn(&["watch", "--headless", "--timeout", "4000"]);
+
+    let first = cli.spawn(&["watch", "--headless", "--timeout", "6000"]);
+    let second = cli.spawn(&["watch", "--headless", "--timeout", "6000"]);
+
+    let a = first.wait_with_output().unwrap();
+    let b = second.wait_with_output().unwrap();
+    let (ta, tb) = (
+        String::from_utf8_lossy(&a.stdout).into_owned(),
+        String::from_utf8_lossy(&b.stdout).into_owned(),
+    );
+
+    for (name, text) in [("first", &ta), ("second", &tb)] {
+        assert!(
+            text.contains("+     work();"),
+            "the {name} pane drew the hunk: {text}"
+        );
+        assert!(text.contains("a.rs:2"), "the {name} pane: {text}");
+    }
+}
+
+#[test]
+fn a_second_local_pane_is_refused() {
+    // `--local` runs an engine in this process, so it still needs the token —
+    // and saying so names the thing to run instead.
+    let cli = session("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let mut first = cli.spawn(&["watch", "--local", "--headless", "--timeout", "4000"]);
     std::thread::sleep(Duration::from_millis(600));
 
-    let second = cli.run(&["watch", "--headless", "--timeout", "1000"]);
+    let second = cli.run(&["watch", "--local", "--headless", "--timeout", "1000"]);
     assert!(!second.status.success());
-    assert!(
-        stderr(&second).contains("already running"),
-        "{}",
-        stderr(&second)
-    );
+    let err = stderr(&second);
+    assert!(err.contains("owns this project's queue"), "{err}");
+    assert!(err.contains("rote watch"), "and names the fix: {err}");
 
     let _ = first.wait();
 }

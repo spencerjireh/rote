@@ -93,6 +93,10 @@ enum Command {
 
     /// Watch your tree and classify as you type. The transcription loop.
     Watch {
+        /// Run the engine in this process instead of attaching to a daemon.
+        /// For debugging, and for a machine where a daemon cannot start.
+        #[arg(long)]
+        local: bool,
         /// Print frames instead of taking the terminal. Inferred off a pipe.
         #[arg(long)]
         headless: bool,
@@ -258,6 +262,7 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Watch {
+            local,
             headless,
             exit_when_empty,
             timeout,
@@ -265,6 +270,7 @@ fn run() -> Result<ExitCode> {
             cmd_watch(
                 &project,
                 &cfg,
+                local,
                 pane::Options {
                     headless,
                     exit_when_empty,
@@ -803,12 +809,27 @@ fn cmd_done(
 }
 
 /// The transcription loop: watch, classify, advance.
-fn cmd_watch(project: &ProjectPaths, cfg: &Config, opts: pane::Options) -> Result<()> {
+fn cmd_watch(project: &ProjectPaths, cfg: &Config, local: bool, opts: pane::Options) -> Result<()> {
     // A rebase or merge in flight makes every classification nonsense, and the
     // pane would report it confidently. Refuse before taking the terminal.
     shadow::ensure_no_operation_in_progress(project)?;
     Manifest::require(project)?;
-    pane::run(project, cfg, opts)
+
+    if local {
+        return pane::run_local(project, cfg, opts);
+    }
+
+    // Attach to whoever owns the queue, starting one if nobody does. Falling
+    // back to a local engine on failure keeps the tool usable on a machine
+    // where the daemon cannot start — and it is not a second engine, because
+    // it takes the same token the daemon would have held.
+    match daemon::ensure_running(project) {
+        Ok(endpoint) => pane::run_client(project, cfg, endpoint, opts),
+        Err(e) => {
+            eprintln!("warning: no rote daemon ({e:#}).\nWatching in this process instead.");
+            pane::run_local(project, cfg, opts)
+        }
+    }
 }
 
 /// Recompute, then print the hunk at the head of the queue.
@@ -1013,10 +1034,22 @@ fn cmd_skip(project: &ProjectPaths, cfg: &Config, hunk_id: Option<&str>) -> Resu
         // manifest, which is how a hunk nobody touched ends up being asked
         // about.
         daemon::Owner::Daemon(ep) => {
-            let id = match hunk_id {
-                Some(id) => id.to_string(),
-                None => match daemon::fetch_state(&ep)?.queue.first() {
-                    Some(q) => q.id.clone(),
+            // One read, for two reasons: to resolve "the active hunk" into an
+            // id, and to have a file name to print. The daemon's reply is an
+            // outcome, not a description of what it acted on.
+            let snapshot = daemon::fetch_state(&ep)?;
+            let (id, file) = match hunk_id {
+                Some(id) => {
+                    let file = snapshot
+                        .queue
+                        .iter()
+                        .find(|q| q.id == id)
+                        .map(|q| q.file.clone())
+                        .unwrap_or_else(|| id.to_string());
+                    (id.to_string(), file)
+                }
+                None => match snapshot.queue.first() {
+                    Some(q) => (q.id.clone(), q.file.clone()),
                     None => {
                         println!("nothing to skip — the queue is empty.");
                         return Ok(());
@@ -1040,7 +1073,7 @@ fn cmd_skip(project: &ProjectPaths, cfg: &Config, hunk_id: Option<&str>) -> Resu
                     bail!("the queue moved underneath that (now at generation {current})")
                 }
             }
-            id
+            file
         }
         // No engine exists, so a direct mutation is safe — for exactly as long
         // as the guard is held, which is why it lives across the whole cycle.

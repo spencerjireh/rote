@@ -226,8 +226,13 @@ pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
     let child = cmd.spawn().context("cannot start the rote daemon")?;
     let pid = child.id();
 
-    // Wait for *this child's* endpoint. A file left by a previous run would
-    // otherwise look exactly like success.
+    // Wait for this child's endpoint — but settle for anyone's.
+    //
+    // Preferring our own pid is what stops a file left by a previous run from
+    // looking like success. Accepting someone else's is what makes two front
+    // ends starting at the same moment work: both find nothing, both spawn, one
+    // wins the engine token and the other exits. The loser's parent has still
+    // got what it asked for, which is a daemon — not necessarily *its* daemon.
     let start = Instant::now();
     loop {
         if let Some(ep) = Endpoint::read(project).filter(|e| e.pid == pid && e.matches(project)) {
@@ -237,6 +242,9 @@ pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
             {
                 return Ok(ep);
             }
+        }
+        if let Some(ep) = discover(project) {
+            return Ok(ep);
         }
         if start.elapsed() >= SPAWN_WAIT {
             anyhow::bail!(

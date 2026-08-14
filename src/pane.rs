@@ -15,7 +15,9 @@
 //! width, so a resize costs nothing to ignore.
 
 use crate::config::Config;
-use crate::engine::{Engine, EngineEvent, RealClock};
+use crate::daemon;
+use crate::engine::{Engine, EngineEvent, RealClock, TICK};
+use crate::http;
 use crate::paths::{Lock, ProjectPaths};
 use crate::present::{self, Anchor};
 use crate::state::{self, Snapshot};
@@ -260,15 +262,15 @@ pub struct Options {
 }
 
 /// Run the pane until the session closes, the user quits, or a limit is hit.
-pub fn run(project: &ProjectPaths, cfg: &Config, opts: Options) -> Result<()> {
-    // One pane per project. Two would fight over the same queue and each would
-    // see the other's writes as the world moving underneath it.
+pub fn run_local(project: &ProjectPaths, cfg: &Config, opts: Options) -> Result<()> {
+    // The engine token. Holding it is what makes running an engine here safe:
+    // two of them do not duplicate work, they corrupt each other.
     let watch_lock = Lock::try_acquire(&project.watch_lock_path())?;
     if watch_lock.is_none() {
         anyhow::bail!(
-            "another `rote watch` is already running on this project.\n\
-             Close it, or if it has crashed, remove {}.",
-            project.watch_lock_path().display()
+            "something already owns this project's queue — a daemon, or another \
+             `rote watch --local`.\n\
+             Run `rote watch` to attach to it instead."
         );
     }
 
@@ -551,4 +553,194 @@ mod tests {
         let empty = snap(None);
         assert_eq!(command_for(Key::Skip, Some(&empty)), None);
     }
+}
+
+/// How long to wait before retrying a lost daemon, and the ceiling on backoff.
+const RECONNECT_MIN: Duration = Duration::from_millis(250);
+const RECONNECT_MAX: Duration = Duration::from_secs(2);
+
+/// How long to keep trying before giving up and saying where to look.
+const RECONNECT_CEILING: Duration = Duration::from_secs(30);
+
+/// What the pane's loop is reacting to.
+enum ClientEvent {
+    Frame(state::Event),
+    /// The stream ended. Not fatal: the daemon may be restarting.
+    Disconnected,
+}
+
+/// Render a daemon's event stream, and send it verbs.
+///
+/// Shares `RawMode`, `Screen`, `render_frame`, `decode` and `command_for` with
+/// the local pane, unchanged. That sharing is the point: the two differ only in
+/// where a `Snapshot` comes from, which is what made putting a socket in the
+/// middle a transport change rather than a rewrite.
+pub fn run_client(
+    project: &ProjectPaths,
+    cfg: &Config,
+    mut endpoint: daemon::Endpoint,
+    opts: Options,
+) -> Result<()> {
+    let raw = if opts.headless {
+        None
+    } else {
+        RawMode::enable()?
+    };
+    let interactive = raw.is_some();
+    let screen = Screen::enter(interactive);
+
+    let deadline = opts
+        .timeout_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+
+    let mut snapshot: Option<Snapshot> = None;
+    let mut last_frame = String::new();
+    let mut rx = subscribe(&endpoint);
+    let mut lost_since: Option<Instant> = None;
+    let mut backoff = RECONNECT_MIN;
+
+    loop {
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                anyhow::bail!(
+                    "`rote watch` timed out after {}ms",
+                    opts.timeout_ms.unwrap()
+                );
+            }
+        }
+
+        match rx.as_ref().map(|rx| rx.recv_timeout(TICK)) {
+            Some(Ok(ClientEvent::Frame(ev))) => {
+                lost_since = None;
+                backoff = RECONNECT_MIN;
+                match ev {
+                    state::Event::Snapshot(s) => snapshot = Some(*s),
+                    state::Event::Closed { terminal } => {
+                        screen.draw(match terminal {
+                            Some(crate::session::Terminal::Done) => "session closed.\n",
+                            Some(crate::session::Terminal::Aborted) => "session aborted.\n",
+                            None => "the session ended.\n",
+                        });
+                        return Ok(());
+                    }
+                    state::Event::Notice(_) | state::Event::Heartbeat { .. } => {}
+                }
+            }
+            Some(Ok(ClientEvent::Disconnected)) | None => {
+                // Losing the daemon is not the end of the pane. It may be
+                // restarting, and the user is probably mid-hunk.
+                let since = *lost_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= RECONNECT_CEILING {
+                    anyhow::bail!(
+                        "lost the rote daemon and could not get it back.\nIts output is in {}.",
+                        project.daemon_log().display()
+                    );
+                }
+                if let Some(s) = &mut snapshot {
+                    s.notices = vec![state::Notice::warn("lost the rote daemon — reconnecting…")];
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+                // Re-read the address book every time: a restarted daemon has a
+                // different port.
+                if let Ok(ep) = daemon::ensure_running(project) {
+                    endpoint = ep;
+                    rx = subscribe(&endpoint);
+                } else {
+                    rx = None;
+                }
+            }
+            Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {}
+            Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => rx = None,
+        }
+
+        if let Some(snap) = &snapshot {
+            let frame = render_frame(snap, cfg.color && interactive);
+            if frame != last_frame {
+                screen.draw(&frame);
+                last_frame = frame;
+            }
+            if opts.exit_when_empty && snap.counts.pending == 0 && snap.counts.total > 0 {
+                return Ok(());
+            }
+        }
+
+        if let Some(raw) = &raw {
+            if let Some(key) = read_key()? {
+                match key {
+                    Key::Quit => return Ok(()),
+                    Key::Open => {
+                        if let Some(p) = snapshot.as_ref().and_then(|s| s.active.as_ref()) {
+                            let editor = present::editor_command(&cfg.editor);
+                            let path = std::path::PathBuf::from(&p.real_path);
+                            let line = p.anchor_line;
+                            let is_new = p.hunk.op == crate::hunks::Op::CreateFile;
+                            let r = screen.suspended(|| {
+                                raw.suspended(|| {
+                                    present::launch_editor(&editor, &path, line, is_new)
+                                })
+                            });
+                            r?;
+                            last_frame.clear();
+                        }
+                    }
+                    other => {
+                        if let Some(cmd) = command_for(other, snapshot.as_ref()) {
+                            let generation = snapshot.as_ref().map(|s| s.generation);
+                            let request = state::Request {
+                                wire_version: state::WIRE_VERSION,
+                                generation,
+                                command: cmd,
+                            };
+                            // A rejection here is the daemon's business, not the
+                            // user's: the next snapshot says what actually
+                            // happened either way.
+                            let _ = daemon::send_command(&endpoint, &request);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Open an event stream and pump it into a channel.
+///
+/// A thread rather than a poll because the read blocks, and the pane's own loop
+/// must stay responsive to keystrokes.
+fn subscribe(endpoint: &daemon::Endpoint) -> Option<std::sync::mpsc::Receiver<ClientEvent>> {
+    use std::io::Write as _;
+
+    let mut stream = http::connect(endpoint.port, http::CLIENT_TIMEOUT).ok()?;
+    // The query token, because `EventSource` cannot set headers and this uses
+    // the same path a browser front end will.
+    let req = format!(
+        "GET /events?token={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        endpoint.token, endpoint.port
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    // No read timeout: an idle stream is normal, and the daemon's keepalive is
+    // what proves it is still there.
+    stream.set_read_timeout(None).ok()?;
+
+    let mut reader = std::io::BufReader::new(stream);
+    let (status, _) = http::read_head(&mut reader).ok()?;
+    if status != 200 {
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for frame in http::Frames::new(reader) {
+            let Ok(frame) = frame else { break };
+            let Ok(ev) = serde_json::from_str::<state::Event>(&frame.data) else {
+                continue;
+            };
+            if tx.send(ClientEvent::Frame(ev)).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(ClientEvent::Disconnected);
+    });
+    Some(rx)
 }
