@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rote::config::{self, Config};
+use rote::daemon;
 use rote::detect;
 use rote::git;
 use rote::hunks::Status;
@@ -100,6 +101,17 @@ enum Command {
         exit_when_empty: bool,
         /// Give up after this many milliseconds. A wedged watcher should fail
         /// a test rather than hang the machine running it.
+        #[arg(long, hide = true)]
+        timeout: Option<u64>,
+    },
+
+    /// Own the queue and serve it. Started for you by `rote start`.
+    #[command(hide = true)]
+    Daemon {
+        /// Stay in the foreground. What tests and debugging use.
+        #[arg(long)]
+        foreground: bool,
+        /// Exit after this many milliseconds no matter what.
         #[arg(long, hide = true)]
         timeout: Option<u64>,
     },
@@ -256,6 +268,19 @@ fn run() -> Result<ExitCode> {
                 pane::Options {
                     headless,
                     exit_when_empty,
+                    timeout_ms: timeout,
+                },
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Daemon {
+            foreground: _,
+            timeout,
+        } => {
+            daemon::serve(
+                &project,
+                &cfg,
+                daemon::ServeOptions {
                     timeout_ms: timeout,
                 },
             )?;

@@ -11,13 +11,39 @@
 //! owns the engine without writing one at all. The flock is the authority,
 //! because the kernel maintains it and a file cannot.
 
-use crate::paths::{write_atomic_mode, ProjectPaths};
+use crate::config::Config;
+use crate::engine::{Engine, EngineEvent, RealClock};
+use crate::http;
+use crate::paths::{write_atomic_mode, Lock, ProjectPaths};
+use crate::session::{Manifest, Terminal};
+use crate::state;
+use crate::watcher;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::{Duration, Instant};
+use tiny_http::{Header, Request, Response, ResponseBox, Server};
 
 /// Bytes of entropy in a session token, before hex encoding.
 const TOKEN_BYTES: usize = 32;
+
+/// How long the accept loop blocks before looking at its own timers.
+pub const ACCEPT_TICK: Duration = Duration::from_millis(100);
+
+/// How long the daemon waits for the engine token before giving up.
+///
+/// Shorter than `Lock::acquire`'s five seconds: a CLI verb holding the token
+/// for the three milliseconds of a direct mutation must not fail a daemon
+/// start, and a daemon blocking five seconds behind a `--local` pane's
+/// lifetime lock is five seconds of `rote start` waiting on nothing.
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// A read handler waits this long on the hub before giving up with a 503.
+pub const HUB_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long to wait for the engine thread to finish after the loop ends.
+pub const JOIN_CEILING: Duration = Duration::from_secs(2);
 
 /// Where a daemon is listening, and how to prove you may talk to it.
 ///
@@ -102,6 +128,376 @@ pub fn mint_token() -> Result<String> {
 fn read_exact(path: &Path, buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read as _;
     std::fs::File::open(path)?.read_exact(buf)
+}
+
+// ---------------------------------------------------------------- the hub
+
+/// What the hub can be asked to do.
+///
+/// A single-consumer actor rather than shared state behind a lock. The
+/// codebase has no `Arc`, no `Mutex` and no atomics, and this does not need
+/// to be the exception: every piece of state has one owning thread and every
+/// interaction is a message.
+enum HubMsg {
+    /// Something the engine published.
+    Publish(state::Event),
+    /// A read handler asking what the world looks like.
+    Peek(Sender<HubView>),
+    /// The session is over. Ends the hub loop, which is the shutdown trigger.
+    Close(Option<Terminal>),
+}
+
+/// The hub's answer to a read.
+#[derive(Debug, Clone, Default)]
+struct HubView {
+    snapshot: Option<state::Snapshot>,
+    subscribers: usize,
+}
+
+/// The hub thread: cache the last snapshot, answer reads, notice the end.
+///
+/// Separate from the engine's sink closure because `GET /state` and
+/// `GET /health` must be answerable **without touching the engine** — `drift`
+/// lives nowhere else, and an HTTP request must never be able to block the
+/// thread that is classifying the user's keystrokes.
+fn run_hub(rx: Receiver<HubMsg>, done: Sender<Option<Terminal>>) {
+    let mut view = HubView::default();
+    for msg in rx {
+        match msg {
+            HubMsg::Publish(state::Event::Snapshot(s)) => view.snapshot = Some(*s),
+            HubMsg::Publish(state::Event::Closed { terminal }) => {
+                let _ = done.send(terminal);
+                return;
+            }
+            HubMsg::Publish(_) => {}
+            HubMsg::Peek(reply) => {
+                // A caller that has given up is not an error.
+                let _ = reply.send(view.clone());
+            }
+            HubMsg::Close(terminal) => {
+                let _ = done.send(terminal);
+                return;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- serving
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServeOptions {
+    /// Exit after this long no matter what. For tests: a wedged daemon should
+    /// fail a suite rather than outlive the machine running it.
+    pub timeout_ms: Option<u64>,
+}
+
+/// Be the daemon.
+///
+/// Takes the engine token first and holds it for the whole run, so the
+/// single-engine invariant is established before anything else happens — there
+/// is no window in which a second engine could be constructed.
+pub fn serve(project: &ProjectPaths, cfg: &Config, opts: ServeOptions) -> Result<()> {
+    let started = Instant::now();
+
+    let lock = Lock::acquire_within(&project.watch_lock_path(), LOCK_WAIT).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}\nSomething already owns this project's queue — another daemon, \
+             or a `rote watch --local` pane."
+        )
+    })?;
+    let _lock = lock;
+
+    Manifest::require(project)?;
+    crate::shadow::ensure_no_operation_in_progress(project)?;
+
+    // Port 0: the kernel picks. A fixed port is a collision waiting to happen
+    // the first time two projects are open at once.
+    let server = Server::http("127.0.0.1:0")
+        .map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1: {e}"))?;
+    let port = server
+        .server_addr()
+        .to_ip()
+        .context("the listener is not an IP socket")?
+        .port();
+    let token = mint_token()?;
+
+    let (engine_tx, engine_rx) = channel::<EngineEvent>();
+    let (hub_tx, hub_rx) = channel::<HubMsg>();
+    let (done_tx, done_rx) = channel::<Option<Terminal>>();
+
+    let watch_tx = engine_tx.clone();
+    let _watch = watcher::spawn(project, cfg, move |ev| watch_tx.send(ev).is_ok())?;
+
+    let hub_thread = std::thread::spawn(move || run_hub(hub_rx, done_tx));
+
+    let engine_hub = hub_tx.clone();
+    let engine_project = project.clone();
+    let engine_cfg = cfg.clone();
+    let engine_thread = std::thread::spawn(move || {
+        let mut engine = Engine::new(engine_project, engine_cfg, Box::new(RealClock::default()));
+        // `Engine::run`'s first caller. It was written for this and has been
+        // waiting since the engine landed.
+        let out = engine.run(&engine_rx, |ev| {
+            Ok(engine_hub.send(HubMsg::Publish(ev)).is_ok())
+        });
+        if let Err(e) = out {
+            eprintln!("rote daemon: the engine stopped: {e:#}");
+        }
+        // However the engine ended, the daemon is finished.
+        let _ = engine_hub.send(HubMsg::Close(None));
+    });
+
+    Endpoint::new(project, std::process::id(), port, token.clone()).write(project)?;
+    println!(
+        "rote daemon listening on 127.0.0.1:{port} (pid {})",
+        std::process::id()
+    );
+
+    let deadline = opts
+        .timeout_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    let ctx = Ctx {
+        project: project.clone(),
+        token,
+        port,
+        started,
+        hub: hub_tx.clone(),
+    };
+
+    let mut terminal = None;
+    let mut timed_out = false;
+    loop {
+        match done_rx.try_recv() {
+            Ok(t) => {
+                terminal = t;
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                timed_out = true;
+                break;
+            }
+        }
+        match server.recv_timeout(ACCEPT_TICK) {
+            Ok(Some(request)) => handle(&ctx, request),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("rote daemon: cannot accept: {e}");
+                break;
+            }
+        }
+    }
+
+    // Order matters: stop feeding the engine before waiting on it, or `run`
+    // never sees `Disconnected` and the join hangs.
+    drop(_watch);
+    drop(engine_tx);
+    let _ = hub_tx.send(HubMsg::Close(terminal));
+    join_within(engine_thread, JOIN_CEILING);
+    join_within(hub_thread, JOIN_CEILING);
+
+    Endpoint::remove(project);
+    drop(server);
+
+    if timed_out {
+        anyhow::bail!(
+            "the rote daemon timed out after {}ms",
+            opts.timeout_ms.unwrap()
+        );
+    }
+    Ok(())
+}
+
+/// Join, but never forever. A thread wedged on a lock must not stop the daemon
+/// from releasing the engine token.
+fn join_within<T>(handle: std::thread::JoinHandle<T>, ceiling: Duration) {
+    let start = Instant::now();
+    loop {
+        if handle.is_finished() {
+            let _ = handle.join();
+            return;
+        }
+        if start.elapsed() >= ceiling {
+            return; // detached; the process is about to exit anyway
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Everything a request handler needs, and nothing it could mutate.
+struct Ctx {
+    project: ProjectPaths,
+    token: String,
+    port: u16,
+    started: Instant,
+    hub: Sender<HubMsg>,
+}
+
+impl Ctx {
+    fn peek(&self) -> Option<HubView> {
+        let (tx, rx) = channel();
+        self.hub.send(HubMsg::Peek(tx)).ok()?;
+        rx.recv_timeout(HUB_TIMEOUT).ok()
+    }
+}
+
+fn json(status: u16, value: &impl Serialize) -> ResponseBox {
+    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    Response::from_data(body)
+        .with_status_code(status)
+        .with_header(header("Content-Type", "application/json"))
+        .boxed()
+}
+
+fn error(status: u16, code: &str) -> ResponseBox {
+    json(status, &serde_json::json!({ "error": code }))
+}
+
+fn header(name: &str, value: &str) -> Header {
+    Header::from_bytes(name.as_bytes(), value.as_bytes())
+        .expect("a header rote wrote itself is well-formed")
+}
+
+/// Authorize, then route. Every rejection is a JSON body with a stable code.
+fn handle(ctx: &Ctx, request: Request) {
+    let url = request.url().to_string();
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (url, String::new()),
+    };
+    let method = request.method().as_str().to_string();
+
+    if let Some(rejection) = reject(ctx, &request, &path, &query) {
+        let _ = request.respond(rejection);
+        return;
+    }
+
+    let response = match (method.as_str(), path.as_str()) {
+        ("GET", "/health") => health(ctx),
+        ("GET", "/state") => snapshot(ctx),
+        ("GET", p) if p.starts_with("/hunk/") => hunk_detail(ctx, &p["/hunk/".len()..]),
+        ("GET", _) | ("POST", _) => error(404, "not_found"),
+        _ => Response::from_data(Vec::new())
+            .with_status_code(405)
+            .with_header(header("Allow", "GET, POST"))
+            .boxed(),
+    };
+    let _ = request.respond(response);
+}
+
+/// The checks every request passes before anything looks at the path.
+fn reject(ctx: &Ctx, request: &Request, path: &str, query: &str) -> Option<ResponseBox> {
+    let headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .map(|h| {
+            (
+                h.field.as_str().as_str().to_string(),
+                h.value.as_str().to_string(),
+            )
+        })
+        .collect();
+    let find = |name: &str| http::header_of(&headers, name).map(|v| v.to_string());
+
+    // A hostile page can point its own name at 127.0.0.1; it cannot forge these.
+    if let Some(origin) = find("Origin") {
+        if !http::is_loopback_origin(&origin, ctx.port) {
+            return Some(error(403, "forbidden_origin"));
+        }
+    }
+    if let Some(host) = find("Host") {
+        if !http::is_loopback_host(&host) {
+            return Some(error(403, "forbidden_host"));
+        }
+    }
+
+    // `EventSource` cannot set headers, so the stream accepts a query token.
+    let presented = find("Authorization")
+        .and_then(|v| v.strip_prefix("Bearer ").map(|t| t.to_string()))
+        .or_else(|| {
+            if path == "/events" {
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("token=").map(|t| t.to_string()))
+            } else {
+                None
+            }
+        });
+    match presented {
+        Some(t) if http::constant_time_eq(t.as_bytes(), ctx.token.as_bytes()) => None,
+        _ => Some(error(401, "unauthorized")),
+    }
+}
+
+fn health(ctx: &Ctx) -> ResponseBox {
+    let view = ctx.peek().unwrap_or_default();
+    let manifest = Manifest::load(&ctx.project).ok().flatten();
+    let body = state::Health {
+        ok: true,
+        wire_version: state::WIRE_VERSION,
+        manifest_version: crate::session::MANIFEST_VERSION,
+        rote_version: env!("CARGO_PKG_VERSION").to_string(),
+        pid: std::process::id(),
+        port: ctx.port,
+        project_hash: ctx.project.hash.clone(),
+        repo_root: ctx.project.repo_root.to_string_lossy().into_owned(),
+        shadow_dir: ctx.project.shadow_dir.to_string_lossy().into_owned(),
+        session_state: manifest.as_ref().map(|m| m.state),
+        task: manifest.map(|m| m.task).unwrap_or_default(),
+        generation: view.snapshot.as_ref().map(|s| s.generation),
+        subscribers: view.subscribers,
+        uptime_ms: ctx.started.elapsed().as_millis() as u64,
+    };
+    json(200, &body)
+}
+
+/// The engine's last published view, not a fresh read.
+///
+/// `drift` is engine-only state, so a handler that re-derived a snapshot here
+/// would either omit it or shell out to git per request — and could disagree
+/// with what every SSE subscriber was just told. `generation` is how a client
+/// knows how fresh this is.
+fn snapshot(ctx: &Ctx) -> ResponseBox {
+    match ctx.peek() {
+        None => error(503, "hub_timeout"),
+        Some(view) => match view.snapshot {
+            Some(s) => json(200, &s),
+            None => Response::from_data(
+                serde_json::to_vec(&serde_json::json!({"error": "warming_up"})).unwrap(),
+            )
+            .with_status_code(503)
+            .with_header(header("Content-Type", "application/json"))
+            .with_header(header("Retry-After", "1"))
+            .boxed(),
+        },
+    }
+}
+
+/// One hunk in full, anchored against the real file as it stands.
+fn hunk_detail(ctx: &Ctx, id: &str) -> ResponseBox {
+    let manifest = match Manifest::load(&ctx.project) {
+        Ok(Some(m)) => m,
+        _ => return error(503, "no_session"),
+    };
+    let Some(hunk) = manifest.find(id) else {
+        return error(404, "no_such_hunk");
+    };
+    let real = ctx.project.repo_root.join(&hunk.file);
+    let lines = crate::present::read_lines(&real).unwrap_or_default();
+    let anchor = crate::present::find_anchor(&lines, hunk);
+    json(
+        200,
+        &state::HunkDetail {
+            generation: manifest.generation,
+            hunk: hunk.clone(),
+            anchor_line: anchor.line,
+            anchor_via: anchor.via,
+            real_path: real.to_string_lossy().into_owned(),
+        },
+    )
 }
 
 #[cfg(test)]

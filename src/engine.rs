@@ -144,6 +144,11 @@ pub fn observe(
     }
 }
 
+/// Has the session been archived out from under us?
+fn session_gone(project: &ProjectPaths) -> bool {
+    matches!(Manifest::load(project), Ok(None))
+}
+
 #[derive(Debug, Clone)]
 struct Candidate {
     actual: Vec<String>,
@@ -270,6 +275,23 @@ impl Engine {
     /// test can advance time by passing `None` and get the timers evaluated in
     /// exactly the order the real loop evaluates them.
     pub fn step(&mut self, ev: Option<EngineEvent>, now: Tick) -> Result<Vec<state::Event>> {
+        match self.step_inner(ev, now) {
+            Ok(out) => Ok(out),
+            // A session can vanish *during* a step, not only between them:
+            // `rote done` deletes session.json and then storms both watchers
+            // with a `git clean`, so a `Manifest::require` deep in the call
+            // stack is racing the teardown. Ending is the correct outcome, and
+            // reporting it as an engine failure would make a normal close look
+            // like a crash in the pane and in the daemon's log.
+            Err(e) if session_gone(&self.project) => {
+                let _ = e;
+                Ok(vec![state::Event::Closed { terminal: None }])
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn step_inner(&mut self, ev: Option<EngineEvent>, now: Tick) -> Result<Vec<state::Event>> {
         let mut notices: Vec<Notice> = Vec::new();
 
         // The session ending is not an error; it is the reason to stop.

@@ -12,6 +12,7 @@ pub mod detect;
 pub mod diffparse;
 pub mod engine;
 pub mod git;
+pub mod http;
 pub mod hunks;
 pub mod pane;
 pub mod paths;
