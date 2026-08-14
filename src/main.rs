@@ -925,26 +925,65 @@ fn cmd_show(project: &ProjectPaths, hunk_id: Option<&str>, color: bool) -> Resul
 /// default: the hunk carrying the question is often not the active one, because
 /// the queue moves on past an unanswered question rather than blocking on it.
 fn cmd_resolve(project: &ProjectPaths, hunk_id: &str, choice: Resolution) -> Result<()> {
-    let file = session::with_session(project, |m| {
-        let h = m
-            .find_mut(hunk_id)
-            .with_context(|| format!("no hunk {hunk_id} in this session"))?;
-        let Some(d) = h.pending_divergence.take() else {
-            return Ok(None);
-        };
-        match choice {
-            Resolution::Keep => {
-                h.status = Status::Diverged;
-                h.divergence = Some(d);
+    let wire_choice = match choice {
+        Resolution::Keep => rote::state::Resolution::Keep,
+        Resolution::Retry => rote::state::Resolution::Retry,
+    };
+
+    let file = match daemon::owner(project)? {
+        // This one matters most. Answering "retry" clears the question, but a
+        // live engine also has to disarm its watchdog and retake its baseline —
+        // otherwise it re-raises the identical question seconds later.
+        daemon::Owner::Daemon(ep) => {
+            let response = daemon::send_command(
+                &ep,
+                &rote::state::Request {
+                    wire_version: rote::state::WIRE_VERSION,
+                    generation: None,
+                    command: rote::state::Command::Resolve {
+                        hunk_id: hunk_id.to_string(),
+                        choice: wire_choice,
+                    },
+                },
+            )?;
+            match response.outcome {
+                rote::state::Outcome::Applied => Some(hunk_id.to_string()),
+                rote::state::Outcome::Rejected { reason }
+                    if reason.contains("no open question") =>
+                {
+                    None
+                }
+                rote::state::Outcome::Rejected { reason } => bail!("{reason} ({hunk_id})"),
+                rote::state::Outcome::Stale { current } => {
+                    bail!("the queue moved underneath that (now at generation {current})")
+                }
             }
-            // There is no editor to reopen. Retry withdraws the question and
-            // lets `rote watch` keep classifying as the user keeps typing.
-            Resolution::Retry => {}
         }
-        let file = h.file.clone();
-        m.last_presented = Some(hunk_id.to_string());
-        Ok(Some(file))
-    })?;
+        daemon::Owner::Nobody(_guard) => {
+            session::with_session_maybe(project, |m| {
+                let h = m
+                    .find_mut(hunk_id)
+                    .with_context(|| format!("no hunk {hunk_id} in this session"))?;
+                let Some(d) = h.pending_divergence.take() else {
+                    return Ok(None);
+                };
+                match choice {
+                    Resolution::Keep => {
+                        h.status = Status::Diverged;
+                        h.divergence = Some(d);
+                    }
+                    // There is no editor to reopen. Retry withdraws the question
+                    // and lets `rote watch` keep classifying as the user types.
+                    Resolution::Retry => {}
+                }
+                let file = h.file.clone();
+                m.last_presented = Some(hunk_id.to_string());
+                Ok(Some(file))
+            })?
+            .0
+        }
+        daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
+    };
 
     match (file, choice) {
         (None, _) => println!("hunk {hunk_id} has no open question."),
@@ -959,7 +998,6 @@ fn cmd_resolve(project: &ProjectPaths, hunk_id: &str, choice: Resolution) -> Res
     }
     Ok(())
 }
-
 /// Leave a hunk untyped, by id or by "whatever is active".
 ///
 /// Addressed by id rather than by position. Resolving "the active hunk" and then
@@ -968,27 +1006,70 @@ fn cmd_resolve(project: &ProjectPaths, hunk_id: &str, choice: Resolution) -> Res
 /// entirely. Resolving to an id first means the thing skipped is the thing the
 /// user was looking at, or nothing at all.
 fn cmd_skip(project: &ProjectPaths, cfg: &Config, hunk_id: Option<&str>) -> Result<()> {
-    let skipped = session::with_session_recomputed(project, cfg, |m, _report| {
-        let target = match hunk_id {
-            Some(id) => id.to_string(),
-            None => match m.active().map(|h| h.id.clone()) {
-                Some(id) => id,
-                None => return Ok(None),
-            },
-        };
-        let h = m
-            .find_mut(&target)
-            .with_context(|| format!("no hunk {target} in this session"))?;
-        h.status = Status::Skipped;
-        let file = h.file.clone();
-        m.last_presented = Some(target);
-        Ok(Some(file))
-    })?;
-
-    let Some(file) = skipped else {
-        println!("nothing to skip — the queue is empty.");
-        return Ok(());
+    let file = match daemon::owner(project)? {
+        // An engine owns the queue, so it has to make this change. Writing
+        // around it would leave its private view of the world — baselines,
+        // armed questions, recompute schedule — silently disagreeing with the
+        // manifest, which is how a hunk nobody touched ends up being asked
+        // about.
+        daemon::Owner::Daemon(ep) => {
+            let id = match hunk_id {
+                Some(id) => id.to_string(),
+                None => match daemon::fetch_state(&ep)?.queue.first() {
+                    Some(q) => q.id.clone(),
+                    None => {
+                        println!("nothing to skip — the queue is empty.");
+                        return Ok(());
+                    }
+                },
+            };
+            let response = daemon::send_command(
+                &ep,
+                &rote::state::Request {
+                    wire_version: rote::state::WIRE_VERSION,
+                    generation: None,
+                    command: rote::state::Command::Skip {
+                        hunk_id: id.clone(),
+                    },
+                },
+            )?;
+            match response.outcome {
+                rote::state::Outcome::Applied => {}
+                rote::state::Outcome::Rejected { reason } => bail!("{reason} ({id})"),
+                rote::state::Outcome::Stale { current } => {
+                    bail!("the queue moved underneath that (now at generation {current})")
+                }
+            }
+            id
+        }
+        // No engine exists, so a direct mutation is safe — for exactly as long
+        // as the guard is held, which is why it lives across the whole cycle.
+        daemon::Owner::Nobody(_guard) => {
+            let skipped = session::with_session_recomputed(project, cfg, |m, _report| {
+                let target = match hunk_id {
+                    Some(id) => id.to_string(),
+                    None => match m.active().map(|h| h.id.clone()) {
+                        Some(id) => id,
+                        None => return Ok(None),
+                    },
+                };
+                let h = m
+                    .find_mut(&target)
+                    .with_context(|| format!("no hunk {target} in this session"))?;
+                h.status = Status::Skipped;
+                let file = h.file.clone();
+                m.last_presented = Some(target);
+                Ok(Some(file))
+            })?;
+            let Some(file) = skipped else {
+                println!("nothing to skip — the queue is empty.");
+                return Ok(());
+            };
+            file
+        }
+        daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
     };
+
     println!("skipped — {file}");
     println!("it will not come back. `rote done` reports it before closing.");
     Ok(())

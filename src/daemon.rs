@@ -329,6 +329,88 @@ fn signal(pid: u32, sig: libc::c_int) {
     }
 }
 
+/// Who owns the engine, and therefore how a mutation must be made.
+pub enum Owner {
+    /// Nobody. The guard is held for as long as the caller mutates directly.
+    Nobody(Lock),
+    /// A daemon, at this address.
+    Daemon(Endpoint),
+    /// Something holds the engine token but does not answer HTTP — a
+    /// `rote watch --local` pane, or a wedged daemon.
+    Opaque { pid: Option<u32> },
+}
+
+/// Decide how to mutate, by trying to take the engine token.
+///
+/// The check *is* the exclusion, which is why this beats asking `daemon.json`
+/// first: acquire the token and no engine exists to be desynchronized, so a
+/// direct mutation is safe for exactly as long as the guard is held. Fail to
+/// acquire it and an engine does exist, so the mutation has to be its decision
+/// rather than ours.
+pub fn owner(project: &ProjectPaths) -> Result<Owner> {
+    project.ensure_state_dir()?;
+    if let Some(guard) = Lock::try_acquire(&project.watch_lock_path())? {
+        return Ok(Owner::Nobody(guard));
+    }
+    match discover(project) {
+        Some(ep) => Ok(Owner::Daemon(ep)),
+        None => Ok(Owner::Opaque {
+            pid: Endpoint::read(project).map(|e| e.pid),
+        }),
+    }
+}
+
+/// Send a verb to a running daemon and wait for its answer.
+pub fn send_command(ep: &Endpoint, request: &state::Request) -> Result<state::Response> {
+    let bytes = serde_json::to_vec(request).context("cannot serialize the command")?;
+    let reply = http::send(
+        ep.port,
+        &ep.token,
+        "POST",
+        "/command",
+        Some(&bytes),
+        http::CLIENT_TIMEOUT,
+    )?;
+    if !reply.is_ok() {
+        anyhow::bail!(
+            "the rote daemon refused the request (status {})",
+            reply.status
+        );
+    }
+    reply.json()
+}
+
+/// Ask the daemon what the world looks like.
+pub fn fetch_state(ep: &Endpoint) -> Result<state::Snapshot> {
+    let reply = http::send(
+        ep.port,
+        &ep.token,
+        "GET",
+        "/state",
+        None,
+        http::CLIENT_TIMEOUT,
+    )?;
+    if !reply.is_ok() {
+        anyhow::bail!("the rote daemon is not ready (status {})", reply.status);
+    }
+    reply.json()
+}
+
+/// The error for "something owns the queue but will not talk to us".
+pub fn opaque_owner_error(project: &ProjectPaths, pid: Option<u32>) -> anyhow::Error {
+    match pid.filter(|p| crate::paths::pid_is_live(*p)) {
+        Some(pid) => anyhow::anyhow!(
+            "pid {pid} owns this project's queue but is not answering.\n\
+             Stop it, then try again."
+        ),
+        None => anyhow::anyhow!(
+            "something owns this project's queue but is not answering.\n\
+             If it has crashed, remove {}.",
+            project.watch_lock_path().display()
+        ),
+    }
+}
+
 // ---------------------------------------------------------------- the hub
 
 /// What the hub can be asked to do.

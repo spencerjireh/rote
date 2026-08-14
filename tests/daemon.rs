@@ -739,6 +739,101 @@ fn reap_refuses_to_signal_a_pid_belonging_to_another_project() {
     let _ = victim.wait();
 }
 
+// ------------------------------------------------------------ verb routing
+
+#[test]
+fn skip_routes_through_the_daemon_when_one_owns_the_queue() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let mut stream = d.events();
+    stream.next_named("snapshot");
+
+    let out = cli.run(&["skip"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // The proof that it went through the daemon rather than around it: an
+    // attached subscriber saw the result.
+    for _ in 0..10 {
+        let snap: state::Snapshot =
+            serde_json::from_str(&stream.next_named("snapshot").data).unwrap();
+        if snap.counts.skipped == 1 {
+            return;
+        }
+    }
+    panic!("the skip never reached a subscriber, so it did not go through the daemon");
+}
+
+#[test]
+fn skip_mutates_directly_when_nothing_owns_the_queue() {
+    // No daemon, no pane: the CLI takes the engine token itself and writes.
+    let cli = session();
+    let out = cli.run(&["skip"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("skipped — a.rs"), "{}", stdout(&out));
+
+    let status = stdout(&cli.run(&["status"]));
+    assert!(status.contains("1 skipped"), "{status}");
+}
+
+#[test]
+fn a_verb_refuses_when_something_owns_the_queue_but_answers_nothing() {
+    // A `rote watch --local` pane, or a wedged daemon. Writing around it is
+    // exactly what corrupts an engine's view of the world.
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+    let _held = rote::paths::Lock::try_acquire(&project.watch_lock_path())
+        .unwrap()
+        .expect("the token should be free");
+
+    let out = cli.run(&["skip"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("owns this project's queue") && err.contains("not answering"),
+        "{err}"
+    );
+}
+
+#[test]
+fn answering_retry_through_the_daemon_does_not_get_re_asked() {
+    // The Stage-1 bug this step closes. Clearing pending_divergence is only
+    // half of answering: a live engine also has to disarm its watchdog, or it
+    // re-raises the identical question a couple of seconds later.
+    let cli = session();
+    let d = Daemon::start(&cli);
+    cli.fx.write("a.rs", "fn a() {\n    my_own_way();\n}\n");
+    let asked = common::daemon::wait_for("a question", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .ok()
+            .filter(|s| s.queue.iter().any(|q| q.has_question))
+    });
+    let id = asked
+        .queue
+        .iter()
+        .find(|q| q.has_question)
+        .unwrap()
+        .id
+        .clone();
+
+    let out = cli.run(&["resolve", &id, "retry"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("withdrew the question"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Well past the grace window: it must stay withdrawn.
+    std::thread::sleep(Duration::from_millis(3500));
+    let snap: state::Snapshot = d.get("/state").json().unwrap();
+    assert!(
+        !snap.queue.iter().any(|q| q.has_question),
+        "an answered question must not come back"
+    );
+}
+
 #[test]
 fn the_daemon_exits_when_the_session_is_archived() {
     // `rote done` deletes session.json and then storms both watchers with a
