@@ -22,6 +22,13 @@ pub const WAIT: Duration = Duration::from_secs(10);
 /// Poll interval. House style: `review::wait_with_timeout`.
 const POLL: Duration = Duration::from_millis(25);
 
+/// How long to let a recursive watch take effect before writing to the tree.
+///
+/// Not paranoia: on an idle machine a test can write within a millisecond of
+/// the daemon answering `/health`, and on macOS fsevents that write can predate
+/// the subscription and never be delivered at all.
+const WATCH_REGISTRATION: Duration = Duration::from_millis(400);
+
 /// Wait for something to become true, or give up and say what we were waiting
 /// for. A sleep long enough to be reliable is long enough to make a suite slow.
 pub fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
@@ -81,6 +88,11 @@ impl Daemon {
                 .map(|r| r.is_ok())
                 .unwrap_or(false)
         });
+        // Answering /health does not mean the recursive watch is registered.
+        // A write that lands inside that window is genuinely lost — the engine
+        // recovers on its next floor sweep, but that is far longer than a test
+        // waits. `tests/watcher.rs` sleeps here for the same reason.
+        std::thread::sleep(WATCH_REGISTRATION);
         Self { child, endpoint }
     }
 

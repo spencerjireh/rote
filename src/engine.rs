@@ -81,14 +81,43 @@ pub enum Origin {
     Shadow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A verb, and somewhere to send the answer.
+///
+/// The reply channel is optional because two callers want different things: an
+/// HTTP handler is holding a socket open and needs the outcome, while the pane
+/// pressing `s` learns what happened from the next snapshot like everything
+/// else. Making it optional is what keeps the in-process path from having to
+/// invent a channel it will not read.
+#[derive(Debug)]
+pub struct CommandRequest {
+    pub request: state::Request,
+    pub reply: Option<std::sync::mpsc::Sender<state::Response>>,
+}
+
+impl From<state::Command> for CommandRequest {
+    /// A verb with no generation and nobody waiting: fire and forget.
+    fn from(command: state::Command) -> Self {
+        Self {
+            request: state::Request {
+                wire_version: state::WIRE_VERSION,
+                generation: None,
+                command,
+            },
+            reply: None,
+        }
+    }
+}
+
+/// Deliberately not `PartialEq`: a reply channel has no meaningful equality,
+/// and nothing in the codebase compares an event.
+#[derive(Debug)]
 pub enum EngineEvent {
     /// Something under this repo-relative path may have changed. Deliberately
     /// carries no `EventKind`: the engine re-reads from disk and decides for
     /// itself, which is what makes atomic-rename saves and coalesced
     /// directory-granular events harmless.
     Changed(Origin, PathBuf),
-    Command(state::Command),
+    Command(CommandRequest),
     /// The watcher itself failed. Degrade to polling rather than dying.
     WatchError(String),
 }
@@ -142,6 +171,18 @@ pub fn observe(
             }
         }
     }
+}
+
+/// What a mutation closure decided.
+enum Decision<T> {
+    Apply(T),
+    Reject(String),
+}
+
+/// Either the value a mutation produced, or the reason there was not one.
+enum Mutated<T> {
+    Applied(T),
+    Refused(state::Outcome),
 }
 
 /// Has the session been archived out from under us?
@@ -313,7 +354,19 @@ impl Engine {
                     // The agent worked. Only a full re-diff can say what it did.
                     self.arm_recompute(now);
                 }
-                EngineEvent::Command(cmd) => self.apply(cmd, now, &mut notices)?,
+                EngineEvent::Command(req) => {
+                    let reply = req.reply;
+                    let outcome = self.apply(&req.request, now, &mut notices)?;
+                    if let Some(tx) = reply {
+                        let generation = Manifest::load(&self.project)?
+                            .map(|m| m.generation)
+                            .unwrap_or(0);
+                        let _ = tx.send(state::Response {
+                            generation,
+                            outcome,
+                        });
+                    }
+                }
                 EngineEvent::WatchError(msg) => {
                     if !self.degraded {
                         self.degraded = true;
@@ -479,33 +532,51 @@ impl Engine {
     fn raise_due_questions(&mut self, now: Tick, notices: &mut Vec<Notice>) -> Result<()> {
         let grace = self.cfg.watch_divergence_grace_ms;
         let due = self.watchdog.due(now, grace);
-        for (id, actual) in due {
+        for (armed_id, actual) in due {
             let manifest = Manifest::require(&self.project)?;
-            let Some(h) = manifest.find(&id) else {
-                self.watchdog.disarm(&id);
+
+            // The hunk a question is about can change identity between the
+            // disagreement and the moment it becomes due. Once the user's own
+            // text is in the tree, a recompute re-diffs that region as
+            // (theirs -> proposal), which is a different id — rule 5 drops the
+            // entry we armed against and rule 6 appends the new one. Following
+            // the content is what keeps the question alive across that; without
+            // it the candidate is disarmed as "gone", the baseline has already
+            // refreshed to include their text so nothing re-arms, and the
+            // disagreement can never be raised again.
+            let target = manifest
+                .find(&armed_id)
+                .filter(|h| h.status == Status::Pending);
+            let target = match target {
+                Some(h) => Some(h),
+                None => manifest
+                    .pending()
+                    .find(|h| h.old_lines == actual && h.pending_divergence.is_none()),
+            };
+
+            let Some(h) = target else {
+                self.watchdog.disarm(&armed_id);
                 continue;
             };
-            if h.status != Status::Pending {
-                self.watchdog.disarm(&id);
-                continue;
-            }
             if h.pending_divergence.is_some() {
                 continue; // already asked
             }
+            let id = h.id.clone();
             let proposed = h.new_lines.clone();
             let key = h.key.clone();
             let file = h.file.clone();
-            let asked = session::with_session(&self.project, |m| {
+            let (asked, _) = session::with_session_maybe(&self.project, |m| {
                 let Some(h) = m.find_mut(&id) else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 if h.status != Status::Pending || h.key != key {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 h.pending_divergence = Some(Divergence { proposed, actual });
-                Ok(true)
+                Ok(Some(()))
             })?;
-            if asked {
+            self.watchdog.disarm(&armed_id);
+            if asked.is_some() {
                 notices.push(Notice::info(format!("your version differs — {file}")));
             }
         }
@@ -588,34 +659,53 @@ impl Engine {
     /// Apply a front-end verb.
     pub fn apply(
         &mut self,
-        cmd: state::Command,
+        req: &state::Request,
         now: Tick,
         notices: &mut Vec<Notice>,
-    ) -> Result<()> {
-        match cmd {
+    ) -> Result<state::Outcome> {
+        if req.wire_version != state::WIRE_VERSION {
+            return Ok(state::Outcome::Rejected {
+                reason: format!(
+                    "this daemon speaks wire version {}, not {}",
+                    state::WIRE_VERSION,
+                    req.wire_version
+                ),
+            });
+        }
+        let want = req.generation;
+
+        match &req.command {
             state::Command::Skip { hunk_id } => {
-                let file = session::with_session(&self.project, |m| {
-                    let Some(h) = m.find_mut(&hunk_id) else {
-                        return Ok(None);
+                let (file, generation) = self.mutate(want, |m| {
+                    let Some(h) = m.find_mut(hunk_id) else {
+                        return Ok(Decision::Reject("no such hunk".into()));
                     };
                     h.status = Status::Skipped;
                     let file = h.file.clone();
                     m.last_presented = Some(hunk_id.clone());
-                    Ok(Some(file))
+                    Ok(Decision::Apply(file))
                 })?;
-                self.watchdog.disarm(&hunk_id);
-                if let Some(file) = file {
-                    self.retake_baseline(&file)?;
-                    notices.push(Notice::info(format!("skipped — {file}")));
+                match file {
+                    Mutated::Applied(file) => {
+                        self.watchdog.disarm(hunk_id);
+                        self.retake_baseline(&file)?;
+                        notices.push(Notice::info(format!("skipped — {file}")));
+                        Ok(state::Outcome::Applied)
+                    }
+                    Mutated::Refused(o) => {
+                        let _ = generation;
+                        Ok(o)
+                    }
                 }
             }
             state::Command::Resolve { hunk_id, choice } => {
-                let file = session::with_session(&self.project, |m| {
-                    let Some(h) = m.find_mut(&hunk_id) else {
-                        return Ok(None);
+                let choice = *choice;
+                let (file, _) = self.mutate(want, |m| {
+                    let Some(h) = m.find_mut(hunk_id) else {
+                        return Ok(Decision::Reject("no such hunk".into()));
                     };
                     let Some(d) = h.pending_divergence.take() else {
-                        return Ok(None);
+                        return Ok(Decision::Reject("no open question on that hunk".into()));
                     };
                     match choice {
                         state::Resolution::Keep => {
@@ -628,33 +718,81 @@ impl Engine {
                     }
                     let file = h.file.clone();
                     m.last_presented = Some(hunk_id.clone());
-                    Ok(Some(file))
+                    Ok(Decision::Apply(file))
                 })?;
-                self.watchdog.disarm(&hunk_id);
-                if let Some(file) = file {
-                    self.retake_baseline(&file)?;
-                    notices.push(Notice::info(match choice {
-                        state::Resolution::Keep => format!("kept your version — {file}"),
-                        state::Resolution::Retry => format!("still watching — {file}"),
-                    }));
+                match file {
+                    Mutated::Applied(file) => {
+                        self.watchdog.disarm(hunk_id);
+                        self.retake_baseline(&file)?;
+                        notices.push(Notice::info(match choice {
+                            state::Resolution::Keep => format!("kept your version — {file}"),
+                            state::Resolution::Retry => format!("still watching — {file}"),
+                        }));
+                        Ok(state::Outcome::Applied)
+                    }
+                    Mutated::Refused(o) => Ok(o),
                 }
             }
             state::Command::Show { hunk_id } => {
-                if let Some(id) = hunk_id {
-                    session::with_session(&self.project, |m| {
-                        if m.find(&id).is_some() {
-                            m.last_presented = Some(id.clone());
-                        }
-                        Ok(())
-                    })?;
-                }
+                let Some(id) = hunk_id.clone() else {
+                    return Ok(state::Outcome::Applied);
+                };
+                let (out, _) = self.mutate(want, |m| {
+                    if m.find(&id).is_none() {
+                        return Ok(Decision::Reject("no such hunk".into()));
+                    }
+                    m.last_presented = Some(id.clone());
+                    Ok(Decision::Apply(()))
+                })?;
+                Ok(match out {
+                    Mutated::Applied(()) => state::Outcome::Applied,
+                    Mutated::Refused(o) => o,
+                })
             }
             state::Command::Refresh => {
                 self.recompute = Pending::At(now);
                 self.last_recompute = None;
+                Ok(state::Outcome::Applied)
             }
         }
-        Ok(())
+    }
+
+    /// Run a mutation with the staleness check **inside** the lock.
+    ///
+    /// The check has to happen in the same read-modify-write cycle as the write
+    /// itself. Comparing the generation in the handler and then locking to write
+    /// is a TOCTOU, which would make the whole mechanism decorative — it is the
+    /// exact shape `with_session`'s doc comment exists to forbid.
+    fn mutate<T>(
+        &self,
+        want: Option<u64>,
+        f: impl FnOnce(&mut Manifest) -> Result<Decision<T>>,
+    ) -> Result<(Mutated<T>, u64)> {
+        let mut refusal: Option<state::Outcome> = None;
+        let (applied, generation) = session::with_session_maybe(&self.project, |m| {
+            if let Some(g) = want {
+                if m.generation != g {
+                    refusal = Some(state::Outcome::Stale {
+                        current: m.generation,
+                    });
+                    return Ok(None);
+                }
+            }
+            match f(m)? {
+                Decision::Apply(v) => Ok(Some(v)),
+                Decision::Reject(reason) => {
+                    refusal = Some(state::Outcome::Rejected { reason });
+                    Ok(None)
+                }
+            }
+        })?;
+        Ok(match applied {
+            Some(v) => (Mutated::Applied(v), generation),
+            None => (
+                Mutated::Refused(refusal.unwrap_or(state::Outcome::Applied)),
+                generation,
+            ),
+        })
     }
 
     /// Build a snapshot, emitting one only when something actually moved.

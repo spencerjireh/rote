@@ -358,7 +358,7 @@ pub fn run(project: &ProjectPaths, cfg: &Config, opts: Options) -> Result<()> {
                     }
                     other => {
                         if let Some(cmd) = command_for(other, snapshot.as_ref()) {
-                            pending = Some(EngineEvent::Command(cmd));
+                            pending = Some(EngineEvent::Command(cmd.into()));
                             continue;
                         }
                     }

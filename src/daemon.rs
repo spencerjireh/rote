@@ -45,6 +45,11 @@ pub const HUB_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long to wait for the engine thread to finish after the loop ends.
 pub const JOIN_CEILING: Duration = Duration::from_secs(2);
 
+/// A verb handler waits this long on the engine before giving up with a 503.
+/// Longer than the hub's ceiling because the engine may be inside a recompute
+/// holding the manifest lock.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Where a daemon is listening, and how to prove you may talk to it.
 ///
 /// Written as one file rather than the conventional separate pid and port
@@ -262,6 +267,7 @@ pub fn serve(project: &ProjectPaths, cfg: &Config, opts: ServeOptions) -> Result
         port,
         started,
         hub: hub_tx.clone(),
+        engine: engine_tx.clone(),
     };
 
     let mut terminal = None;
@@ -334,6 +340,7 @@ struct Ctx {
     port: u16,
     started: Instant,
     hub: Sender<HubMsg>,
+    engine: Sender<EngineEvent>,
 }
 
 impl Ctx {
@@ -375,10 +382,12 @@ fn handle(ctx: &Ctx, request: Request) {
         return;
     }
 
+    let mut request = request;
     let response = match (method.as_str(), path.as_str()) {
         ("GET", "/health") => health(ctx),
         ("GET", "/state") => snapshot(ctx),
         ("GET", p) if p.starts_with("/hunk/") => hunk_detail(ctx, &p["/hunk/".len()..]),
+        ("POST", "/command") => command(ctx, &mut request),
         ("GET", _) | ("POST", _) => error(404, "not_found"),
         _ => Response::from_data(Vec::new())
             .with_status_code(405)
@@ -386,6 +395,68 @@ fn handle(ctx: &Ctx, request: Request) {
             .boxed(),
     };
     let _ = request.respond(response);
+}
+
+/// Read a JSON body, refusing anything that is not one.
+fn read_json_body<T: serde::de::DeserializeOwned>(request: &mut Request) -> Result<T, ResponseBox> {
+    let content_type = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default();
+    if !http::is_json_content_type(&content_type) {
+        // A browser form can only send three content types, none of them this
+        // one — which is what stops a hostile page firing a simple-CORS POST at
+        // every port on the loopback.
+        return Err(error(415, "expected_json"));
+    }
+    if let Some(len) = request.body_length() {
+        if len > http::MAX_BODY {
+            return Err(error(413, "body_too_large"));
+        }
+    }
+
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    if request
+        .as_reader()
+        .take(http::MAX_BODY as u64 + 1)
+        .read_to_end(&mut body)
+        .is_err()
+    {
+        return Err(error(400, "unreadable_body"));
+    }
+    if body.len() > http::MAX_BODY {
+        return Err(error(413, "body_too_large"));
+    }
+    serde_json::from_slice(&body).map_err(|_| error(400, "bad_json"))
+}
+
+/// A verb. The engine answers; this thread only carries the reply back.
+fn command(ctx: &Ctx, request: &mut Request) -> ResponseBox {
+    let parsed: state::Request = match read_json_body(request) {
+        Ok(v) => v,
+        Err(rejection) => return rejection,
+    };
+
+    let (tx, rx) = channel();
+    let sent = ctx
+        .engine
+        .send(EngineEvent::Command(crate::engine::CommandRequest {
+            request: parsed,
+            reply: Some(tx),
+        }));
+    if sent.is_err() {
+        return error(503, "engine_gone");
+    }
+    // The engine may be inside a recompute holding the manifest lock, so this
+    // is generous — but it is bounded, because a handler that waits forever is
+    // a socket that never closes.
+    match rx.recv_timeout(COMMAND_TIMEOUT) {
+        Ok(response) => json(200, &response),
+        Err(_) => error(503, "engine_timeout"),
+    }
 }
 
 /// The checks every request passes before anything looks at the path.

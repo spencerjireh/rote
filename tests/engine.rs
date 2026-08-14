@@ -132,6 +132,50 @@ fn a_settled_disagreement_becomes_a_question_and_the_queue_moves_on() {
 }
 
 #[test]
+fn a_recompute_between_the_disagreement_and_the_question_does_not_lose_it() {
+    // Found by a daemon test that only passed when other tests happened to slow
+    // it down. Once the user's own text is in the tree, a recompute re-diffs
+    // that region as (theirs -> proposal), which is a *different* id: rule 5
+    // drops the entry the watchdog armed against and rule 6 appends the new
+    // one. The candidate then looked "gone" and was disarmed — and because the
+    // baseline had already refreshed to include their text, nothing could ever
+    // re-arm it. The disagreement became unaskable.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let armed_id = manifest(&fx).active().unwrap().id.clone();
+
+    // They type their own version, and it settles.
+    fx.write("a.rs", "fn a() {\n    my_own_way();\n}\n");
+    engine.step(Some(changed()), Tick(100)).unwrap();
+
+    // A full recompute lands before the grace window expires.
+    engine
+        .step(
+            Some(EngineEvent::Command(state::Command::Refresh.into())),
+            Tick(200),
+        )
+        .unwrap();
+    engine.step(None, Tick(LATER)).unwrap();
+    let m = manifest(&fx);
+    assert!(
+        m.find(&armed_id).is_none(),
+        "the recompute should have re-identified the region"
+    );
+
+    // The question must still arrive, on whatever the region is called now.
+    engine.step(None, Tick(LATER + 5_000)).unwrap();
+
+    let m = manifest(&fx);
+    let asked = m
+        .pending()
+        .find(|h| h.pending_divergence.is_some())
+        .expect("the disagreement must survive being re-identified");
+    let q = asked.pending_divergence.as_ref().unwrap();
+    assert_eq!(q.actual, vec!["    my_own_way();"]);
+    assert_eq!(q.proposed, vec!["    work();"]);
+}
+
+#[test]
 fn fixing_the_text_withdraws_an_unanswered_question() {
     let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
     engine.step(None, Tick(0)).unwrap();
@@ -292,9 +336,12 @@ fn skip_and_resolve_come_in_as_commands() {
 
     engine
         .step(
-            Some(EngineEvent::Command(state::Command::Skip {
-                hunk_id: id.clone(),
-            })),
+            Some(EngineEvent::Command(
+                state::Command::Skip {
+                    hunk_id: id.clone(),
+                }
+                .into(),
+            )),
             Tick(100),
         )
         .unwrap();
@@ -315,10 +362,13 @@ fn keeping_a_divergence_records_both_versions_and_is_not_re_offered() {
 
     engine
         .step(
-            Some(EngineEvent::Command(state::Command::Resolve {
-                hunk_id: id,
-                choice: state::Resolution::Keep,
-            })),
+            Some(EngineEvent::Command(
+                state::Command::Resolve {
+                    hunk_id: id,
+                    choice: state::Resolution::Keep,
+                }
+                .into(),
+            )),
             Tick(2_200),
         )
         .unwrap();

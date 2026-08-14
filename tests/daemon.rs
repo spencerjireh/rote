@@ -204,6 +204,213 @@ fn every_response_carries_a_content_length() {
     }
 }
 
+// ------------------------------------------------------------ POST /command
+
+fn skip(id: &str, generation: Option<u64>) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "wire_version": state::WIRE_VERSION,
+        "verb": "skip",
+        "hunk_id": id,
+    });
+    if let Some(g) = generation {
+        v["generation"] = serde_json::json!(g);
+    }
+    v
+}
+
+#[test]
+fn a_command_applies_with_or_without_a_generation() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    wait_until("a first snapshot", || d.get("/state").status == 200);
+    let snap: state::Snapshot = d.get("/state").json().unwrap();
+    let id = snap.queue[0].id.clone();
+
+    // Carrying the current generation is the careful form.
+    let r = d.post("/command", &skip(&id, Some(snap.generation)));
+    assert_eq!(r.status, 200, "an outcome is a successful conversation");
+    let body: state::Response = r.json().unwrap();
+    assert_eq!(body.outcome, state::Outcome::Applied);
+    assert!(body.generation > snap.generation, "the write moved it");
+
+    wait_until("the skip to reach the snapshot", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .map(|s| s.counts.skipped == 1)
+            .unwrap_or(false)
+    });
+}
+
+#[test]
+fn a_stale_generation_is_refused_with_the_current_one_attached() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    wait_until("a first snapshot", || d.get("/state").status == 200);
+    let snap: state::Snapshot = d.get("/state").json().unwrap();
+    let id = snap.queue[0].id.clone();
+
+    let stale = snap.generation.saturating_sub(1);
+    let r = d.post("/command", &skip(&id, Some(stale)));
+    assert_eq!(r.status, 200);
+    let body: state::Response = r.json().unwrap();
+    match body.outcome {
+        state::Outcome::Stale { current } => {
+            assert_eq!(
+                current, snap.generation,
+                "the current generation comes back, so a client can re-issue \
+                 without a round trip to discover it"
+            );
+        }
+        other => panic!("expected stale, got {other:?}"),
+    }
+
+    // Nothing was written, and the generation did not move — which is what
+    // makes retrying exactly once safe.
+    let after: state::Snapshot = d.get("/state").json().unwrap();
+    assert_eq!(after.generation, snap.generation);
+    assert_eq!(after.counts.skipped, 0);
+}
+
+#[test]
+fn answering_a_question_about_a_hunk_the_agent_has_since_reworked_does_not_land() {
+    // The case the whole generation mechanism exists for. A front end renders a
+    // question, the agent reworks that region, and the user answers what they
+    // are still looking at — which is no longer what is there.
+    let cli = session();
+    let d = Daemon::start(&cli);
+    wait_until("a first snapshot", || d.get("/state").status == 200);
+
+    // Raise a question: type something of your own and let it settle.
+    cli.fx.write("a.rs", "fn a() {\n    my_own_way();\n}\n");
+    let asked = common::daemon::wait_for("a question to be raised", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .ok()
+            .filter(|s| s.queue.iter().any(|q| q.has_question))
+    });
+    let id = asked
+        .queue
+        .iter()
+        .find(|q| q.has_question)
+        .unwrap()
+        .id
+        .clone();
+
+    // The agent reworks the region while the question is on screen.
+    std::fs::write(
+        cli.shadow().join("a.rs"),
+        "fn a() {\n    something_else();\n}\n",
+    )
+    .unwrap();
+    wait_until("the rework to move the generation", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .map(|s| s.generation > asked.generation)
+            .unwrap_or(false)
+    });
+
+    // The user answers what they were looking at.
+    let r = d.post(
+        "/command",
+        &serde_json::json!({
+            "wire_version": state::WIRE_VERSION,
+            "generation": asked.generation,
+            "verb": "resolve",
+            "hunk_id": id,
+            "choice": "keep",
+        }),
+    );
+    let body: state::Response = r.json().unwrap();
+    assert!(
+        matches!(body.outcome, state::Outcome::Stale { .. }),
+        "an answer to a question that has moved must not land: {:?}",
+        body.outcome
+    );
+
+    let after: state::Snapshot = d.get("/state").json().unwrap();
+    assert_eq!(
+        after.counts.diverged, 0,
+        "and nothing was recorded as a kept divergence"
+    );
+}
+
+#[test]
+fn a_command_that_cannot_be_carried_out_is_rejected_rather_than_applied() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    wait_until("a first snapshot", || d.get("/state").status == 200);
+    let snap: state::Snapshot = d.get("/state").json().unwrap();
+    let id = snap.queue[0].id.clone();
+
+    // No such hunk.
+    let body: state::Response = d.post("/command", &skip("h-nope", None)).json().unwrap();
+    assert!(matches!(body.outcome, state::Outcome::Rejected { .. }));
+
+    // Resolving a hunk with no open question.
+    let body: state::Response = d
+        .post(
+            "/command",
+            &serde_json::json!({
+                "wire_version": state::WIRE_VERSION,
+                "verb": "resolve",
+                "hunk_id": id,
+                "choice": "keep",
+            }),
+        )
+        .json()
+        .unwrap();
+    match body.outcome {
+        state::Outcome::Rejected { reason } => assert!(reason.contains("no open question")),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+
+    // A wire version this daemon does not speak.
+    let body: state::Response = d
+        .post(
+            "/command",
+            &serde_json::json!({"wire_version": 99, "verb": "refresh"}),
+        )
+        .json()
+        .unwrap();
+    match body.outcome {
+        state::Outcome::Rejected { reason } => assert!(reason.contains("wire version")),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_post_must_be_json_and_must_not_be_enormous() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+
+    // The three content types a browser form can send are all refused, which is
+    // what stops a hostile page firing one at every port on the loopback.
+    use std::io::{BufReader, Write};
+    let post = |content_type: &str, body: &str| -> u16 {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", d.port())).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let req = format!(
+            "POST /command HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            d.port(),
+            d.token(),
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut r = BufReader::new(s);
+        rote::http::read_head(&mut r).unwrap().0
+    };
+
+    assert_eq!(post("application/x-www-form-urlencoded", "{}"), 415);
+    assert_eq!(post("text/plain", "{}"), 415);
+    assert_eq!(post("application/json", "not json"), 400);
+    assert_eq!(
+        post("application/json", &"x".repeat(70 * 1024)),
+        413,
+        "a verb is a few hundred bytes; refuse rather than allocate on trust"
+    );
+}
+
 #[test]
 fn a_second_daemon_refuses_because_the_first_owns_the_engine() {
     // The single-engine invariant, from the daemon's side. Two engines do not
