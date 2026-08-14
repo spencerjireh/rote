@@ -411,6 +411,144 @@ fn a_post_must_be_json_and_must_not_be_enormous() {
     );
 }
 
+// ------------------------------------------------------------ GET /events
+
+#[test]
+fn a_small_event_reaches_the_client_immediately() {
+    // The regression test for the chunked-buffer trap. tiny_http's chunked path
+    // is Encoder::new + io::copy: the encoder buffers 8 KiB, io::copy never
+    // flushes, and for an infinite reader it never returns either. A frame this
+    // size would sit invisible until eight kilobytes had accumulated. Without
+    // this test that bug returns the first time someone "simplifies" the writer
+    // back to a Response.
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let mut stream = d.events();
+
+    let started = std::time::Instant::now();
+    let frame = stream.next_named("snapshot");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a few hundred bytes took {:?} to arrive — it is being buffered",
+        started.elapsed()
+    );
+    assert!(frame.data.len() < 8192, "and it is well under a chunk");
+
+    let snap: state::Snapshot = serde_json::from_str(&frame.data).unwrap();
+    assert_eq!(snap.wire_version, state::WIRE_VERSION);
+}
+
+#[test]
+fn the_first_frame_after_connecting_is_the_whole_world() {
+    // Which is why the protocol needs no Last-Event-ID and no resume: a client
+    // that attaches late, or reconnects, is never behind.
+    let cli = session();
+    let d = Daemon::start(&cli);
+    wait_until("a first snapshot", || d.get("/state").status == 200);
+
+    let mut stream = d.events();
+    let snap: state::Snapshot = serde_json::from_str(&stream.next_named("snapshot").data).unwrap();
+    assert_eq!(snap.counts.pending, 1);
+    assert!(snap.active.is_some());
+}
+
+#[test]
+fn typing_the_proposal_pushes_a_frame_without_being_asked() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let mut stream = d.events();
+    stream.next_named("snapshot"); // the cached one
+
+    cli.fx.write("a.rs", "fn a() {\n    work();\n}\n");
+
+    // Keep reading until the queue drains — there may be intermediate frames.
+    for _ in 0..10 {
+        let snap: state::Snapshot =
+            serde_json::from_str(&stream.next_named("snapshot").data).unwrap();
+        if snap.counts.typed == 1 && snap.counts.pending == 0 {
+            return;
+        }
+    }
+    panic!("typing the proposal never produced a typed snapshot");
+}
+
+#[test]
+fn two_clients_see_the_same_thing() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let mut a = d.events();
+    let mut b = d.events();
+
+    cli.fx.write("a.rs", "fn a() {\n    work();\n}\n");
+
+    let drained = |s: &mut common::daemon::Stream| {
+        for _ in 0..10 {
+            let snap: state::Snapshot =
+                serde_json::from_str(&s.next_named("snapshot").data).unwrap();
+            if snap.counts.typed == 1 {
+                return snap;
+            }
+        }
+        panic!("no typed snapshot");
+    };
+    let sa = drained(&mut a);
+    let sb = drained(&mut b);
+    assert_eq!(sa.generation, sb.generation);
+    assert_eq!(sa.counts, sb.counts);
+
+    // And the daemon knows how many are listening.
+    let health: state::Health = d.get("/health").json().unwrap();
+    assert_eq!(health.subscribers, 2);
+}
+
+#[test]
+fn a_closing_session_says_so_on_the_stream_before_the_daemon_goes() {
+    // A pane must be able to tell "the session ended" from "the daemon
+    // vanished" — they call for different sentences and different exit codes.
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let mut stream = d.events();
+    stream.next_named("snapshot");
+
+    let out = cli.run_with_input(&["done", "--force", "--no-checks", "--no-review"], "y\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let frame = stream.next_named("closed");
+    let ev: state::Event = serde_json::from_str(&frame.data).unwrap();
+    assert!(matches!(ev, state::Event::Closed { .. }), "got {ev:?}");
+}
+
+#[test]
+fn a_reader_that_goes_away_is_pruned() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    {
+        let mut s = d.events();
+        s.next_named("snapshot");
+        let health: state::Health = d.get("/health").json().unwrap();
+        assert_eq!(health.subscribers, 1);
+    } // the socket closes here
+
+    // Pruning is deliberately lazy: there is no unsubscribe message, so the hub
+    // only learns a client is gone when a send to it fails. That takes two
+    // published frames — the first wakes the stream thread, which discovers the
+    // broken socket on its write and drops the receiver; the second finds the
+    // channel closed. One mechanism, and no bookkeeping that can leak.
+    //
+    // It also means the count in /health is as of the last publish, not as of
+    // now: an idle daemon publishes nothing, so nothing prunes.
+    wait_until("the subscriber to be pruned", || {
+        d.post(
+            "/command",
+            &serde_json::json!({"wire_version": state::WIRE_VERSION, "verb": "refresh"}),
+        );
+        d.get("/health")
+            .json::<state::Health>()
+            .map(|h| h.subscribers == 0)
+            .unwrap_or(false)
+    });
+}
+
 #[test]
 fn a_second_daemon_refuses_because_the_first_owns_the_engine() {
     // The single-engine invariant, from the daemon's side. Two engines do not

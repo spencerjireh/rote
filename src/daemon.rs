@@ -20,6 +20,7 @@ use crate::state;
 use crate::watcher;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -44,6 +45,18 @@ pub const HUB_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long to wait for the engine thread to finish after the loop ends.
 pub const JOIN_CEILING: Duration = Duration::from_secs(2);
+
+/// How long an idle event stream waits before writing a keepalive comment.
+///
+/// The keepalive is what makes a vanished client detectable: without a write
+/// there is nothing to fail, so a browser tab closed an hour ago would still
+/// hold a thread and a socket.
+pub const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// How many frames a subscriber may fall behind before it is dropped.
+///
+/// Eight whole snapshots behind on loopback is not slow, it is broken.
+pub const SSE_QUEUE: usize = 8;
 
 /// A verb handler waits this long on the engine before giving up with a 503.
 /// Longer than the hub's ceiling because the engine may be inside a recompute
@@ -148,6 +161,9 @@ enum HubMsg {
     Publish(state::Event),
     /// A read handler asking what the world looks like.
     Peek(Sender<HubView>),
+    /// A new event stream. Gets the cached snapshot immediately, which is why
+    /// SSE needs no `Last-Event-ID` and no resume: every frame is whole.
+    Subscribe(std::sync::mpsc::SyncSender<state::Event>),
     /// The session is over. Ends the hub loop, which is the shutdown trigger.
     Close(Option<Terminal>),
 }
@@ -167,24 +183,60 @@ struct HubView {
 /// thread that is classifying the user's keystrokes.
 fn run_hub(rx: Receiver<HubMsg>, done: Sender<Option<Terminal>>) {
     let mut view = HubView::default();
+    let mut subscribers: Vec<std::sync::mpsc::SyncSender<state::Event>> = Vec::new();
+
     for msg in rx {
         match msg {
-            HubMsg::Publish(state::Event::Snapshot(s)) => view.snapshot = Some(*s),
+            HubMsg::Publish(state::Event::Snapshot(s)) => {
+                view.snapshot = Some((*s).clone());
+                fan_out(&mut subscribers, state::Event::Snapshot(s));
+                view.subscribers = subscribers.len();
+            }
             HubMsg::Publish(state::Event::Closed { terminal }) => {
+                // Tell everyone before going, so a pane can say "session closed"
+                // rather than "the daemon vanished".
+                fan_out(&mut subscribers, state::Event::Closed { terminal });
                 let _ = done.send(terminal);
                 return;
             }
-            HubMsg::Publish(_) => {}
+            // The engine emits one of these every tick. Four frames a second
+            // down a socket is noise; each stream writes its own keepalive when
+            // it has actually been idle.
+            HubMsg::Publish(state::Event::Heartbeat { .. }) => {}
+            HubMsg::Publish(other) => fan_out(&mut subscribers, other),
             HubMsg::Peek(reply) => {
                 // A caller that has given up is not an error.
                 let _ = reply.send(view.clone());
             }
+            HubMsg::Subscribe(sink) => {
+                if let Some(s) = &view.snapshot {
+                    // A client that attaches mid-session sees the world at once.
+                    if sink
+                        .try_send(state::Event::Snapshot(Box::new(s.clone())))
+                        .is_err()
+                    {
+                        continue;
+                    }
+                }
+                subscribers.push(sink);
+                view.subscribers = subscribers.len();
+            }
             HubMsg::Close(terminal) => {
+                fan_out(&mut subscribers, state::Event::Closed { terminal });
                 let _ = done.send(terminal);
                 return;
             }
         }
     }
+}
+
+/// Send to every subscriber, dropping the ones that have gone or fallen behind.
+///
+/// There is no unsubscribe message: a stream thread that exits drops its
+/// receiver, and this notices on the next send. One mechanism, and no
+/// bookkeeping that can leak.
+fn fan_out(subscribers: &mut Vec<std::sync::mpsc::SyncSender<state::Event>>, ev: state::Event) {
+    subscribers.retain(|s| s.try_send(ev.clone()).is_ok());
 }
 
 // ---------------------------------------------------------------- serving
@@ -382,6 +434,13 @@ fn handle(ctx: &Ctx, request: Request) {
         return;
     }
 
+    // The event stream takes the socket over rather than returning a response,
+    // so it is routed before anything that produces one.
+    if method == "GET" && path == "/events" {
+        events(ctx, request);
+        return;
+    }
+
     let mut request = request;
     let response = match (method.as_str(), path.as_str()) {
         ("GET", "/health") => health(ctx),
@@ -431,6 +490,78 @@ fn read_json_body<T: serde::de::DeserializeOwned>(request: &mut Request) -> Resu
         return Err(error(413, "body_too_large"));
     }
     serde_json::from_slice(&body).map_err(|_| error(400, "bad_json"))
+}
+
+/// Serve `text/event-stream` on its own thread, for as long as the client reads.
+///
+/// The response is written by hand through `Request::into_writer` rather than
+/// returned as a `Response`, and this is not a stylistic choice. tiny_http's
+/// chunked path is `Encoder::new(writer)` followed by `io::copy` — the encoder
+/// buffers 8 KiB and `io::copy` never flushes, and for an infinite reader it
+/// never returns either, so nothing after it runs. A three-hundred-byte frame
+/// would sit invisible in that buffer until eight kilobytes had accumulated.
+/// The whole point of this stream is that a frame arrives when it happens, so
+/// every frame is followed by an explicit `flush`.
+///
+/// Framing is end-of-body-at-close: no `Content-Length`, no
+/// `Transfer-Encoding`. Legal HTTP/1.1, what every `EventSource` handles, and
+/// three fewer lines of chunk framing to get wrong on a loopback socket with no
+/// intermediaries.
+fn events(ctx: &Ctx, request: Request) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<state::Event>(SSE_QUEUE);
+    if ctx.hub.send(HubMsg::Subscribe(tx)).is_err() {
+        let _ = request.respond(error(503, "hub_gone"));
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let mut w = request.into_writer();
+        let head = "HTTP/1.1 200 OK\r\n\
+                    Content-Type: text/event-stream\r\n\
+                    Cache-Control: no-store\r\n\
+                    Connection: close\r\n\
+                    X-Accel-Buffering: no\r\n\r\n";
+        if w.write_all(head.as_bytes()).is_err() || w.flush().is_err() {
+            return;
+        }
+
+        loop {
+            let frame = match rx.recv_timeout(SSE_HEARTBEAT) {
+                Ok(ev) => {
+                    let name = event_name(&ev);
+                    let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+                    // `event:` mirrors the type tag so a browser can use
+                    // addEventListener; `data:` is the whole event so a client
+                    // that only listens to onmessage is equally correct.
+                    let done = matches!(ev, state::Event::Closed { .. });
+                    let frame = format!("event: {name}\ndata: {data}\n\n");
+                    if w.write_all(frame.as_bytes()).is_err() || w.flush().is_err() {
+                        return;
+                    }
+                    if done {
+                        return;
+                    }
+                    continue;
+                }
+                // A comment line. Invisible to `EventSource`, and the only
+                // reason a silent stream ever notices its client has gone.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ":\n\n".to_string(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            };
+            if w.write_all(frame.as_bytes()).is_err() || w.flush().is_err() {
+                return;
+            }
+        }
+    });
+}
+
+fn event_name(ev: &state::Event) -> &'static str {
+    match ev {
+        state::Event::Snapshot(_) => "snapshot",
+        state::Event::Notice(_) => "notice",
+        state::Event::Heartbeat { .. } => "heartbeat",
+        state::Event::Closed { .. } => "closed",
+    }
 }
 
 /// A verb. The engine answers; this thread only carries the reply back.

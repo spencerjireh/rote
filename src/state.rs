@@ -65,6 +65,9 @@ pub struct Health {
     pub task: String,
     /// `None` before the engine's first publish.
     pub generation: Option<u64>,
+    /// Attached event streams, as of the last published frame rather than as of
+    /// now: a client is only noticed to have gone when a send to it fails, and
+    /// an idle daemon publishes nothing.
     pub subscribers: usize,
     pub uptime_ms: u64,
 }

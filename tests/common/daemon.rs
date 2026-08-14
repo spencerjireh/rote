@@ -150,6 +150,53 @@ impl Drop for Daemon {
     }
 }
 
+/// An open event stream, as an iterator of parsed frames.
+///
+/// Deliberately not buffered by the test either: `Frames` reads line by line,
+/// so a frame that has not left the daemon is a frame this does not see.
+pub struct Stream {
+    pub frames: http::Frames<std::io::BufReader<std::net::TcpStream>>,
+}
+
+impl Daemon {
+    /// Subscribe, using the query token the way `EventSource` has to.
+    pub fn events(&self) -> Stream {
+        use std::io::Write as _;
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", self.port())).unwrap();
+        s.set_read_timeout(Some(WAIT)).unwrap();
+        let req = format!(
+            "GET /events?token={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            self.token(),
+            self.port()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+
+        let mut r = std::io::BufReader::new(s);
+        let (status, headers) = http::read_head(&mut r).unwrap();
+        assert_eq!(status, 200, "the stream should open");
+        assert_eq!(
+            http::header_of(&headers, "Content-Type"),
+            Some("text/event-stream")
+        );
+        Stream {
+            frames: http::Frames::new(r),
+        }
+    }
+}
+
+impl Stream {
+    /// The next frame with this event name, skipping anything else.
+    pub fn next_named(&mut self, name: &str) -> http::Frame {
+        for f in self.frames.by_ref() {
+            let f = f.expect("a readable frame");
+            if f.event.as_deref() == Some(name) {
+                return f;
+            }
+        }
+        panic!("the stream ended before a {name} frame arrived");
+    }
+}
+
 pub fn get(endpoint: &Endpoint, path: &str) -> Option<http::Response> {
     http::send(
         endpoint.port,
