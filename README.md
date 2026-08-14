@@ -65,9 +65,10 @@ rote start "add tagging to posts"
 commands it has verified will run here, so `rote done` checks something from the
 start instead of passing silently. It prints what it chose.
 
-`start` syncs the shadow and hands your pane to claude. Argue with it and run its
-tests, all inside the shadow. When you have what you want, quit claude (or flip
-to a second pane) and open the watcher:
+`start` syncs the shadow, leaves a small daemon watching in the background, and
+hands your pane to claude. Argue with it and run its tests, all inside the
+shadow. When you have what you want, quit claude (or flip to a second pane) and
+open the watcher:
 
 ```
 rote watch     # the loop: shows a hunk, and watches you type it
@@ -76,6 +77,12 @@ rote watch     # the loop: shows a hunk, and watches you type it
 That is the whole loop. There is no command between typing a line and the queue
 moving: rote watches your tree, notices the save, checks what you typed against
 the proposal, and advances to the next hunk on its own.
+
+The watching is done by the background daemon, not by the pane, so it keeps
+going whether or not a pane is open — and you can have as many panes as you
+like, on the same queue. `rote done` and `rote abort` stop it. `[daemon]
+autostart = false` in `.rote.toml` turns the automatic start off; `rote watch`
+then starts one when you need it.
 
 ### The three-pane workflow
 
@@ -107,7 +114,7 @@ re-offered as new ones.
 |---|---|
 | `rote init` | Write a commented `.rote.toml`. `--force` overwrites. |
 | `rote start [TASK…]` | Sync the shadow, open a session, exec claude in it. |
-| `rote watch` | The loop. Watch your tree, classify as you type, advance. |
+| `rote watch` | The loop. Attaches to the background daemon; `--local` runs the engine in this process instead. |
 | `rote status` | State, task, age, shadow path, hunk counts. |
 | `rote next` | Print the hunk at the head of the queue. Display only. |
 | `rote show [HUNK_ID]` | Re-print a hunk, defaulting to the last presented. Display only. |
@@ -183,10 +190,17 @@ model_args = []
 divergence_grace_ms = 2000       # stillness before rote asks about a difference
 debounce_ms = 400                # before re-diffing the trees
 ignore = []                      # extra globs the watcher never wakes for
+
+[daemon]
+autostart = true                 # whether `rote start` leaves one watching
 ```
 
-Both `[review]` and `[watch]` are project-only sections: the global config takes
-flat keys only, so a table there is a parse error.
+`[review]`, `[watch]` and `[daemon]` are project-only sections: the global config
+takes flat keys only, so a table there is a parse error.
+
+The daemon listens on 127.0.0.1 on a port the kernel picks, behind a token
+generated per session. It is what the nvim plugin and the browser front end will
+talk to; `rote watch` already does.
 
 `$ROTE_EDITOR` overrides `editor`. `$EDITOR` is deliberately *not* consulted —
 the open action uses a specific `+LINE` calling convention, and silently
@@ -198,7 +212,9 @@ inheriting a pager is a worse failure than an explicit setting.
 ~/.cache/rote/<hash>/shadow/          the shadow clone
 ~/.local/share/rote/<hash>/
     session.json                      the active session
-    watch.lock                        held while a pane is running
+    watch.lock                        held by whoever owns the queue
+    daemon.json                       where the daemon listens (mode 0600)
+    daemon.log                        its output, if you need to see why
     baseline.patch                    the real tree at session start
     archive/<timestamp>.json          finished sessions
     archive/<timestamp>.patch         the agent's work you never typed

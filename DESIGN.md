@@ -38,10 +38,16 @@ Creates `.rote.toml` in the repo root (see §7). Idempotent; refuses to overwrit
 ### `rote status`
 Prints: state, task, session age, shadow path, and if `transcribing`/`working`: files changed, hunk counts by status (pending / typed / diverged / skipped). Exit code 0 always (informational).
 
-### `rote watch`
-The transcription loop, and the only command in it. Watches the real tree and the shadow, reclassifies on save (§6), advances the queue, and redraws a full-screen pane. There is no command between a keystroke and the queue moving.
+### `rote watch [--local]`
+The transcription loop, and the only command in it. By default it **attaches to
+the daemon** (§13), starting one if none is running; `--local` runs the engine in
+this process instead, for debugging and for a machine where a daemon cannot
+start. Two panes attached to one daemon are ordinary; two `--local` panes are
+refused, because each would run an engine. Watches the real tree and the shadow, reclassifies on save (§6), advances the queue, and redraws a full-screen pane. There is no command between a keystroke and the queue moving.
 
-Refuses while the repository is mid-merge or mid-rebase: every classification would be nonsense and the pane would report it confidently. Holds `watch.lock` for its lifetime, so two panes cannot fight over one queue — that lock is separate from the manifest lock, which the pane takes and releases around every write.
+Refuses while the repository is mid-merge or mid-rebase: every classification would be nonsense and the pane would report it confidently.
+
+Losing the daemon is not fatal: the pane shows a warning notice and reconnects with backoff, re-reading `daemon.json` each attempt because a restarted daemon has a different port. It gives up after 30s and names the log. A `closed` frame is a clean exit instead, with the reason — "session closed" or "session aborted".
 
 Keys: `s` skip, `o` open the configured editor at the anchor, `g` refresh, `q` quit; `k`/`r` answer an open question. Hidden flags `--exit-when-empty` and `--timeout` exist for tests and scripts, so a wedged watcher fails rather than hangs.
 
@@ -368,7 +374,9 @@ The flag names are the one place rote touches Claude Code's surface, so keep the
 8. **Shadow deleted or corrupted mid-session** — recompute detects a missing shadow dir → error instructing `rote abort` then `rote start` again.
 9. **Symlinks in the repo** — copy as symlinks during untracked-file sync; diffing follows git's behavior (link target as content).
 10. **Empty session** (agent changed nothing) — the pane and `next` report the queue empty; `done` short-circuits checks/review with "no changes".
-11. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
+11. **Two engines** — impossible by construction, and the reason the daemon exists in the shape it does. See §13: `watch.lock` is the engine token, and every mutation either holds it or routes to whoever does. Getting this wrong does not merely duplicate work; it fabricates divergence questions about hunks the user never touched, and `reconcile` keeps them forever.
+12. **A question raised, then re-identified** — once the user's own text is in the tree, a recompute re-diffs that region as (theirs → proposal), a different id. A question that has been *written down* survives by content match (§5); one that is still only an armed candidate follows its content onto the new hunk. Without that the disagreement becomes permanently unaskable, because the baseline has already refreshed to include their text and nothing can re-arm.
+13. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
 
 ---
 
@@ -469,6 +477,14 @@ to keep in agreement forever, and they would disagree.
   Deliberately excludes `done`, `abort` and `start`: those confirm interactively
   and `exec`, so they stay CLI-only. And there is no verb that sets a hunk to
   `typed` (§1).
+- `Health` — the handshake: wire and manifest versions, pid, port, project hash,
+  and the session's state. A front end reads this first and can refuse politely
+  rather than misinterpreting a payload it does not understand. `project_hash`
+  is the field a client must check.
+- `HunkDetail` — one hunk in full, from `GET /hunk/<id>`, with its anchor
+  resolved. The other half of `QueueItem` carrying no line bodies. Not a
+  `Presented`: `position` and `total` are meaningless for a typed hunk, and zero
+  is a lie a front end will render.
 - `Request`/`Response` — a request may carry the `generation` it was looking at;
   when present and stale, the response is `stale` with the current generation
   attached, so a client can re-read and re-issue without a round trip to
@@ -477,4 +493,131 @@ to keep in agreement forever, and they would disagree.
 
 `WIRE_VERSION` bumps only when a change would break a client written against the
 old shape. New optional fields and new event variants are additive.
+
+---
+
+## 13. The daemon
+
+### The single-engine invariant
+
+**An `Engine` may be constructed only by a process holding the `watch.lock`
+flock, and it holds that lock unbroken for the engine's whole lifetime.**
+
+Two engines do not duplicate work, they corrupt each other, and the damage is
+user-visible and durable. An engine's authority lives in private in-process
+state — its baselines, its watchdog, its recompute schedule — that no other
+process can see or invalidate. Both classify the same keystroke; one wins the
+compare-and-swap in `commit_typed`; the loser's `typed_any` stays false, so it
+never retakes its baseline, and it goes on to raise a divergence question about
+a hunk the user never touched. `reconcile` keeps hunks with an open question
+across every recompute, so only answering clears it.
+
+The lock is therefore also the routing decision for every mutation:
+
+```
+Lock::try_acquire(watch.lock):
+  acquired -> no engine exists. Mutate directly, holding the guard across
+              the whole cycle.
+  refused  -> an engine exists. Send it a verb over the protocol.
+              Nothing answers -> refuse, naming the pid.
+```
+
+The check *is* the exclusion, which is why it beats consulting `daemon.json`
+first. That file is an **address book, never an authority**: it outlives a
+`kill -9`, and a `--local` pane owns the engine without writing one at all.
+
+### Lifecycle
+
+`rote start` spawns one detached (`setsid`, so it survives the pty that started
+it) and waits for `/health` before `exec`ing claude — the only window in which a
+failure is reportable, since nothing after the exec runs. Failure warns and
+continues. `--no-launch` deliberately does not spawn. `[daemon] autostart =
+false` turns it off; front ends then start one on demand.
+
+`done` and `abort` reap **before** taking the manifest lock, which is before
+`archive_and_clear` and the `shadow::sync` that resets the shadow. Reaping asks
+over HTTP first, so the daemon can broadcast `closed` with the reason — the
+reaper is the only thing that knows it, and it knows it before the archive
+exists. It escalates to SIGTERM then SIGKILL, which is safe because every write
+is an atomic rename and the kernel releases the flock. It refuses to signal a
+pid whose endpoint does not name this project: pids are recycled.
+
+The daemon lives until the session closes. The queue advancing while you type
+with no pane open is most of what it is for.
+
+### The HTTP surface
+
+`127.0.0.1` only, ephemeral port, per-session bearer token; both in
+`daemon.json`, mode 0600, in a state directory that is 0700.
+
+`Authorization: Bearer <token>` on everything, compared in constant time.
+`GET /events` also accepts `?token=`, because `EventSource` cannot set headers.
+`Origin` and `Host`, when present, must be loopback — the second is the
+DNS-rebinding defence, and it costs four lines now versus a CVE the week a
+browser front end ships. **No CORS headers at all**: the webapp will be served
+by this daemon, same-origin. POSTs must be `application/json` (a browser form
+can only send three content types, none of them this one) and cap at 64 KiB.
+
+| Method + path | Success | Failures |
+|---|---|---|
+| `GET /health` | `200` `Health` | `401`, `403` |
+| `GET /state` | `200` `Snapshot` | `401`, `403`, `503 warming_up`, `503 hub_timeout` |
+| `GET /hunk/<id>` | `200` `HunkDetail` | `401`, `403`, `404`, `503 no_session` |
+| `GET /events` | `200 text/event-stream` | `401`, `403` |
+| `POST /command` | `200` `Response` | `400`, `401`, `403`, `413`, `415`, `503 engine_timeout` |
+| `POST /shutdown` | `202` | `400`, `401`, `403`, `415` |
+
+`applied`, `stale` and `rejected` all return **200**. The outcome is the payload
+of a successful conversation, and a client that reads only status codes must not
+confuse a race with a transport failure.
+
+**The generation check happens inside the `with_session` closure**, in the same
+read-modify-write cycle as the mutation. Checking it in the handler and then
+locking to write is a TOCTOU that would make the mechanism decorative. `stale`
+writes nothing and does not move the generation, which is what makes retrying
+exactly once safe.
+
+`GET /state` is the engine's **last published view**, not a fresh read: `drift`
+is engine-only state, so a stateless handler would either omit it or shell out to
+git per request, and could disagree with what every subscriber was just told.
+`generation` is how a client knows how fresh it is.
+
+### The event stream
+
+`event:` mirrors the `type` tag so a browser can `addEventListener("snapshot",
+…)`; `data:` is the whole event, so a client that only listens to `onmessage`
+and parses is equally correct. The first frame after connecting is always the
+cached snapshot — which is why there is **no `Last-Event-ID`, no resume and no
+deltas**: a reconnecting client is never behind. A bare `:` comment every 15s of
+silence proves the socket is alive, and is the only thing that makes a vanished
+client detectable, since without a write there is nothing to fail.
+
+**The response is written by hand through `Request::into_writer`, with an
+explicit flush after every frame.** tiny_http's chunked path is `Encoder::new`
+followed by `io::copy`: the encoder buffers 8 KiB, `io::copy` never flushes, and
+for an infinite reader it never returns either. A small frame would sit invisible
+until eight kilobytes had accumulated.
+
+There is no unsubscribe message — a stream thread that exits drops its receiver
+and the hub prunes on the next send. One mechanism, no bookkeeping that can leak,
+and the consequence is that `Health.subscribers` is as of the last published
+frame rather than as of now.
+
+### Threads
+
+Five kinds, all `std::thread` + `mpsc`, and **no `Arc`, `Mutex`, `RwLock` or
+atomics anywhere**: every piece of state has one owning thread, every interaction
+is a message, and every message that expects an answer has a deadline.
+
+- **main** — the `tiny_http` accept loop, the lock guard, `daemon.json`.
+- **engine** — owns the `Engine` (`Send`, not `Sync`) and its receiver.
+- **hub** — a fan-out actor caching the last snapshot. Separate so `/state` and
+  `/health` are answerable without touching the engine, and so an HTTP request
+  can never block the thread classifying keystrokes.
+- **watcher pump** — unchanged from Stage 1.
+- **event streams** — one per client, blocking.
+
+Shutdown needs no flag: everything that ends the session ends the hub loop.
+`SIGTERM` gets no handler, because atomic renames and a kernel-released flock
+make abrupt death safe by construction.
 

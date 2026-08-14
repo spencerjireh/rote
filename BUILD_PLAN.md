@@ -158,3 +158,31 @@ Edge cases this milestone adds to §9: half-typed saves (6), and the per-region
 untouched rule — an edit anywhere in a file must not accuse the other hunks in
 it.
 
+---
+
+## M9 — the daemon and the protocol
+
+Move the engine into a long-lived daemon serving localhost HTTP + SSE, and make
+`rote watch` a client of it. Merged with what was going to be a separate
+"pane becomes a client" milestone, because shipping a daemon while the pane
+still ran its own engine would have been actively broken — see the
+single-engine invariant in DESIGN §13.
+
+Scope:
+- `src/http.rs` — transport as pure functions over bytes; `src/daemon.rs` —
+  identity, server, spawn, reap, routing.
+- `watch.lock` becomes the engine token, and the routing decision for every
+  mutation.
+- `POST /command` with the generation check inside the `with_session` closure.
+- SSE via `Request::into_writer` with a flush per frame.
+- `rote start` spawns detached and health-waits; `done`/`abort` reap before the
+  shadow sync.
+- `rote skip` / `rote resolve` route to the daemon; `rote watch [--local]`.
+
+Acceptance: `rote start` leaves a daemon watching; two panes attach to it and
+see the same hunk; typing advances the queue in both; `rote skip` from another
+shell moves them; `done` reaps it and the panes say the session closed.
+
+Edge cases this milestone adds to §9: two engines (11) and a question raised
+then re-identified (12).
+

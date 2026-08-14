@@ -10,8 +10,9 @@ Core idea: **the shadow workspace.** Claude Code runs inside a sandbox twin of t
 
 1. **Agent unawareness.** No hooks, no restricted tools, no special instructions injected into the Claude Code session. Claude must behave exactly as it would in a normal repo. `rote` has zero coupling to Claude Code internals; it only sets the working directory Claude is launched in.
 2. **Real tree is sacred.** No code path in `rote` ever writes source files into the real repository. The only writes to the real tree are the user's keystrokes in their editor. rote never opens one as part of the loop — the watch pane offers to, and that is the only invocation. (`rote` may write its own per-project config `.rote.toml` if the user runs `rote init`, and nothing else.)
-3. **Git is plumbing, never surface.** Git provides snapshots, diffs, and file enumeration. The user never sees or types a git command through this tool. All git usage is shelled out and hidden. `rote`'s own state lives outside git.
-4. **The interface is the product.** Sessions, hunks, progress, divergence tracking — all first-class concepts owned by `rote`'s own state, so the plumbing (git) or the frontend can be swapped without changing the workflow contract. Front ends render from one `state::Snapshot` (DESIGN.md §12) and send back verbs; the terminal pane is simply the first one.
+3. **One engine.** Exactly one process may run the watch engine for a project, and it proves that by holding the `watch.lock` flock for the engine's whole lifetime. An engine's authority lives in private in-process state that no other process can see or invalidate, so two of them do not duplicate work — they corrupt each other, fabricating divergence questions about hunks nobody touched. Every mutation therefore either holds that lock or routes to whoever does (DESIGN.md §13).
+4. **Git is plumbing, never surface.** Git provides snapshots, diffs, and file enumeration. The user never sees or types a git command through this tool. All git usage is shelled out and hidden. `rote`'s own state lives outside git.
+5. **The interface is the product.** Sessions, hunks, progress, divergence tracking — all first-class concepts owned by `rote`'s own state, so the plumbing (git) or the frontend can be swapped without changing the workflow contract. Front ends render from one `state::Snapshot` (DESIGN.md §12) and send back verbs; the terminal pane is simply the first one.
 
 ## Tech stack
 
@@ -141,4 +142,6 @@ These are independent invocations; nothing links them.
 
 ## v2 seam
 
-Rendering is a pure function of a `state::Snapshot` (DESIGN.md §12). The watch pane reads no files and consults no manifest — everything it draws arrives in one value, and its keystrokes go out as `state::Command` verbs. Putting a daemon and a socket between the two is therefore a transport swap rather than a rewrite, and any front end that can render a snapshot and send a verb is already a peer.
+That swap has happened. The engine lives in a daemon (`rote daemon`, started for you by `rote start`); `rote watch` is a client of it, and so are the nvim plugin and browser front end when they arrive. Its thread topology is five kinds of thread over `mpsc` with no shared mutable state at all — main accepts, one owns the engine, a hub fans out to subscribers, the watcher pumps, and each event stream blocks on its own.
+
+Rendering is a pure function of a `state::Snapshot` (DESIGN.md §12). The watch pane reads no files and consults no manifest — everything it draws arrives in one value, and its keystrokes go out as `state::Command` verbs. Putting a daemon and a socket between the two was therefore a transport swap rather than a rewrite, and any front end that can render a snapshot and send a verb is a peer.
