@@ -11,7 +11,10 @@
 #
 # On a new release: tag it, push the tag, then `just formula-sha <tag>` and
 # update both the url and the sha256 below. The hash covers GitHub's generated
-# tarball for that tag, so it cannot be computed before the tag exists.
+# tarball for that tag, so it cannot be computed before the tag exists. Those
+# two are the only values to change — the nvim pin in the caveats is derived
+# from `version`, which Homebrew reads back out of the url, so leave it derived
+# rather than writing a tag into it that will go stale one release later.
 class Rote < Formula
   desc "Use Claude Code at full capability; type every line in yourself"
   homepage "https://github.com/spencerjireh/rote"
@@ -31,6 +34,10 @@ class Rote < Formula
   end
 
   def caveats
+    # A --HEAD install tracks main, so pin the plugin to main too; anything else
+    # is a tagged binary and wants the matching tag.
+    pin = build.head? ? %(branch = "main") : %(tag = "v#{version}")
+
     <<~EOS
       rote needs the `claude` CLI to run a session:
         https://docs.claude.com/en/docs/claude-code
@@ -39,13 +46,19 @@ class Rote < Formula
         rote setup     # writes ~/.config/rote/config.toml
         rote doctor    # confirms this machine is ready
 
-      Front ends, all speaking the same protocol:
+      Then, in each repository:
+        rote init                        # writes .rote.toml, shaped to the project
+        rote start "add tagging to posts"
+
+      Front ends onto that session, all speaking the same protocol:
         rote watch         a terminal pane
         rote watch --web   prints a URL; the daemon serves the page itself
 
       For nvim, point a plugin manager at the same repository — this formula
-      installs only the binary:
-        { "spencerjireh/rote", config = function() require("rote").setup({}) end }
+      installs only the binary, and the plugin speaks a wire version that has to
+      match the one it installed:
+        { "spencerjireh/rote", #{pin},
+          config = function() require("rote").setup({}) end }
     EOS
   end
 
