@@ -29,6 +29,21 @@ use anyhow::{Context, Result};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+/// `n` bytes of kernel entropy, hex encoded.
+///
+/// `/dev/urandom` through ordinary file I/O rather than `getrandom`/`rand` (a
+/// dependency for two calls) or `libc::getentropy` (an `unsafe` block, and a
+/// `// Safety:` line, to buy nothing over a read that cannot fail on any
+/// platform rote supports).
+pub fn random_hex(bytes: usize) -> Result<String> {
+    use std::io::Read as _;
+    let mut buf = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .context("cannot read entropy from /dev/urandom")?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Timestamp for manifest fields: RFC 3339 / ISO 8601 extended, UTC.
 pub fn now_iso8601() -> String {
     OffsetDateTime::now_utc()

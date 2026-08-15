@@ -234,6 +234,7 @@ mod tests {
             state: State::Transcribing,
             task: task.into(),
             created_at: "2026-01-01T00:00:00Z".into(),
+            session_id: "test-session".into(),
             project_root: "/p".into(),
             shadow_dir: "/s".into(),
             baseline: BaselineRecord {

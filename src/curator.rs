@@ -52,7 +52,7 @@ pub struct Entry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cache {
     pub version: u32,
-    /// The session this belongs to, copied from `Manifest::created_at`.
+    /// The session this belongs to, from `Manifest::session_stamp`.
     ///
     /// Load-bearing. Clearing the file at `done`/`abort` is not enough: an
     /// `abort` reaps the daemon best-effort, and a `rote watch --local` pane
@@ -216,6 +216,7 @@ mod tests {
             generation: 0,
             task: "t".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
+            session_id: "test-session".into(),
             state: State::Transcribing,
             project_root: "/repo".into(),
             shadow_dir: "/shadow".into(),

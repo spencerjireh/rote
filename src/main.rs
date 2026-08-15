@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rote::config::{self, Config};
+use rote::curator;
 use rote::daemon;
 use rote::detect;
 use rote::git;
@@ -1146,6 +1147,10 @@ fn cmd_start(
         let _lock = Lock::acquire(&project.lock_path())?;
         project.ensure_state_dir()?;
         manifest.save(project)?;
+        // Tidiness only. A curation left by a pane that outlived the last
+        // teardown is already inert, because it is stamped with that session's
+        // created_at and this one's will not match.
+        curator::Cache::remove(project);
     }
 
     if !task.is_empty() && !quiet {

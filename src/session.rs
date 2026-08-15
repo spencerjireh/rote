@@ -68,6 +68,15 @@ pub struct Manifest {
     pub state: State,
     pub task: String,
     pub created_at: String,
+    /// Unique to this session, minted at `start`.
+    ///
+    /// `created_at` is second-resolution, so it cannot serve as identity: two
+    /// sessions opened in the same second would share it, and anything keyed off
+    /// a session — the curation cache, today — would believe the previous
+    /// session's file. Empty on a manifest written before this field existed;
+    /// `session_stamp` handles that.
+    #[serde(default)]
+    pub session_id: String,
     pub project_root: String,
     pub shadow_dir: String,
     pub baseline: BaselineRecord,
@@ -93,6 +102,9 @@ impl Manifest {
             state: State::Working,
             task,
             created_at: crate::now_iso8601(),
+            // A failure here is not worth refusing to start a session over: the
+            // timestamp is a weaker identity, not no identity.
+            session_id: crate::random_hex(8).unwrap_or_default(),
             project_root: project.repo_root.to_string_lossy().into_owned(),
             shadow_dir: project.shadow_dir.to_string_lossy().into_owned(),
             baseline: baseline.into(),
@@ -100,6 +112,20 @@ impl Manifest {
             generation: 0,
             last_presented: None,
             terminal: None,
+        }
+    }
+
+    /// What anything keyed off this session should stamp itself with.
+    ///
+    /// Falls back to `created_at` for a manifest written before `session_id`
+    /// existed, so a session opened by an older rote and continued by a newer
+    /// one still gets *some* identity rather than an empty one that every stale
+    /// file would match.
+    pub fn session_stamp(&self) -> &str {
+        if self.session_id.is_empty() {
+            &self.created_at
+        } else {
+            &self.session_id
         }
     }
 
@@ -311,6 +337,20 @@ pub fn recompute(
     // Rule 1: the fresh truth from the trees.
     let fresh = compute_hunks(project, cfg)?;
     let mut report = reconcile(manifest, fresh, cfg.strict_whitespace);
+
+    // Curator state is restored here rather than carried through `reconcile`,
+    // and the split is deliberate. `reconcile` matches on `id`, which folds in
+    // surrounding context — so typing within three lines of a hunk drops the old
+    // entry (rule 5) and appends its replacement with `curator_note: None`. That
+    // happens constantly while the user works. The cache is keyed by `key`,
+    // which ignores context, so re-applying it after the rules have run is what
+    // makes a note survive its hunk being re-identified.
+    //
+    // Do not "fix" this by teaching `reconcile` about the cache: that would put
+    // the id dependency back and make the rules impure, and they are tested as a
+    // pure function over (manifest, fresh) for good reasons.
+    crate::curator::Cache::load(project, manifest.session_stamp()).apply(manifest);
+
     promote_state(manifest);
 
     report.drift = drift;
@@ -530,6 +570,16 @@ pub fn archive_and_clear(
     bytes.push(b'\n');
     write_atomic(&manifest_path, &bytes)?;
 
+    // File the curation beside the manifest, then drop the live copy. Both are
+    // best effort and neither is what makes a stale cache safe — the `session`
+    // stamp inside it is, because a `--local` pane can outlive this teardown and
+    // write the file again a moment after it is removed.
+    let cache = crate::curator::Cache::load(project, manifest.session_stamp());
+    if !cache.entries.is_empty() {
+        let _ = cache.archive_to(&dir, &slug);
+    }
+    crate::curator::Cache::remove(project);
+
     // Clearing session.json is what returns the project to idle.
     let live = project.session_json();
     match std::fs::remove_file(&live) {
@@ -610,6 +660,7 @@ mod tests {
             state: State::Transcribing,
             task: "t".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
+            session_id: "test-session".into(),
             project_root: "/tmp/p".into(),
             shadow_dir: "/tmp/s".into(),
             baseline: BaselineRecord {
@@ -892,6 +943,38 @@ mod tests {
         // And an unranked hunk sorts after every ranked one.
         let order: Vec<_> = m.queue_view().iter().map(|h| h.file.clone()).collect();
         assert_eq!(order, vec!["zzz.rs", "aaa.rs"]);
+    }
+
+    #[test]
+    fn reconcile_leaves_curator_fields_empty_and_recompute_is_what_restores_them() {
+        // Documenting the split so nobody later "fixes" it by teaching
+        // `reconcile` about the cache. Doing that would put the id dependency
+        // back — the cache is keyed by `key` precisely because ids move — and
+        // would make these rules impure, which is the property every test above
+        // this line relies on.
+        let mut curated = hunk("aaa", Status::Pending);
+        curated.curator_note = Some("kept".into());
+        let mut m = manifest_with(vec![curated.clone()]);
+
+        // The same hunk still in the trees, plus one the agent just added.
+        reconcile(
+            &mut m,
+            vec![curated.clone(), hunk("zzz", Status::Pending)],
+            false,
+        );
+
+        assert_eq!(m.hunks.len(), 2);
+        assert_eq!(
+            m.find(&curated.id).unwrap().curator_note.as_deref(),
+            Some("kept"),
+            "an id that still matches keeps its own object, note and all"
+        );
+        let added = m.hunks.iter().find(|h| h.file == "zzz.rs").unwrap();
+        assert_eq!(
+            (added.curator_note.as_deref(), added.curator_rank),
+            (None, None),
+            "but a hunk arriving from the trees is uncurated — `recompute` applies the cache after"
+        );
     }
 
     // ------------------------------------------------ unanswered divergence

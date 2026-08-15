@@ -63,6 +63,67 @@ fn recompute_builds_the_queue_from_the_trees() {
 }
 
 #[test]
+fn a_curator_note_survives_the_edit_that_re_identifies_its_hunk() {
+    // The reason the cache exists at all. A hunk's id folds in its surrounding
+    // context, so typing a neighbour re-identifies it: `reconcile` drops the old
+    // entry under rule 5 and appends the replacement with `curator_note: None`.
+    // `key` ignores context, so the cache still recognises it.
+    // Adjacent on purpose: once the first hunk is typed, its added line becomes
+    // a line both trees share, so it turns into *context* for the second hunk.
+    // That is the whole mechanism — the neighbour's id moves without the
+    // neighbour changing.
+    let (fx, cfg, mut manifest) = started(
+        "fn a() {\n}\nfn b() {\n}\n",
+        "fn a() {\n    one();\n}\nfn b() {\n    two();\n}\n",
+    );
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+    assert_eq!(manifest.pending().count(), 2, "two separate hunks");
+
+    // Curate the second one.
+    let second = manifest
+        .queue_view()
+        .iter()
+        .find(|h| h.new_lines == vec!["    two();"])
+        .map(|h| (*h).clone())
+        .expect("the second hunk");
+    let mut cache = rote::curator::Cache::new(manifest.session_stamp());
+    cache.entries.insert(
+        second.key.clone(),
+        rote::curator::Entry {
+            rank: Some(1),
+            note: Some("type this after one()".into()),
+        },
+    );
+    cache.save(&project).unwrap();
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+    assert_eq!(
+        manifest.find(&second.id).unwrap().curator_note.as_deref(),
+        Some("type this after one()"),
+        "recompute is what applies the cache"
+    );
+
+    // Now type the *first* hunk. That rewrites the file, which changes the
+    // second hunk's context and therefore its id.
+    fx.write("a.rs", "fn a() {\n    one();\n}\nfn b() {\n}\n");
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+
+    let now = manifest
+        .pending()
+        .find(|h| h.new_lines == vec!["    two();"])
+        .expect("the second hunk is still pending");
+    assert_ne!(now.id, second.id, "it really was re-identified");
+    assert_eq!(now.key, second.key, "but it is the same change");
+    assert_eq!(
+        now.curator_note.as_deref(),
+        Some("type this after one()"),
+        "and it kept the note the manifest could not have carried"
+    );
+    assert_eq!(now.curator_rank, Some(1));
+}
+
+#[test]
 fn typing_a_hunk_retires_it_from_the_queue() {
     // The self-truing property: recompute needs no help to notice.
     let (fx, cfg, mut manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");

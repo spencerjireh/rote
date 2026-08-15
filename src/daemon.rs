@@ -21,7 +21,6 @@ use crate::watcher;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
-use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Request, Response, ResponseBox, Server};
@@ -131,21 +130,8 @@ impl Endpoint {
 }
 
 /// A fresh session token: 32 bytes of kernel entropy, hex encoded.
-///
-/// `/dev/urandom` through ordinary file I/O rather than `getrandom`/`rand`
-/// (a dependency for one call) or `libc::getentropy` (an `unsafe` block, and a
-/// `// Safety:` line, to buy nothing over a read that cannot fail on any
-/// platform rote supports).
 pub fn mint_token() -> Result<String> {
-    let mut buf = [0u8; TOKEN_BYTES];
-    read_exact(Path::new("/dev/urandom"), &mut buf)
-        .context("cannot read entropy from /dev/urandom")?;
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-fn read_exact(path: &Path, buf: &mut [u8]) -> std::io::Result<()> {
-    use std::io::Read as _;
-    std::fs::File::open(path)?.read_exact(buf)
+    crate::random_hex(TOKEN_BYTES)
 }
 
 // ------------------------------------------------- finding, starting, ending
@@ -1002,7 +988,7 @@ mod tests {
     use super::*;
     use crate::watcher::Filter;
 
-    fn project(dir: &Path) -> ProjectPaths {
+    fn project(dir: &std::path::Path) -> ProjectPaths {
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         ProjectPaths::resolve_in(&repo, &dir.join("cache"), &dir.join("data")).unwrap()

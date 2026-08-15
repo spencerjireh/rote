@@ -209,6 +209,92 @@ fn pending_hunks_require_consent_and_become_skipped() {
     assert!(!cli.fx.project().session_json().exists());
 }
 
+/// Start a session with one pending hunk and a curation already recorded for it.
+fn session_with_a_curation(cli: &Cli) -> rote::curator::Cache {
+    let (stub, _) = stub_claude(cli.fx.root.path(), "claude-stub", "ok", 0);
+    cli.use_claude_stub(&stub);
+    cli.run(&["start", "--no-launch", "t"]);
+    std::fs::write(cli.shadow().join("a.rs"), "fn a() {\n    work();\n}\n").unwrap();
+    cli.run(&["next", "--json"]); // builds the queue
+
+    let project = cli.fx.project();
+    let manifest = rote::session::Manifest::load(&project).unwrap().unwrap();
+    let key = manifest.head_of_queue().unwrap().key.clone();
+
+    let mut cache = rote::curator::Cache::new(manifest.session_stamp());
+    cache.entries.insert(
+        key,
+        rote::curator::Entry {
+            rank: Some(1),
+            note: Some("the thing everything else needs".into()),
+        },
+    );
+    cache.save(&project).unwrap();
+    cache
+}
+
+#[test]
+fn closing_a_session_files_the_curator_cache_with_the_archive() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    session_with_a_curation(&cli);
+
+    let closed = cli.run_with_input(&["done", "--no-checks", "--no-review"], "y\ny\n");
+    assert!(closed.status.success(), "{}", stderr(&closed));
+
+    let project = cli.fx.project();
+    assert!(
+        !project.curator_json().exists(),
+        "the live curation goes with the session"
+    );
+    let entries: Vec<String> = std::fs::read_dir(project.archive_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        entries.iter().any(|e| e.ends_with(".curator.json")),
+        "and it is filed beside the manifest: {entries:?}"
+    );
+}
+
+#[test]
+fn a_curator_cache_left_by_an_aborted_session_is_not_believed_by_the_next_one() {
+    // The silent-wrong-order case. `abort` reaps the daemon best-effort, and a
+    // `rote watch --local` pane has no daemon.json to reap — so its engine can
+    // write the file again after the teardown removed it. If the next session
+    // trusted that, it would inherit a teaching order built for a different set
+    // of hunks and never re-curate, because every key would look considered.
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    let stale = session_with_a_curation(&cli);
+
+    let out = cli.run_with_input(&["abort"], "y\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    cli.run(&["start", "--no-launch", "second"]);
+    std::fs::write(cli.shadow().join("a.rs"), "fn a() {\n    work();\n}\n").unwrap();
+
+    // Only now does the pane that outlived the teardown get around to writing.
+    // Ordering matters: `start` deletes the file, so a write *before* it proves
+    // nothing — this has to land inside the new session's lifetime, which is
+    // exactly what a detached process does.
+    let project = cli.fx.project();
+    stale.save(&project).unwrap();
+    cli.run(&["next", "--json"]);
+
+    let manifest = rote::session::Manifest::load(&project).unwrap().unwrap();
+    let head = manifest.head_of_queue().unwrap();
+    assert_eq!(
+        head.curator_note, None,
+        "same hunk, same key — and still no note, because the stamp does not match"
+    );
+    assert_eq!(head.curator_rank, None);
+}
+
 #[test]
 fn the_residue_patch_holds_what_was_skipped() {
     let fx = Fixture::new();
