@@ -14,6 +14,7 @@ pub mod engine;
 pub mod git;
 pub mod http;
 pub mod hunks;
+pub mod model;
 pub mod pane;
 pub mod paths;
 pub mod present;

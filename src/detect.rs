@@ -5,11 +5,11 @@
 //! write. `doctor` renders the reports, `setup` and `init` act on them.
 
 use crate::config::Config;
+use crate::model;
 use crate::present;
-use crate::review::REVIEWER_TOOL_FLAGS;
-use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Look up an executable the way a shell would.
 ///
@@ -53,7 +53,7 @@ impl ClaudeReport {
 
 /// The flag name rote passes to restrict the reviewer's tools.
 fn tool_flag_name() -> &'static str {
-    REVIEWER_TOOL_FLAGS.first().copied().unwrap_or("--tools")
+    model::TOOL_FLAGS.first().copied().unwrap_or("--tools")
 }
 
 /// Resolve claude and check the reviewer flag it will be handed.
@@ -87,40 +87,39 @@ pub fn probe_claude(cfg: &Config) -> ClaudeReport {
     }
 }
 
+/// How long the probe gets. Shorter than the reviewer's: this asks for four
+/// words, and `doctor` is something you run while waiting for it.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Actually run the reviewer path once, end to end.
 ///
 /// Costs a token spend, so it is only reached via `rote doctor --deep`.
 pub fn deep_probe_claude(cfg: &Config, report: &mut ClaudeReport) {
-    use std::io::Write as _;
-
     let Some(path) = report.resolved.clone() else {
         report.deep_ok = Some(false);
         return;
     };
-    let args = &cfg.claude_cmd[1..];
+    // The resolved path, then whatever the configured command carried after its
+    // program name.
+    let mut cmd = vec![path.to_string_lossy().into_owned()];
+    cmd.extend_from_slice(&cfg.claude_cmd[1..]);
 
-    let run = || -> Result<bool> {
-        let mut child = Command::new(&path)
-            .args(args)
-            .arg("-p")
-            .arg("Reply with exactly: ROTE OK")
-            .args(REVIEWER_TOOL_FLAGS)
-            .args(&cfg.review_model_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("no stdin"))?
-            .write_all(b"probe\n")?;
-        drop(child.stdin.take());
-        let out = child.wait_with_output()?;
-        Ok(out.status.success())
-    };
+    // Through `model::run` rather than a second hand-rolled spawn. The copy this
+    // replaces had no timeout at all, so `doctor --deep` against a wedged claude
+    // hung for as long as you left it.
+    let ok = model::run(
+        &model::Invocation {
+            claude_cmd: &cmd,
+            prompt: "Reply with exactly: ROTE OK",
+            extra_args: &cfg.review_model_args,
+            timeout: PROBE_TIMEOUT,
+        },
+        "probe\n",
+    )
+    .map(|out| out.status.success())
+    .unwrap_or(false);
 
-    report.deep_ok = Some(run().unwrap_or(false));
+    report.deep_ok = Some(ok);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

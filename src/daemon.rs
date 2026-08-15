@@ -153,7 +153,7 @@ fn read_exact(path: &Path, buf: &mut [u8]) -> std::io::Result<()> {
 /// How long to wait for a freshly spawned daemon to answer.
 pub const SPAWN_WAIT: Duration = Duration::from_secs(3);
 
-/// Poll interval while waiting for one. House style: `review::wait_with_timeout`.
+/// Poll interval while waiting for one. House style: `model::run`.
 const SPAWN_POLL: Duration = Duration::from_millis(25);
 
 /// How long a reaped daemon gets to exit on its own before it is signalled.

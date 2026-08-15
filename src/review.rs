@@ -3,12 +3,12 @@
 use crate::config::Config;
 use crate::git;
 use crate::hunks::Status;
+use crate::model;
 use crate::paths::ProjectPaths;
 use crate::session::Manifest;
 use anyhow::{Context, Result};
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 /// The reviewer's instructions. A constant so the payload is reproducible.
@@ -19,17 +19,6 @@ to the manual divergences: distinguish deliberate refactors from likely transcri
 explicitly with file and line. Note anything a skipped hunk leaves broken. Be terse. Do not \
 explain concepts. Output findings as a flat list ordered by severity; if nothing is wrong, say \
 so in one line.";
-
-/// Tool-restriction flags for the reviewer invocation.
-///
-/// This is the one place rote touches Claude Code's flag surface, so it lives in
-/// a single named constant and is expected to need updating across CLI versions.
-/// It is what makes ARCHITECTURE.md's "never gets filesystem access" true: an
-/// empty cwd alone would not stop `claude -p` reading whatever it liked.
-///
-/// Principle 1 is unaffected — that governs the *session* agent, which rote
-/// launches completely unconfigured.
-pub const REVIEWER_TOOL_FLAGS: &[&str] = &["--tools", ""];
 
 /// How long the reviewer gets before rote gives up and moves on.
 pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(300);
@@ -186,63 +175,25 @@ pub fn run_reviewer(cfg: &Config, payload: &str) -> Option<String> {
 }
 
 fn try_reviewer(cfg: &Config, payload: &str) -> Result<String> {
-    // An empty temp cwd: the reviewer runs in neither tree.
-    let scratch = tempfile::tempdir().context("cannot create a temp cwd for the reviewer")?;
-
-    let (program, base_args) = cfg
-        .claude_cmd
-        .split_first()
-        .context("claude_cmd is empty")?;
-    let mut cmd = Command::new(program);
-    cmd.args(base_args)
-        .arg("-p")
-        .arg(REVIEW_PROMPT)
-        .args(REVIEWER_TOOL_FLAGS)
-        .args(&cfg.review_model_args)
-        .current_dir(scratch.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("cannot run `{}`", cfg.claude_cmd.join(" ")))?;
-    child
-        .stdin
-        .as_mut()
-        .context("reviewer stdin unavailable")?
-        .write_all(payload.as_bytes())
-        .context("cannot write the payload to the reviewer")?;
-    drop(child.stdin.take());
-
-    let out = wait_with_timeout(child, REVIEW_TIMEOUT)?;
+    // The session diff runs to hundreds of kilobytes on an ordinary session, so
+    // this call is the one that used to deadlock: see `model::run`.
+    let out = model::run(
+        &model::Invocation {
+            claude_cmd: &cfg.claude_cmd,
+            prompt: REVIEW_PROMPT,
+            extra_args: &cfg.review_model_args,
+            timeout: REVIEW_TIMEOUT,
+        },
+        payload,
+    )?;
     if !out.status.success() {
         anyhow::bail!(
             "exit {}: {}",
             out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).trim()
+            out.complaint()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Wait for a child, killing it if it outstays the deadline.
-fn wait_with_timeout(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_) => return Ok(child.wait_with_output()?),
-            None if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("timed out after {}s", timeout.as_secs());
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
+    Ok(out.stdout)
 }
 
 /// Where the archived residue patch for this session will land, for messaging.

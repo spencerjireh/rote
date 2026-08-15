@@ -5,6 +5,7 @@ use rote::daemon;
 use rote::detect;
 use rote::git;
 use rote::hunks::Status;
+use rote::model;
 use rote::pane;
 use rote::paths::{self, Lock, ProjectPaths};
 use rote::present::{self, Classification};
@@ -380,10 +381,7 @@ fn cmd_doctor(cli: &Cli, cfg: &Config, deep: bool, color: bool) -> Result<ExitCo
     match &claude.resolved {
         Some(path) => {
             checks.push(Check::ok("claude", tilde(path)));
-            let flag = review::REVIEWER_TOOL_FLAGS
-                .first()
-                .copied()
-                .unwrap_or("--tools");
+            let flag = model::TOOL_FLAGS.first().copied().unwrap_or("--tools");
             match claude.tool_flag_supported {
                 Some(true) => checks.push(Check::ok(
                     "reviewer tools",

@@ -87,6 +87,55 @@ fn doctor_passes_when_everything_resolves() {
 }
 
 #[test]
+fn doctor_deep_reports_a_claude_that_answers_badly() {
+    // `--deep` had no integration coverage at all, which is how it kept a
+    // hand-rolled spawn with no timeout on it. The ceiling itself is proven by
+    // `model::run`'s unit tests — asserting it here would cost the suite a full
+    // PROBE_TIMEOUT. This proves the path is wired and that a bad answer is
+    // reported rather than assumed fine.
+    let r = Cli::new();
+    r.fx.write("a.rs", "fn a() {}\n");
+    r.fx.commit_all("initial");
+    r.fx.write(".rote.toml", "[checks]\ncommands = [\"true\"]\n");
+
+    // `--help` advertises the flag, so the cheap check passes; the `-p`
+    // invocation fails, so only the deep check can catch it.
+    let stub = r.bin.join("claude-stub");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         case \"$1\" in --help) echo '  --tools <tools...>'; exit 0;; esac\n\
+         cat > /dev/null\n\
+         echo 'model unavailable' >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &stub,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(r.global_config().parent().unwrap()).unwrap();
+    std::fs::write(
+        r.global_config(),
+        format!("claude_cmd = [\"{}\"]\neditor = \"sh\"\n", stub.display()),
+    )
+    .unwrap();
+
+    let out = r.run(&["doctor", "--deep"]);
+    let text = stdout(&out);
+    assert!(
+        !out.status.success(),
+        "a reviewer that cannot answer is a failing doctor: {text}"
+    );
+    assert!(
+        text.contains("reviewer probe") && text.contains("invocation failed"),
+        "and it names the probe rather than blaming something else: {text}"
+    );
+}
+
+#[test]
 fn a_missing_editor_no_longer_fails_doctor() {
     // rote does not launch an editor as part of the loop any more — it only
     // offers to, from the `o` key in the watch pane. A machine without one

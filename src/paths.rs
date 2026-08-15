@@ -315,7 +315,7 @@ struct LockInfo {
 
 /// How long `acquire` will wait for a holder to finish before giving up.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Poll interval while waiting. House style: `review::wait_with_timeout`.
+/// Poll interval while waiting. House style: `model::run`.
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Guards manifest read-modify-write cycles. Held across the whole cycle by

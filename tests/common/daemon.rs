@@ -19,7 +19,7 @@ pub const TIMEOUT_MS: u64 = 20_000;
 /// How long a `wait_until` will keep trying.
 pub const WAIT: Duration = Duration::from_secs(10);
 
-/// Poll interval. House style: `review::wait_with_timeout`.
+/// Poll interval. House style: `model::run`.
 const POLL: Duration = Duration::from_millis(25);
 
 /// How long to let a recursive watch take effect before writing to the tree.
