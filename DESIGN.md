@@ -75,6 +75,9 @@ Marks a hunk `skipped`, defaulting to the active one. Skip is **durable**: a ski
 ### `rote report <HUNK_ID> typed|pasted`
 Records how a hunk's content arrived (§6). Changes no status and moves nothing in the queue; it exists so a user with no editor plugin can correct what the engine could not observe, and so one whose plugin guessed wrong can correct it back. Last write wins.
 
+### `rote endpoint [--json] [--token] [--ensure]`
+Prints where the daemon is listening, for a front end that is not the pane. The human form withholds the token — that is the form that ends up in scrollback and on a shared screen — and `--json` / `--token` print it, because the only consumer of a token is a program capturing stdout. Gating on a tty instead would break `rote endpoint --json | jq` in exactly the configuration where someone is debugging. `--json` prints an object on failure too (`no_session`, `no_daemon`, `opaque_owner`) so a caller can parse stdout unconditionally. `--ensure` starts a daemon, explicitly overriding `[daemon] autostart = false`, which is about *implicit* spawning at `start`.
+
 ### `rote talk`
 Prints the shadow path and, with `--attach`, execs `claude --continue` (configurable) in the shadow so the user can resume arguing with the session agent.
 
@@ -496,7 +499,8 @@ Identical to the reviewer's: `model::TOOL_FLAGS`, an empty temp cwd, and a hard 
 16. **A hunk half-typed then pasted** — the in-progress observation stands and the verdict is `typed`. Deliberate: the inference proves a human was in the loop, not that every character was typed, and it is stated that way in §6 rather than quietly overclaimed.
 17. **A daemon restarted mid-hunk** — the typing evidence is in memory and goes with the process, so that hunk degrades to `unknown`, never to `pasted`. Persisting it would be a fourth on-disk artifact with its own version and session stamps for an advisory counter that gates nothing.
 18. **A hunk re-identified mid-typing** — a floor sweep re-diffs the region as (half-typed → proposal), which changes `old_lines` and therefore the `key` too, so the evidence is lost and the next save re-creates it. The window is one save and the cost is `unknown`, which is why the record is keyed by `key` and not by a proposal-only hash: the latter would survive this but would alias two hunks in one file with identical `new_lines`, turning "typed the first, pasted the second" into a false `typed`. A false negative is the right failure.
-19. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
+19. **A paste outside the active hunk's region** — not reported, and the verdict stays `unknown`. The active hunk is the only one whose id a front end holds reliably: `QueueItem` carries `anchor_hint`, which is where a hunk was at the last recompute rather than where it is now. Attributing a paste to the wrong hunk is worse than attributing it to none.
+20. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
 
 ---
 
@@ -524,6 +528,14 @@ src/
   http.rs          # transport as pure functions over bytes
   pane.rs          # the terminal front end, local or client
 ```
+
+Plus `lua/rote/` and `plugin/rote.lua`: the nvim front end, and the repository's
+first non-Rust artifacts. It reads the event stream over a raw `vim.uv` socket
+and issues every mutation by running `rote`, which already decides for itself
+whether to mutate directly or send a verb (§13) — so the plugin never holds a
+token, never builds a request body, and cannot disagree with the CLI about what
+a verb means. The binary is unaffected: it still ships as one file with no
+runtime assets, and a plugin manager installs the Lua.
 
 Unit-test targets (minimum): diffparse (fixture diffs incl. new/deleted/binary/no-newline), hunk splitting, anchor matching (drifted files), reconciliation scenarios (typed/diverged/reworked/new), sync round-trip on a fixture repo (integration test using a temp git repo).
 

@@ -70,3 +70,15 @@ brew-reinstall:
 # Not worth it to lint one formula. If you do run it, expect to clean up after.
 brew-check:
     ruby -c Formula/rote.rb
+
+# Lint the nvim plugin, if the tools are installed.
+#
+# Deliberately not part of `gate`, and never in .rote.toml's [checks] — those
+# run at `rote done` on other people's machines, where stylua is not a
+# reasonable thing to require.
+lua-lint:
+    #!/usr/bin/env sh
+    if command -v stylua > /dev/null; then stylua --check lua plugin; \
+    else echo "stylua not installed — skipping"; fi
+    if command -v luacheck > /dev/null; then luacheck lua plugin; \
+    else echo "luacheck not installed — skipping"; fi

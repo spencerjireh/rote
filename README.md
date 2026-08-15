@@ -114,6 +114,27 @@ entirely, and `[curator] enabled = false` in either config file turns it off for
 good — in `~/.config/rote/config.toml` if you would rather rote never spent
 tokens on its own.
 
+### Inside nvim
+
+If you would rather not have a separate pane, the plugin in `lua/` is the same
+front end without leaving the editor:
+
+```lua
+{ "spencerjireh/rote", config = function() require("rote").setup({}) end }
+```
+
+`:Rote` opens a panel showing the current hunk with its curator note. The queue
+advances as you type and the panel follows, and the cursor moves to each new
+hunk — but never while you are in insert mode, and never when it is already
+inside the hunk you are typing. `s`, `k`, `r` and `g` do what they do in the
+pane. `:help rote` has the rest.
+
+The plugin also tells rote when content arrived by paste, which is the one thing
+nothing outside your editor can see. That is the whole of what it adds over the
+terminal pane, and it is why the count at `done` means anything.
+
+Note the binary is installed separately — a plugin manager only takes the Lua.
+
 ### The three-pane workflow
 
 The intended shape, in ghostty or any splittable terminal: claude on the left,
@@ -292,10 +313,10 @@ restriction flags on the two separate headless calls — the curator, and the
 reviewer at `done`. The session agent is unconfigured and cannot tell it is being
 shadowed.
 
-Also out of scope for now: multiple concurrent sessions, non-git projects, paste
-prevention (honor system), Windows, and telemetry of any kind. The nvim plugin
-and the browser front end are planned, and will speak the same protocol
-`rote watch` already renders from.
+Also out of scope for now: multiple concurrent sessions, non-git projects,
+Windows, and telemetry of any kind. Paste *prevention* is not planned either —
+rote records how a hunk arrived and says so when the session closes, but it will
+never withhold text or refuse a paste.
 
 ## Development
 

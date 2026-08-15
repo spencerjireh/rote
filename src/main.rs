@@ -111,6 +111,19 @@ enum Command {
         input: Arrival,
     },
 
+    /// Where the daemon is listening, for a front end that wants to attach.
+    Endpoint {
+        /// Machine-readable, including the token.
+        #[arg(long)]
+        json: bool,
+        /// Print the bare token and nothing else.
+        #[arg(long)]
+        token: bool,
+        /// Start a daemon if none is running.
+        #[arg(long)]
+        ensure: bool,
+    },
+
     /// Watch your tree and classify as you type. The transcription loop.
     Watch {
         /// Run the engine in this process instead of attaching to a daemon.
@@ -315,6 +328,11 @@ fn run() -> Result<ExitCode> {
             cmd_report(&project, &hunk_id, input)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Endpoint {
+            json,
+            token,
+            ensure,
+        } => cmd_endpoint(&project, json, token, ensure),
         Command::Watch {
             local,
             headless,
@@ -1124,6 +1142,100 @@ fn cmd_resolve(project: &ProjectPaths, hunk_id: &str, choice: Resolution) -> Res
     }
     Ok(())
 }
+/// Print where a daemon is listening, so a front end can attach to it.
+///
+/// The token is withheld from the human form and printed by the machine ones,
+/// which is the opposite of the usual instinct and is deliberate: the only
+/// consumer of a token is a program capturing stdout, and the exposure worth
+/// defending against is a terminal someone is looking at or sharing. Gating on
+/// a tty instead would break `rote endpoint --json | jq` in exactly the
+/// configuration where someone is debugging.
+///
+/// `--json` always prints a JSON object, including on failure, so a caller can
+/// parse stdout unconditionally rather than switching on the exit code first.
+fn cmd_endpoint(project: &ProjectPaths, json: bool, token: bool, ensure: bool) -> Result<ExitCode> {
+    let fail = |error: &str, pid: Option<u32>| -> Result<ExitCode> {
+        if json {
+            let mut body = serde_json::json!({ "ok": false, "error": error });
+            if let Some(p) = pid {
+                body["pid"] = serde_json::json!(p);
+            }
+            println!("{body}");
+        } else {
+            eprintln!("{}", endpoint_advice(error, pid));
+        }
+        Ok(ExitCode::FAILURE)
+    };
+
+    if Manifest::load(project)?.is_none() {
+        return fail("no_session", None);
+    }
+
+    // `--ensure` overrides `[daemon] autostart = false`, which is about
+    // *implicit* spawning at `start`. Asking for an address is explicit.
+    let found = if ensure {
+        daemon::ensure_running(project).ok()
+    } else {
+        daemon::discover(project)
+    };
+
+    let Some(ep) = found else {
+        // A `rote watch --local` pane owns the engine and publishes no address
+        // at all, so "no daemon" would be a lie. Say which it is.
+        return match daemon::owner(project)? {
+            daemon::Owner::Opaque { pid } => fail("opaque_owner", pid),
+            _ => fail("no_daemon", None),
+        };
+    };
+
+    if token {
+        println!("{}", ep.token);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "url": ep.base_url(),
+                "port": ep.port,
+                "token": ep.token,
+                "project_hash": ep.project_hash,
+                "repo_root": ep.repo_root,
+                "pid": ep.pid,
+                "wire_version": ep.wire_version,
+                "rote_version": ep.rote_version,
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // The human form. No token: this is the one that ends up in scrollback and
+    // on a shared screen.
+    let state = Manifest::load(project)?
+        .map(|m| m.state.to_string())
+        .unwrap_or_else(|| "idle".into());
+    println!("url:    {}", ep.base_url());
+    println!("pid:    {}", ep.pid);
+    println!("hash:   {}", ep.project_hash);
+    println!("state:  {state}");
+    println!("\ntoken withheld. `rote endpoint --token` prints it.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn endpoint_advice(error: &str, pid: Option<u32>) -> String {
+    match error {
+        "no_session" => "no active session.\nRun `rote start \"what you're working on\"` to begin one.".into(),
+        "opaque_owner" => format!(
+            "something owns this project's queue but does not serve HTTP{}.\n\
+             A `rote watch --local` pane does that. Quit it, or attach to that pane instead.",
+            pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+        ),
+        _ => "no daemon is running for this project.\nRun `rote endpoint --ensure` to start one, or `rote watch`.".into(),
+    }
+}
+
 /// Record how a hunk's content arrived.
 ///
 /// The manual half of the input signal: the engine infers `typed` only when it

@@ -1,0 +1,170 @@
+*rote.txt*  Type in the agent's code by hand, without leaving nvim
+
+==============================================================================
+CONTENTS                                                        *rote-contents*
+
+  1. Introduction ................ |rote-introduction|
+  2. Requirements ................ |rote-requirements|
+  3. Setup ....................... |rote-setup|
+  4. Commands .................... |rote-commands|
+  5. Keys in the panel ........... |rote-keys|
+  6. How content arrived ......... |rote-input|
+  7. Configuration ............... |rote-config|
+  8. How it works ................ |rote-internals|
+
+==============================================================================
+1. INTRODUCTION                                             *rote-introduction*
+
+`rote` runs Claude Code inside a shadow clone of your repository and serves the
+resulting diff back hunk by hunk, for you to type in by hand. This plugin is a
+front end over the same localhost protocol the `rote watch` terminal pane
+renders from: it draws the current hunk in a split, follows the queue as you
+type, and tells rote when content arrived by paste rather than by typing.
+
+The plugin classifies nothing. The daemon is the only thing that decides a hunk
+has been typed, and there is deliberately no verb by which a front end could
+assert otherwise.
+
+==============================================================================
+2. REQUIREMENTS                                             *rote-requirements*
+
+  - nvim 0.10 or newer
+  - the `rote` binary on your PATH
+
+The binary is installed separately — this repository ships both, but a plugin
+manager only installs the Lua half. See the project README for `brew` and
+`cargo install`.
+
+No plugin dependencies, and no `curl`.
+
+==============================================================================
+3. SETUP                                                           *rote-setup*
+
+With lazy.nvim: >lua
+
+    { "spencerjireh/rote", config = function() require("rote").setup({}) end }
+<
+`setup()` is required — it installs the autocommands and the paste hooks. It
+does not connect to anything by itself unless `auto_open` is set (it is, by
+default), in which case it looks for a session once and opens the panel if it
+finds one.
+
+==============================================================================
+4. COMMANDS                                                     *rote-commands*
+
+                                                                       *:Rote*
+:Rote                   Open the panel, or close it if it is already open.
+                        Starts watching if it was not already.
+
+                                                                  *:RoteClose*
+:RoteClose              Close the panel but keep watching. The queue keeps
+                        advancing and the anchor sign stays in your buffers.
+
+                                                                 *:RoteDetach*
+:RoteDetach             Stop watching entirely.
+
+                                                                   *:RoteSkip*
+:RoteSkip [{hunk-id}]   Leave a hunk untyped. Defaults to the active one.
+                        Skipping is durable: it will not come back.
+
+                                                                *:RoteResolve*
+:RoteResolve {keep|retry} [{hunk-id}]
+                        Answer an open divergence question. `keep` records what
+                        you typed and stops offering the proposal; `retry`
+                        withdraws the question and keeps watching.
+
+                                                                 *:RoteReport*
+:RoteReport {typed|pasted} [{hunk-id}]
+                        Say how a hunk's content arrived. See |rote-input|.
+                        Changes no status.
+
+                                                                *:RoteRefresh*
+:RoteRefresh            Force a re-diff of the two trees.
+
+                                                                   *:RoteJump*
+:RoteJump               Move the cursor to the active hunk, ignoring the guards
+                        that normally hold a jump back.
+
+                                                                 *:RoteStatus*
+:RoteStatus             What the plugin is currently looking at.
+
+==============================================================================
+5. KEYS IN THE PANEL                                                *rote-keys*
+
+Buffer-local, and the same letters the terminal pane uses, so the two are
+interchangeable: >
+
+    s     skip this hunk
+    k     keep your version (only with a question open)
+    r     withdraw the question and keep typing
+    g     refresh
+    q     close the panel
+    <CR>  jump to the hunk
+<
+==============================================================================
+6. HOW CONTENT ARRIVED                                             *rote-input*
+
+The point of rote is that you type the code rather than paste it, and the
+filesystem cannot tell the two apart — a careful typist who writes a whole hunk
+into the buffer and saves once is byte-identical to a paste.
+
+rote's daemon infers what it can: if it ever sees the region as a partial
+prefix of the proposal, someone was typing. That misses anyone who saves only
+at the end, and it can never prove a paste.
+
+nvim knows. This plugin reports both verdicts for the hunk you are currently
+on, and `rote done` prints the tally when the session closes.
+
+Detection is `precise` by default and has no false positives: it fires only
+when nvim actually routed a paste (bracketed paste, OSC 52, `nvim_paste`, or a
+put key). Set `paste_detection = "heuristic"` to also treat any large single
+change as a paste — it catches more and may misfire on undo, which is why it is
+not the default.
+
+Only changes inside the *active* hunk are reported. That is the only hunk whose
+identity the plugin holds reliably, and attributing a paste to the wrong hunk
+would be worse than attributing it to none.
+
+A wrong verdict is always correctable, from the plugin or the shell: >
+
+    :RoteReport typed
+    $ rote report h-1a2b typed
+<
+==============================================================================
+7. CONFIGURATION                                                  *rote-config*
+
+Defaults: >lua
+
+    require("rote").setup({
+      width = 80,             -- panel width, in columns
+      width_ratio = 0.4,      -- capped at this share of the screen
+      auto_jump = "on_change",-- or "never"
+      paste_detection = "precise", -- or "heuristic"
+      paste_threshold = 24,   -- bytes, for "heuristic"
+      auto_open = true,       -- open the panel if a session is found
+    })
+<
+                                                               *rote-auto-jump*
+The cursor is never moved while you are in insert mode, and never when it is
+already inside the hunk being typed — the anchor is where the region starts,
+and jumping there while you are on line five of it would throw you back to the
+top of what you are writing. `auto_jump = "never"` turns the automatic move off
+entirely; |:RoteJump| still works.
+
+==============================================================================
+8. HOW IT WORKS                                                *rote-internals*
+
+The plugin reads the daemon's server-sent event stream over a raw TCP socket
+(`vim.uv`), and issues every mutation by running the `rote` binary. That split
+is deliberate: the CLI already decides for itself whether to mutate directly or
+send a verb to a running daemon, so the plugin never holds a bearer token,
+never builds a request body, and cannot disagree with the CLI about what a verb
+means.
+
+It finds the daemon with `rote endpoint --json`, and re-asks on every
+reconnect, because a restarted daemon has a new port *and* a new token.
+
+Every frame carries a whole snapshot rather than a delta, so a reconnecting
+plugin is never behind and there is nothing to resynchronise.
+
+ vim:tw=78:ts=8:ft=help:norl:

@@ -265,3 +265,48 @@ observed nothing.
 
 Edge cases this milestone adds to §9: a hunk half-typed then pasted (16), a
 daemon restarted mid-hunk (17), and a hunk re-identified mid-typing (18).
+
+---
+
+## M12 — the nvim plugin
+
+`state.rs` has said since M8 that three front ends would be written against it.
+One existed. This is the second, and it is also the test of whether freezing the
+protocol in M9 actually bought anything — the answer is that the daemon needed
+one new command and no changes at all to the wire.
+
+The plugin's reason to exist beyond being a nicer pane is the input signal. The
+engine can prove *typed* only when it happens to catch a partial save, so a
+`:w`-at-the-end user gets `unknown` for work they typed every character of.
+nvim knows the difference and nothing else does.
+
+Scope:
+- `rote endpoint [--json] [--token] [--ensure]`, so a front end need not
+  reimplement the project hashing to find `daemon.json`. The human form
+  withholds the token; the machine forms print it.
+- `lua/rote/` and `plugin/rote.lua`: the panel, the stream, the jump policy,
+  paste detection, and `doc/rote.txt`.
+- Read over a raw `vim.uv` socket; write by shelling out to `rote`, which
+  already routes through the engine-token check — so the plugin never holds a
+  token, never builds a request body, and cannot drift from the CLI.
+
+Acceptance: `rote endpoint --json --ensure` starts a daemon and prints an
+address a front end can connect with. With the plugin installed, `:Rote` opens a
+panel showing the current hunk and its curator note; the queue advances as you
+type and the panel follows; the cursor is never moved while you are in insert
+mode or already inside the hunk; skip and resolve work; a paste is reported and
+shows up at `done`; killing the daemon reconnects against a fresh port and
+token.
+
+Verified by hand, because `cargo test` can prove `rote endpoint` and nothing
+else about Lua. A headless nvim was driven against a live daemon for each of:
+every file loads; the panel renders the region as coherent source with the
+filetype set from the hunk's path; typing advances the queue and the panel
+follows; `:RoteSkip` moves it; `:RoteReport pasted` lands and changes no status;
+`kill -9` on the daemon reconnects to a new port with a new token and keeps
+rendering. Two Rust tests guard the seam that will actually rot: the plugin's
+pinned wire version against the daemon's, and every `:Rote*` command against
+`doc/rote.txt`.
+
+Edge cases this milestone adds to §9: a paste outside the active hunk's region
+(19).
