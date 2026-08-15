@@ -139,3 +139,38 @@ fn watch_refuses_while_the_repo_is_mid_merge() {
         stderr(&out)
     );
 }
+
+#[test]
+fn the_pane_prints_the_curators_line_above_the_hunk() {
+    // The last link: the note is written by a thread, stored in a file keyed by
+    // content, projected onto the manifest by a recompute, carried on a snapshot
+    // over a socket, and finally drawn. This asserts the whole chain, which no
+    // unit test can.
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.commit_all("initial");
+    let mut cli = Cli::with_fixture(fx);
+
+    let stub = cli.bin.join("curator-stub");
+    common::cli::write_exec(
+        &stub,
+        "#!/bin/sh\ncat > /dev/null\n\
+         printf '%s' '{\"order\":[{\"hunk\":1,\"note\":\"start here: everything else uses it\"}]}'\n",
+    );
+    cli.enable_curator(&stub);
+
+    let out = cli.run(&["start", "--no-launch", "add work"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    std::fs::write(cli.shadow().join("a.rs"), "fn a() {\n    work();\n}\n").unwrap();
+    std::fs::write(cli.shadow().join("b.rs"), "fn b() {\n}\n").unwrap();
+
+    // Two hunks, because one is not worth curating.
+    let child = cli.spawn(&["watch", "--headless", "--timeout", "3500"]);
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    assert!(
+        text.contains("start here: everything else uses it"),
+        "the curator's line, above the hunk: {text}"
+    );
+}

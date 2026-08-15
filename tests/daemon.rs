@@ -858,3 +858,84 @@ fn the_daemon_exits_when_the_session_is_archived() {
         "and it takes its address book with it"
     );
 }
+
+// ------------------------------------------------------------------ curator
+
+/// A session whose queue is worth curating, with a stub that will answer.
+///
+/// Two files so the model's order is visibly different from file order, and
+/// `enable_curator` because every fixture in this suite runs with the curator
+/// off — the default `claude_cmd` would otherwise resolve to the developer's
+/// real binary and every daemon test would spend tokens.
+fn curated_session(reply: &str) -> Cli {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.write("b.rs", "fn b() {\n}\n");
+    fx.commit_all("initial");
+    let mut cli = Cli::with_fixture(fx);
+
+    let stub = cli.bin.join("curator-stub");
+    common::cli::write_exec(
+        &stub,
+        &format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{reply}'\n"),
+    );
+    cli.enable_curator(&stub);
+
+    let out = cli.run(&["start", "--no-launch", "add work"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    std::fs::write(cli.shadow().join("a.rs"), "fn a() {\n    one();\n}\n").unwrap();
+    std::fs::write(cli.shadow().join("b.rs"), "fn b() {\n    two();\n}\n").unwrap();
+    cli
+}
+
+#[test]
+fn the_curators_order_and_notes_reach_the_snapshot() {
+    // The whole point, seen from where a front end sees it: the queue arrives
+    // already ordered, and each entry carries its line.
+    let cli = curated_session(
+        r#"{"order":[{"hunk":2,"note":"needed by a"},{"hunk":1,"note":"uses b"}]}"#,
+    );
+    let d = Daemon::start(&cli);
+
+    wait_until("the curation to reach the snapshot", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .map(|s| s.queue.iter().any(|q| q.curator_note.is_some()))
+            .unwrap_or(false)
+    });
+
+    let snap: state::Snapshot = d.get("/state").json().unwrap();
+    let files: Vec<&str> = snap.queue.iter().map(|q| q.file.as_str()).collect();
+    assert_eq!(
+        files,
+        vec!["b.rs", "a.rs"],
+        "teaching order, not file order"
+    );
+    assert_eq!(snap.queue[0].curator_note.as_deref(), Some("needed by a"));
+    assert_eq!(snap.queue[1].curator_note.as_deref(), Some("uses b"));
+}
+
+#[test]
+fn a_daemon_with_the_curator_off_never_runs_the_model() {
+    // `session()` leaves it off, which is the default for every fixture here.
+    // If that ever stops being true, this suite starts spending money quietly,
+    // so the assertion is on the stub never having been invoked at all.
+    let cli = session();
+    let marker = cli.bin.join("claude");
+    common::cli::write_exec(
+        &marker,
+        &format!(
+            "#!/bin/sh\ntouch {}\n",
+            cli.fx.root.path().join("model-was-called").display()
+        ),
+    );
+
+    let d = Daemon::start(&cli);
+    wait_until("a first snapshot", || d.get("/state").status == 200);
+    std::thread::sleep(Duration::from_millis(600));
+
+    assert!(
+        !cli.fx.root.path().join("model-was-called").exists(),
+        "a test suite must never reach a model on its own"
+    );
+}
