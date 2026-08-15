@@ -186,3 +186,43 @@ shell moves them; `done` reaps it and the panes say the session closed.
 Edge cases this milestone adds to §9: two engines (11) and a question raised
 then re-identified (12).
 
+
+---
+
+## M10 — the curator
+
+The queue was sorted by file path and line number, which is the order a
+filesystem happens to be in and not the order a change makes sense in: it hands
+you a caller before the thing it calls, and a test for something you have not
+written yet. `curator_note` and `curator_rank` have existed since the v2
+manifest, fully plumbed through the sort, the wire and the pane, with nothing
+writing them. This milestone supplies the producer.
+
+It opens with a prerequisite rather than a feature. Every headless `claude -p`
+wrote its whole payload to stdin before reading a byte of output, which
+deadlocks past a pipe buffer — 16 KiB on macOS — and the reviewer's timeout was
+armed only after that write returned, so the hang had no ceiling and no
+diagnostic. A curator payload of every pending hunk hits it routinely.
+
+Scope:
+- `src/model.rs` — the one headless call, with a writer thread, two reader
+  threads, and the deadline around the whole thing. `review.rs` and
+  `detect::deep_probe_claude` move onto it; the latter had no timeout at all.
+- `src/curator.rs` — prompt, payload, tolerant JSON parser, the cache, and the
+  pure policy (`should_curate`, `assign_ranks`).
+- `curator.json`, keyed by hunk `key` and stamped with `session_id`, re-applied
+  after every `reconcile` — the source of truth, because ids move as the user
+  types and `reconcile` copies nothing onto a fresh hunk.
+- The engine gains a curation channel, a settle timer of its own, and a
+  writeback whose every failure is a notice rather than an error.
+- `[curator]` on both config files, and `ROTE_CURATOR=off`.
+
+Acceptance: with a session open and the agent's work landed, the queue reorders
+itself into teaching order within seconds and each hunk carries one line saying
+why it comes where it does; the hunk being typed does not move; `rote talk`
+adding work re-curates and only the tail changes; a curator that cannot run
+leaves the file order, warns once, and is not asked again.
+
+Edge cases this milestone adds to §9: a curation landing mid-transcription (13),
+a daemon restarted mid-curation (14), and a curator child outliving the session
+(15).

@@ -141,10 +141,11 @@ No automatic teardown. `rote abort`/`done` re-sync rather than delete. (A `rote 
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "state": "transcribing",
   "task": "add tagging to posts",
   "created_at": "2026-08-13T10:22:00Z",
+  "session_id": "9f2c1a4e7b03d581",
   "project_root": "/home/user/proj",
   "shadow_dir": "/home/user/.cache/rote/ab12…/shadow",
   "baseline": {
@@ -153,9 +154,12 @@ No automatic teardown. `rote abort`/`done` re-sync rather than delete. (A `rote 
     "synced_at": "2026-08-13T10:22:01Z"
   },
   "hunks": [ Hunk, … ],
+  "generation": 41,
   "last_presented": "h-0007"
 }
 ```
+
+`generation` is monotonic and bumped by every write that changes something (§13). `session_id` is 8 bytes of kernel entropy minted at `start`; it exists because `created_at` is second-resolution and so cannot identify a session — two opened in the same second would share it, and anything keyed off a session would believe the previous one's file. `Manifest::session_stamp` falls back to `created_at` for a manifest written before the field existed.
 
 There is no `session_start_snapshot` field. The session-start baseline is `baseline.head` plus the patch at the fixed path `~/.local/share/rote/<hash>/baseline.patch`, written by sync step 7 — one representation, derivable from the project hash, so nothing can disagree with itself. Archived manifests carry one extra field, `"terminal": "done" | "aborted"` (§2).
 
@@ -171,13 +175,22 @@ There is no `session_start_snapshot` field. The session-start baseline is `basel
   "new_lines": ["    body = models.TextField()", "    tags = TaggableManager()"],
   "context_after": ["", "    def __str__(self):"],
   "anchor_hint": 42,                // line number in the REAL file at last recompute; advisory only
+  "key": "k-3f9a1c7e0b52d846",      // content identity WITHOUT context — see below
   "status": "pending",              // pending | typed | diverged | skipped
   "divergence": null,               // when diverged: {"proposed": [...], "actual": [...]}
-  "note": null                      // optional one-liner rote attaches (e.g. "file is new")
+  "pending_divergence": null,       // a question asked but not yet answered (§6)
+  "note": null,                     // optional one-liner rote attaches (e.g. "file is new")
+  "curator_note": null,             // one line of ordering rationale (§8b)
+  "curator_rank": null,             // teaching order; absent sorts after everything ranked
+  "input": "unknown"                // unknown | typed | pasted
 }
 ```
 
-Hunk IDs are content-addressed: `h-` + first 8 hex of SHA-256 over (`file`, `old_lines`, `new_lines`, `context_before`, `context_after`). This makes reconciliation across recomputes natural: an unchanged proposal keeps its ID; a reworked one appears as a new hunk.
+Every field after `note` is optional and omitted when unset, which is what keeps this additive: `WIRE_VERSION` is unchanged by all of them.
+
+Hunk IDs are content-addressed: `h-` + first 16 hex of SHA-256 over (`file`, `old_lines`, `new_lines`, `context_before`, `context_after`). This makes reconciliation across recomputes natural: an unchanged proposal keeps its ID; a reworked one appears as a new hunk. Colliding IDs are disambiguated with a `.2`, `.3` ordinal.
+
+`key` is the same hash **without the two context groups**, and the difference is the point. Because `id` folds in surrounding context, typing anywhere within `CONTEXT_LINES` of a hunk changes its *neighbour's* id — so anything stored against an id evaporates while the user works. `key` survives exactly that churn, and is what the curator cache (§8b) and the classifier's compare-and-swap key off. Two hunks in one file with the same `old → new` pair deliberately share a key: they are the same change and deserve the same note. So `key` is content identity, never a lookup handle — `find`/`find_mut` are id-only.
 
 `op` is derived, not free-form: empty `old_lines` → `insert`; empty `new_lines` → `delete`; both populated → `replace`. The whole-file ops `create_file` / `delete_file` come from the `/dev/null` side of the diff (§5) and win over the line-level derivation. For `create_file`, `anchor_hint` is `1` — the real file does not exist yet, so there is nothing to anchor against.
 
@@ -216,7 +229,9 @@ Exit code 1 with output = normal. Parse with the hand-rolled unified-diff parser
 Raw git hunks larger than `max_hunk_lines` (default **20**, counting `max(old_lines.len(), new_lines.len())`) are split into sub-hunks. Counting `new_lines` alone would leave every large deletion unsplittable — a 500-line removal has no new lines at all, and arrives as one hunk regardless of the limit:
 - Prefer split points at blank lines in `new_lines`; else at lines with lower indentation than their successor (crude block boundary); else hard-cut at the limit.
 - Each sub-hunk gets ≥ 2 lines of context on each side, synthesized from the neighboring sub-hunk's lines where the original context is out of reach.
-- Sub-hunks of one parent are ordered and must be presented in order (the queue is globally ordered: file path, then position).
+- Sub-hunks of one parent are ordered and must be presented in order.
+
+**Queue order** is a *read-time view*, never storage order — `reconcile` appends to the tail and its positional invariants are what the reconcile tests assert against, so nothing may sort `manifest.hunks` itself. The view is: `curator_rank` where it exists, then file path, then position within the file, then `id` so the sort is total. The last three are the entire ordering when no curator has run (§8b), and the tie-break when one has.
 
 ### Reconciliation (the heart of recompute)
 **Terminal statuses are sticky, keyed by hunk ID.** Once a hunk is `typed`, `diverged`, or `skipped`, it stays that way and stays out of the queue — with exactly one exception, rule 3. This is the load-bearing rule; get it wrong and `skip` and `diverged` both stop working (see the note below).
@@ -285,7 +300,13 @@ claude_continue_cmd = ["claude", "--continue"]   # for `rote talk --attach`
 color = true
 max_hunk_lines = 20              # project value overrides this
 strict_whitespace = false        # true = trailing whitespace differences count as divergence
+
+[curator]                        # the one table the global file carries
+enabled = true
+model_args = []
 ```
+
+`[curator]` is global as well as per-project, and it is the only table that is. Every other one describes a repository; this one answers "may rote spend tokens in the background without being asked", which is a property of the person and their plan. Requiring it once per repo is how it ends up unsaid somewhere. Project values still win.
 
 Both claude commands are **argument vectors, not shell strings.** They are the same kind of thing and must have the same shape; a bare binary name in one and a space-separated string with flags in the other invites splitting one and not the other, and any `exec` path that shell-splits a config string is a quoting bug waiting for a path with a space in it. Vectors are passed to `exec` verbatim, with no shell involved.
 
@@ -310,7 +331,21 @@ commands = ["cargo test", "cargo clippy -- -D warnings"]   # run in REAL tree at
 [review]
 enabled = true
 model_args = []          # extra args appended to `claude -p`, e.g. ["--model", "claude-haiku-4-5"]
+
+[watch]
+divergence_grace_ms = 2000   # stillness before a disagreement becomes a question (§6)
+debounce_ms = 400            # trailing-edge debounce before a full re-diff
+ignore = []                  # extra globs the watcher never wakes for
+
+[daemon]
+autostart = true             # `rote start` leaves a daemon watching (§13)
+
+[curator]
+enabled = true               # the teaching-order pass (§8b)
+model_args = []
 ```
+
+**Environment.** `NO_COLOR` disables colour. `ROTE_EDITOR` overrides `editor`. `ROTE_CURATOR=off` (also `0`, `no`, `false`) disables the curator for one invocation — the escape hatch for the only thing rote does that spends money without being asked. It is read at the process boundary rather than inside config loading, so config loading stays a pure function of two files. A detached daemon inherits it, so turning it off for a `rote start` also turns it off for the session that start leaves running.
 
 Per-project values override globals. Missing file → defaults. `copy` and `preserve` are separate keys doing different jobs and must not be merged: `copy` moves files real → shadow on every sync (so the agent's `.env` matches yours), while `preserve` merely exempts paths from the shadow's clean (and is never copied from anywhere).
 
@@ -354,7 +389,71 @@ ARCHITECTURE.md claims the reviewer "never gets filesystem access." A temp cwd a
 - **Plus** the temp empty cwd, `--no-color`-safe output handling, and a 5-minute timeout.
 - **Fail soft.** A nonzero exit, a timeout, or an unsupported flag on the installed CLI prints a warning and continues the pipeline. Review is advisory (§1 step 4), so a reviewer that cannot run must never block a session from closing.
 
-The flag names are the one place rote touches Claude Code's surface, so keep them in a single named constant in `review.rs` and expect to update them across CLI versions. This does not weaken Principle 1: that principle governs the *session* agent, which stays entirely unconfigured. The reviewer is a separate, headless invocation that rote fully owns.
+The flag names are the one place rote touches Claude Code's surface, so they live in a single named constant — `model::TOOL_FLAGS`, now shared by the reviewer, the curator, and `doctor --deep` — and expect to update them across CLI versions. This does not weaken Principle 1: that principle governs the *session* agent, which stays entirely unconfigured. The reviewer is a separate, headless invocation that rote fully owns.
+
+### The model call itself
+
+All three headless invocations go through `model::run`, and nothing else in the tree spawns `claude` for an answer. That is not tidiness: the obvious implementation writes the payload to the child's stdin and then reads its output, which deadlocks the moment both pipes fill — the parent blocked in `write_all` because the child is not reading, the child blocked in `write` because the parent is not reading. Pipe buffers are 16 KiB on macOS and 64 KiB on Linux, so a session diff clears the threshold on an ordinary session.
+
+So: stdin gets its own thread, stdout and stderr get one each, and the calling thread polls `try_wait` against the deadline — which is what puts the timeout around the *whole* call rather than only the part after the payload has landed. Killing the child is what unblocks the other three, by closing the pipe ends. Results are collected over a channel rather than by joining, because a grandchild that inherits the pipe keeps `read_to_end` from returning and an unconditional join would reintroduce the same hang one level down.
+
+---
+
+## 8b. Curator Claude payload
+
+A headless pass that puts the queue in **teaching order** and writes one line per hunk saying why it comes where it does. Advisory in every direction: a curator that cannot run leaves the deterministic order (§5) exactly as it was.
+
+Payload piped to stdin of `claude -p "$CURATOR_PROMPT" [tool flags] [curator.model_args…]`:
+
+```
+== TASK ==
+<task string or "(unspecified)">
+
+== HOW TO ANSWER ==
+{"order":[{"hunk":3,"note":"..."},...]} — every hunk number below
+exactly once, best first. JSON only.
+
+== HUNKS ==
+[1] src/models.py:42  replace
+    in: class Post(models.Model):
+    note: <mechanical note, if any>
+    previously: <the note a earlier pass gave this hunk, if any>
+    -     body = models.TextField()
+    +     body = models.TextField()
+    +     tags = TaggableManager()
+[2] …
+```
+
+Hunks are labelled with **small integers, never keys**. A model asked to echo `k-3f9a1c…` will eventually mangle one, and a mangled key is a hunk silently placed where it does not belong; index → key is a mapping rote owns and can check. The list is deduplicated by `key` (§4), capped at `MAX_HUNKS` (60), and each side of a hunk is capped at `MAX_LINES_PER_HUNK` (30) so one enormous hunk cannot crowd out the other fifty. Untypeable hunks (§5's byte-compare gate) go in with their `note` as their body — a lockfile belongs somewhere in the order too, usually last.
+
+`CURATOR_PROMPT` (constant in source) asks for an order in which each hunk makes sense to a reader who has seen everything above it and nothing below it — definitions before uses, a data model before the code that reads it, the core change before the knock-ons, tests and generated files last — plus one short line of **ordering rationale** per hunk. It explicitly rules two things out: not a summary of what the hunk does (the reader is about to read it, and a description becomes the thing they read instead of the code), and not warnings about typos or tricky syntax (noticing those is the exercise).
+
+**Reading the reply** is forgiving in bounded ways, because the failure mode of strictness is discarding a good ordering over a code fence: fenced JSON, JSON wrapped in prose, a bare top-level array, unknown keys, out-of-range or repeated hunk numbers (first position wins). Brace matching tracks string literals and their escapes rather than scanning for the last `}` — the material being described is code, so a note containing a brace or a quote is ordinary. Notes are reduced to one trimmed line and capped at 160 characters. A reply with nothing usable is an **error**, not an empty ordering: the caller has to be able to tell "the model declined" from "the model chose this order".
+
+### Where the result lives
+
+`~/.local/share/rote/<hash>/curator.json`, keyed by hunk `key`, re-applied after every `reconcile` (§5). This is the source of truth and the fields on `Hunk` are a projection of it — it has to be, because `reconcile` copies nothing onto a fresh hunk and ids move whenever the user types near one (§4).
+
+Two properties are load-bearing:
+
+- **An entry with neither rank nor note is a tombstone**, meaning "offered to the model, nothing came back". Without it a failed pass is retried on every keystroke: the uncached set would still be the pending set, and typing a hunk *shrinks* it, moving the fingerprint the trigger compares against. Tombstones gate **triggering**, never **inclusion** — the payload is always the whole pending set, because a new hunk cannot be ordered against hunks the model has not seen.
+- **The file is stamped with `session_id`.** Clearing it at `done`/`abort` is not enough: `abort` reaps the daemon best-effort, and a `rote watch --local` pane publishes no `daemon.json` to be reaped at all, so its engine can write the file *after* the teardown removed it. The next session would then inherit a teaching order built for a different set of hunks — and never re-curate, because every key would look considered.
+
+### When it runs
+
+In the engine, on its own thread; `Engine::run` is single-threaded and a blocking `claude -p` inside `step` would freeze keystroke classification for minutes. A pass starts when all of: the curator is enabled, none is in flight, the shadow has been still for `CURATOR_SETTLE_MS` (1.5 s) with no re-diff owed, at least two hunks are pending, at least one pending key has never been considered, and the fingerprint of the pending set differs from the last attempt. At most `MAX_PASSES_PER_SESSION` (8) in one session, in memory — a daemon restart resets it, which is right, because a restart is not a loop.
+
+Quiescence is its own signal rather than the recompute debounce, which the user's typing arms as well: gating on that would delay curation for as long as somebody is working, and under steady typing a comparable window may never elapse.
+
+### Freeze current, reorder ahead
+
+A curation landing mid-session must not move the hunk you are looking at. The pin is **baked into the stored ranks** (rank 0) rather than applied when writing — it has to be, because the cache is re-applied after every `reconcile`, so a pin held anywhere else would be overwritten by the next recompute a second later and the screen would jump after all.
+
+The head is pinned only once the user is *in* the session: any hunk terminal, or the head carrying an open question, or the head's region differing from its baseline. With nothing typed and nothing started there is no place to lose, and the curator's opinion about what to do first is the entire point of asking. That last test goes through `engine::observe`, not `present::is_in_progress` — the latter returns true for an empty region ("the state before the first keystroke") and so cannot tell started from not-started.
+
+### Curator isolation
+
+Identical to the reviewer's: `model::TOOL_FLAGS`, an empty temp cwd, and a hard timeout (`CURATOR_TIMEOUT`, 120 s — shorter than the reviewer's, since this ranks material already summarized while a user waits to see a queue). Every failure becomes a `Notice::warn` and never a propagated error: an `Err` out of the curation path reaches `Engine::run`, which reports "the engine stopped" and takes the daemon with it, so a curator that could not write its cache would kill the thing that watches you type.
 
 ---
 
@@ -376,7 +475,10 @@ The flag names are the one place rote touches Claude Code's surface, so keep the
 10. **Empty session** (agent changed nothing) — the pane and `next` report the queue empty; `done` short-circuits checks/review with "no changes".
 11. **Two engines** — impossible by construction, and the reason the daemon exists in the shape it does. See §13: `watch.lock` is the engine token, and every mutation either holds it or routes to whoever does. Getting this wrong does not merely duplicate work; it fabricates divergence questions about hunks the user never touched, and `reconcile` keeps them forever.
 12. **A question raised, then re-identified** — once the user's own text is in the tree, a recompute re-diffs that region as (theirs → proposal), a different id. A question that has been *written down* survives by content match (§5); one that is still only an armed candidate follows its content onto the new hunk. Without that the disagreement becomes permanently unaskable, because the baseline has already refreshed to include their text and nothing can re-arm.
-13. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
+13. **A curation landing mid-transcription** — the pass runs unlocked and takes seconds, so the queue moves underneath it. No compare-and-swap is needed, unlike the classifier's: the cache is keyed by content, so a hunk typed while the model was thinking is terminal and its rank is irrelevant, and one the agent reworked away simply has no entry. The *pin* does need care and is computed inside the lock, because the head moves too. A hunk that appears during the call has no entry and so sorts after every ranked hunk rather than in file position; the next pass picks it up. See §8b.
+14. **A daemon restarted mid-curation** — the job thread dies with the process and no tombstones were written, so the fingerprint is `None` and the next engine re-fires: one duplicate call per crash, which is correct. Deliberately **no on-disk in-flight marker** — after a `kill -9` a stale one would disable the curator permanently, which is the exact failure `watch.lock`'s doctrine exists to avoid (§13).
+15. **A curator child outliving the session** — `serve` joins the engine thread within `JOIN_CEILING` and exits, but a `claude` spawned by a curation can outlive `rote done` by up to `CURATOR_TIMEOUT`. It runs in an empty temp cwd with no tools, so it can do nothing; reaping it would mean holding a child handle somewhere with no business holding one.
+16. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
 
 ---
 
@@ -393,8 +495,16 @@ src/
   hunks.rs         # splitting, IDs, Hunk model (serde)
   session.rs       # SessionEngine: manifest, state machine, recompute
   detect.rs        # environment + project detection (doctor/setup/init)
-  present.rs       # HunkPresenter: render, anchor, editor, classify
+  present.rs       # HunkPresenter: render, anchor, classify
+  model.rs         # the one headless `claude -p` call (§8)
   review.rs        # done-pipeline: checks, reviewer payload + invocation
+  curator.rs       # teaching order: payload, parser, cache, policy (§8b)
+  state.rs         # the wire types (§12)
+  engine.rs        # the watch engine: classify on save, advance, publish
+  watcher.rs       # filesystem events, filtered and origin-tagged
+  daemon.rs        # the daemon: endpoint, threads, HTTP surface (§13)
+  http.rs          # transport as pure functions over bytes
+  pane.rs          # the terminal front end, local or client
 ```
 
 Unit-test targets (minimum): diffparse (fixture diffs incl. new/deleted/binary/no-newline), hunk splitting, anchor matching (drifted files), reconciliation scenarios (typed/diverged/reworked/new), sync round-trip on a fixture repo (integration test using a temp git repo).
@@ -467,7 +577,10 @@ to keep in agreement forever, and they would disagree.
   client: without it, rendering a jump target means reading the file, and a
   browser front end cannot.
 - `QueueItem` — a summary with no line bodies, so a snapshot stays small at two
-  hundred pending hunks. Full text is fetched by id.
+  hundred pending hunks. Full text is fetched by id. Carries `curator_note`, so
+  a front end can show the whole queue with its reasons without fetching
+  anything. The *order* needs no field: `queue` is already in teaching order,
+  because it is built from `queue_view` (§5).
 - `Event` — `snapshot` | `notice` | `heartbeat` | `closed`, tagged on `type`.
   **Every change carries a whole snapshot, never a delta.** A delta protocol
   needs a resync story, and a client that misses one frame is silently wrong

@@ -37,12 +37,17 @@ Given a real repo at `/home/user/proj` (project identity = hash of canonicalized
 
 ```
 ~/.cache/rote/<hash>/shadow/          # the shadow repo (a full local clone)
-~/.local/share/rote/<hash>/
+~/.local/share/rote/<hash>/            # 0700: a bearer token lives in here
     session.json                       # active session manifest
-    session.json.lock                  # PID lock, held only across manifest writes
+    session.json.lock                  # flock(2), held across a whole manifest read-modify-write
+    watch.lock                         # flock(2), THE ENGINE TOKEN: held for an engine's lifetime
+    curator.json                       # the teaching order and its notes, keyed by hunk key
+    daemon.json                        # 0600: where a running daemon listens, and its token
+    daemon.log                         # the detached daemon's output
     baseline.patch                     # real tree's uncommitted diff at last sync
     archive/<timestamp>.json           # completed/aborted sessions
     archive/<timestamp>.patch          # the agent's work that was never typed
+    archive/<timestamp>.curator.json   # the teaching order it was transcribed in
 ~/.config/rote/config.toml            # global config (defaults; editor is optional)
 <repo>/.rote.toml                     # per-project config (check commands, env allowlist, hunk size)
 ```
@@ -88,6 +93,7 @@ After sync, shadow working tree ≡ real working tree, byte for byte, across all
 - **SessionEngine** — the state machine (`idle → working → transcribing → idle`; `done`/`aborted` are labels on archived sessions, not live states) and the manifest. Its key operation is **recompute**: re-diff shadow vs. real and reconcile the hunk queue against hunks already typed/diverged/skipped, which is what allows the user to flip back to the Claude session mid-transcription, ask for rework, and continue. Terminal statuses are sticky by hunk ID (DESIGN.md §5) — the trees are the source of truth about content, the manifest about the user's decisions.
 - **WatchEngine** — watches both trees, reclassifies the pending hunks in a saved file, commits terminal statuses, and advances the queue. The fast path shells out to nothing: one file read and pure functions. A full re-diff runs only when the hunk *set* can change, behind a debounce. Time enters through an injected clock, so the whole "do not interrupt someone mid-thought" behaviour is unit-tested with no sleeps.
 - **HunkPresenter** — the pure core: anchoring, region extraction, classification, and rendering. It has no I/O beyond reading files, which is what lets both the engine and the pane share it. Divergence policy: a line-wise prefix of the proposal is *in progress* and never a question; anything else becomes one after the file has been still for a configured window. Files that cannot meaningfully be typed (binaries, lockfiles) are classified by byte comparison against the shadow instead.
+- **Curator** — a headless pass that ranks the pending hunks into a teaching order and writes one line of ordering rationale for each. Runs on its own thread, because a blocking model call inside the engine loop would freeze keystroke classification for minutes. Its result lives in a file keyed by hunk *content*, not id, and is re-applied after every recompute — ids move whenever the user types near a hunk, so the manifest cannot hold this by itself. The policy (when to run, what to rank, what to pin) is pure functions, testable with no clock and no model.
 - **GitPlumbing + DiffParser** — thin `Command` wrappers over the ~8 git invocations rote needs, and a unified-diff parser producing structured hunks.
 
 ## Data flow (one session)
@@ -124,10 +130,13 @@ rote done
   → state → idle
 ```
 
-## The two Claudes
+## The three Claudes
 
 1. **Session Claude** — interactive, launched by `rote start` inside the shadow. Fully capable, fully unaware. rote never communicates with it.
-2. **Reviewer Claude** — headless `claude -p`, invoked by `rote done`. Receives only text on stdin (the session diff against the pre-session baseline, plus the divergence report). It never gets filesystem access — enforced by tool-restriction flags on the invocation, not merely by the empty temp cwd it runs in — and never runs inside either tree. Its output is advisory; the user confirms before the session closes. This is the one place rote touches Claude Code's flag surface; Principle 1 governs the session agent, which stays entirely unconfigured.
+2. **Curator Claude** — headless `claude -p`, run by the engine once the agent's work settles. Receives only text on stdin: the pending hunks, labelled with integers. Returns a teaching order and one line per hunk saying why it comes where it does. Advisory — a curator that cannot run leaves the deterministic file order untouched.
+3. **Reviewer Claude** — headless `claude -p`, invoked by `rote done`. Receives only text on stdin (the session diff against the pre-session baseline, plus the divergence report). Its output is advisory; the user confirms before the session closes.
+
+The two headless ones share `model::TOOL_FLAGS`, an empty temp cwd, and a hard timeout, which is what makes "never gets filesystem access" true rather than aspirational — an empty cwd alone would not stop `claude -p` reading whatever it liked. This is the one place rote touches Claude Code's flag surface; Principle 1 governs the session agent, which stays entirely unconfigured.
 
 These are independent invocations; nothing links them.
 

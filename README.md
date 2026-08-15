@@ -84,6 +84,36 @@ like, on the same queue. `rote done` and `rote abort` stop it. `[daemon]
 autostart = false` in `.rote.toml` turns the automatic start off; `rote watch`
 then starts one when you need it.
 
+### The order you get them in
+
+Sorting a diff by file path and line number gives you the order a filesystem
+happens to be in, which is rarely the order a change makes sense in — you end up
+typing a caller before the thing it calls, and a test for something you have not
+written yet.
+
+So once the agent's work settles, rote makes one headless call that puts the
+queue in **teaching order** and writes a line above each hunk saying why it comes
+where it does:
+
+```
+the Post.tags field everything below reads
+── hunk 1/3 ── models.py:3 ── insert ───────────────────────
+   class Post:
+       title = ""
+ +     tags = []
+```
+
+It runs in the background and takes a few seconds, so you will usually see file
+order first and watch it rearrange. **The hunk you are already typing never
+moves** — only the queue behind it. Ask the agent for more work and it re-orders
+around what arrived, without paying to re-examine what it has already seen.
+
+It is one call per session and it fails soft: if it cannot run, you get the plain
+file order and one line saying so. `ROTE_CURATOR=off rote start` skips it
+entirely, and `[curator] enabled = false` in either config file turns it off for
+good — in `~/.config/rote/config.toml` if you would rather rote never spent
+tokens on its own.
+
 ### The three-pane workflow
 
 The intended shape, in ghostty or any splittable terminal: claude on the left,
@@ -215,9 +245,11 @@ inheriting a pager is a worse failure than an explicit setting.
     watch.lock                        held by whoever owns the queue
     daemon.json                       where the daemon listens (mode 0600)
     daemon.log                        its output, if you need to see why
+    curator.json                      the teaching order and its notes
     baseline.patch                    the real tree at session start
     archive/<timestamp>.json          finished sessions
     archive/<timestamp>.patch         the agent's work you never typed
+    archive/<timestamp>.curator.json  the order you transcribed it in
 ~/.config/rote/config.toml
 <repo>/.rote.toml
 ```
@@ -247,14 +279,18 @@ rm -rf ~/.cache/rote/<hash>
 ```
 
 The next `rote start` rebuilds it. Nothing in your real repository is affected:
-rote never writes source into it.
+rote never writes source into it. If a session's own state is the problem rather
+than the shadow, `rm -rf ~/.local/share/rote/<hash>` clears the manifest, the
+daemon's address book and the teaching order together — after which the project
+is simply idle.
 
 ## What it will not do
 
 No hooks, no MCP servers, no SDK, no prompt injection. rote's entire coupling to
 Claude Code is the working directory it launches the agent in, plus tool-
-restriction flags on the separate headless reviewer at `done`. The session agent
-is unconfigured and cannot tell it is being shadowed.
+restriction flags on the two separate headless calls — the curator, and the
+reviewer at `done`. The session agent is unconfigured and cannot tell it is being
+shadowed.
 
 Also out of scope for now: multiple concurrent sessions, non-git projects, paste
 prevention (honor system), Windows, and telemetry of any kind. The nvim plugin
