@@ -24,6 +24,9 @@ class Rote < Formula
   depends_on "git"
 
   def install
+    # One binary, no runtime assets: the browser front end is compiled in with
+    # include_str!, and the nvim plugin is installed by a plugin manager rather
+    # than from here — see the caveats.
     system "cargo", "install", *std_cargo_args
   end
 
@@ -35,6 +38,14 @@ class Rote < Formula
       Then, once:
         rote setup     # writes ~/.config/rote/config.toml
         rote doctor    # confirms this machine is ready
+
+      Front ends, all speaking the same protocol:
+        rote watch         a terminal pane
+        rote watch --web   prints a URL; the daemon serves the page itself
+
+      For nvim, point a plugin manager at the same repository — this formula
+      installs only the binary:
+        { "spencerjireh/rote", config = function() require("rote").setup({}) end }
     EOS
   end
 
