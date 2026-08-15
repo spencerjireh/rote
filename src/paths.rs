@@ -168,6 +168,18 @@ impl ProjectPaths {
         self.state_dir.join("baseline.patch")
     }
 
+    /// The curator's teaching order and notes, keyed by hunk `key`.
+    ///
+    /// Not a convenience: it is where curator state actually lives. `reconcile`
+    /// copies nothing onto a fresh hunk, and a hunk's `id` folds in its
+    /// surrounding context — so typing within three lines of a hunk re-identifies
+    /// it and the manifest's copy of a note is gone. `key` ignores context and
+    /// survives exactly that churn, which is why this file is the source of truth
+    /// and the fields on `Hunk` are a projection of it.
+    pub fn curator_json(&self) -> PathBuf {
+        self.state_dir.join("curator.json")
+    }
+
     pub fn archive_dir(&self) -> PathBuf {
         self.state_dir.join("archive")
     }
