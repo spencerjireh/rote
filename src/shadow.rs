@@ -178,35 +178,15 @@ pub fn residue_diff(project: &ProjectPaths, cfg: &Config) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
 
-    let mut candidates = git::status_paths(shadow)?;
-    candidates.extend(git::status_paths(real)?);
-    candidates.sort();
-    candidates.dedup();
-
-    let devnull = std::path::PathBuf::from("/dev/null");
-    let mut out = Vec::new();
-    for rel in candidates {
-        let real_path = real.join(&rel);
-        let shadow_path = shadow.join(&rel);
-        let real_bytes = std::fs::read(&real_path).ok();
-        let shadow_bytes = std::fs::read(&shadow_path).ok();
-        if real_bytes == shadow_bytes {
-            continue;
-        }
-        let a = if real_bytes.is_some() {
-            &real_path
-        } else {
-            &devnull
-        };
-        let b = if shadow_bytes.is_some() {
-            &shadow_path
-        } else {
-            &devnull
-        };
-        let raw = git::diff_no_index(a, b, crate::hunks::CONTEXT_LINES)?;
-        // Repo-relative headers, so the archived patch can actually be applied.
-        out.extend(git::relativize_no_index_diff(&raw, &rel.to_string_lossy()));
+    // Repo-relative headers, so the archived patch can actually be applied.
+    let out = crate::pairdiff::Pair {
+        left: real,
+        right: shadow,
+        status_from: &[shadow, real],
+        extra: &[],
     }
+    .diff(crate::hunks::CONTEXT_LINES)?;
+
     let _ = cfg;
     Ok(out)
 }

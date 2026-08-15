@@ -67,33 +67,22 @@ pub fn session_diff(project: &ProjectPaths, manifest: &Manifest) -> Result<Vec<u
         }
     }
 
-    let mut candidates = git::status_paths(&project.repo_root)?;
-    candidates.extend(git::status_paths(&project.shadow_dir)?);
-    for h in &manifest.hunks {
-        candidates.push(std::path::PathBuf::from(&h.file));
+    // The baseline worktree is a throwaway checkout with no status of its own,
+    // so the candidates come from the two live trees — plus every file the
+    // manifest mentions, which is what makes a hunk the user typed and then
+    // reverted still show up as considered.
+    let touched: Vec<std::path::PathBuf> = manifest
+        .hunks
+        .iter()
+        .map(|h| std::path::PathBuf::from(&h.file))
+        .collect();
+    let out = crate::pairdiff::Pair {
+        left: &base,
+        right: &project.repo_root,
+        status_from: &[&project.repo_root, &project.shadow_dir],
+        extra: &touched,
     }
-    candidates.sort();
-    candidates.dedup();
-
-    let devnull = std::path::PathBuf::from("/dev/null");
-    let mut out = Vec::new();
-    for rel in candidates {
-        let before = base.join(&rel);
-        let now = project.repo_root.join(&rel);
-        let before_bytes = std::fs::read(&before).ok();
-        let now_bytes = std::fs::read(&now).ok();
-        if before_bytes == now_bytes {
-            continue;
-        }
-        let a = if before_bytes.is_some() {
-            &before
-        } else {
-            &devnull
-        };
-        let b = if now_bytes.is_some() { &now } else { &devnull };
-        let raw = git::diff_no_index(a, b, crate::hunks::CONTEXT_LINES)?;
-        out.extend(git::relativize_no_index_diff(&raw, &rel.to_string_lossy()));
-    }
+    .diff(crate::hunks::CONTEXT_LINES)?;
 
     // Drop the worktree registration so the shadow's git dir stays tidy.
     let _ = git::prune_worktrees(&project.shadow_dir);

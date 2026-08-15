@@ -6,9 +6,10 @@ use rote::daemon;
 use rote::detect;
 use rote::git;
 use rote::hunks::Status;
+use rote::lockfile::Lock;
 use rote::model;
 use rote::pane;
-use rote::paths::{self, Lock, ProjectPaths};
+use rote::paths::{self, ProjectPaths};
 use rote::present::{self, Classification};
 use rote::review;
 use rote::session::{self, Manifest, Terminal};
@@ -1043,13 +1044,12 @@ fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Re
         return Ok(());
     }
 
-    let file_lines = present::read_lines(&real_file)?;
-    let anchor = present::find_anchor(&file_lines, &hunk);
+    let located = present::locate(&project.repo_root, &hunk);
     print!(
         "{}",
-        present::render(&hunk, position, total, &anchor, color)
+        present::render(&hunk, position, total, &located.anchor, color)
     );
-    println!("{}:{}", hunk.file, anchor.line);
+    println!("{}:{}", hunk.file, located.anchor.line);
     if let Some(d) = &hunk.pending_divergence {
         print!(
             "{}",
@@ -1078,9 +1078,8 @@ fn cmd_show(project: &ProjectPaths, hunk_id: Option<&str>, color: bool) -> Resul
         return Ok(());
     };
 
-    let file_lines = present::read_lines(&project.repo_root.join(&hunk.file))?;
-    let anchor = present::find_anchor(&file_lines, hunk);
-    print!("{}", present::render(hunk, 0, 0, &anchor, color));
+    let located = present::locate(&project.repo_root, hunk);
+    print!("{}", present::render(hunk, 0, 0, &located.anchor, color));
     println!("status: {}", hunk.status);
     if let Some(d) = hunk
         .divergence

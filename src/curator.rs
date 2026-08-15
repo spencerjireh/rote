@@ -153,7 +153,7 @@ fn set_if_changed<T: PartialEq>(slot: &mut Option<T>, value: Option<T>) -> bool 
 /// The trigger compares this against the last attempt, so it must not move when
 /// the queue is merely re-sorted or when the same key appears twice — otherwise
 /// the curator would re-fire on its own output.
-pub fn fingerprint(keys: &[String]) -> String {
+fn fingerprint(keys: &[String]) -> String {
     let mut sorted: Vec<&str> = keys.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     sorted.dedup();
@@ -168,7 +168,11 @@ pub fn fingerprint(keys: &[String]) -> String {
 }
 
 /// The keys of every pending hunk, deduplicated, in queue order.
-pub fn pending_keys(manifest: &Manifest) -> Vec<String> {
+///
+/// `pub(crate)` rather than private because the engine asks the same question
+/// for an unrelated reason: pruning its record of which hunks were seen
+/// mid-transcription down to the ones still in the queue.
+pub(crate) fn pending_keys(manifest: &Manifest) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     manifest
         .queue_view()
@@ -179,7 +183,7 @@ pub fn pending_keys(manifest: &Manifest) -> Vec<String> {
 }
 
 /// Whether a hunk is one the curator has anything to say about.
-pub fn is_rankable(h: &Hunk) -> bool {
+fn is_rankable(h: &Hunk) -> bool {
     !h.key.is_empty()
 }
 
@@ -253,7 +257,7 @@ pub struct Candidate {
 /// share a key by design (`disambiguate_ids` splits ids, not keys) — offering
 /// the same change twice would only invite the model to rank it inconsistently
 /// with itself.
-pub fn candidates(manifest: &Manifest, cache: &Cache) -> Vec<Candidate> {
+fn candidates(manifest: &Manifest, cache: &Cache) -> Vec<Candidate> {
     let mut seen = std::collections::HashSet::new();
     manifest
         .queue_view()
@@ -285,7 +289,7 @@ pub fn candidates(manifest: &Manifest, cache: &Cache) -> Vec<Candidate> {
 /// not cosmetic: a model asked to echo `k-3f9a1c...` will eventually mangle one,
 /// and a mangled key is a silently misplaced hunk. Index to key is a mapping we
 /// own and can check.
-pub fn build_payload(task: &str, candidates: &[Candidate]) -> String {
+fn build_payload(task: &str, candidates: &[Candidate]) -> String {
     let mut out = String::new();
     out.push_str("== TASK ==\n");
     out.push_str(if task.is_empty() {
@@ -384,7 +388,7 @@ struct RawRanked {
 /// keys. It does not accept an answer it cannot make sense of at all — that
 /// returns `Err` so the caller can tombstone the batch and warn once, rather
 /// than silently producing an empty ordering that looks like success.
-pub fn parse_response(text: &str, n: usize) -> Result<Vec<Ranked>> {
+fn parse_response(text: &str, n: usize) -> Result<Vec<Ranked>> {
     let body = extract_json(text).context("no JSON object or array in the reply")?;
 
     let raw: Vec<RawRanked> = if body.starts_with('[') {
@@ -454,22 +458,24 @@ pub const CURATOR_SETTLE_MS: u64 = 1500;
 /// daemon restart resets it, which is right: a restart is not a loop.
 pub const MAX_PASSES_PER_SESSION: u32 = 8;
 
-/// Everything the decision needs, and nothing it could act on.
+/// What only the engine knows: whether a pass may start at all.
 ///
-/// Pure so the policy is testable with no clock, no filesystem and no model —
-/// the same argument that made `Watchdog` pure.
+/// The queue and the cache are deliberately absent. Those are the curator's own
+/// business, and `start` reads them — an engine that had to assemble them would
+/// be an engine that could assemble them wrongly.
 pub struct Trigger<'a> {
     pub enabled: bool,
     pub in_flight: bool,
     /// The agent has stopped writing and no re-diff is owed.
     pub quiet: bool,
     pub passes: u32,
-    pub pending_keys: &'a [String],
-    pub cache: &'a Cache,
     pub last_fingerprint: Option<&'a str>,
 }
 
 /// The fingerprint to record if a pass should start now, or `None`.
+///
+/// Pure so the policy is testable with no clock, no filesystem and no model —
+/// the same argument that made `Watchdog` pure.
 ///
 /// The subtle condition is the second-to-last one. Firing needs at least one
 /// pending key the cache has never *considered* — and because a completed pass
@@ -477,24 +483,46 @@ pub struct Trigger<'a> {
 /// can never bring that set back from empty. Typing removes a hunk from
 /// `pending`; it does not uncurate anything. So ordinary work never re-fires the
 /// curator, and only the agent adding something does.
-pub fn should_curate(t: &Trigger) -> Option<String> {
+fn should_curate(t: &Trigger, pending_keys: &[String], cache: &Cache) -> Option<String> {
     if !t.enabled || t.in_flight || !t.quiet {
         return None;
     }
     if t.passes >= MAX_PASSES_PER_SESSION {
         return None;
     }
-    if t.pending_keys.len() < MIN_HUNKS_TO_CURATE {
+    if pending_keys.len() < MIN_HUNKS_TO_CURATE {
         return None;
     }
-    if t.pending_keys.iter().all(|k| t.cache.considered(k)) {
+    if pending_keys.iter().all(|k| cache.considered(k)) {
         return None;
     }
-    let fp = fingerprint(t.pending_keys);
+    let fp = fingerprint(pending_keys);
     if t.last_fingerprint == Some(fp.as_str()) {
         return None;
     }
     Some(fp)
+}
+
+/// A pass that is owed: what to ask, and the fingerprint to remember asking.
+pub struct Pass {
+    pub fingerprint: String,
+    pub task: String,
+    pub candidates: Vec<Candidate>,
+}
+
+/// Whether a pass is owed right now, and everything running one needs.
+///
+/// Reads the cache and the queue itself, so the caller's only job is to say
+/// whether the world is quiet enough to ask. Takes no lock and writes nothing:
+/// the engine calls this on its own thread and `run_pass` on another.
+pub fn start(project: &ProjectPaths, m: &Manifest, t: &Trigger) -> Option<Pass> {
+    let cache = Cache::load(project, m.session_stamp());
+    let fingerprint = should_curate(t, &pending_keys(m), &cache)?;
+    Some(Pass {
+        fingerprint,
+        task: m.task.clone(),
+        candidates: candidates(m, &cache),
+    })
 }
 
 /// Turn the model's ordering into the entries to store, pin included.
@@ -507,7 +535,7 @@ pub fn should_curate(t: &Trigger) -> Option<String> {
 /// the cache is re-applied after every `reconcile`, so a pin held anywhere else
 /// would be overwritten by the next recompute a second later and the screen
 /// would jump after all.
-pub fn assign_ranks(
+fn assign_ranks(
     considered: &[String],
     order: &[(String, Option<String>)],
     pinned: Option<&str>,
@@ -596,6 +624,42 @@ pub fn run_pass(cfg: &crate::config::Config, task: &str, candidates: Vec<Candida
         },
         Err(e) => fail(format!("{e:#}")),
     }
+}
+
+/// Write a finished pass to the cache and project it onto the manifest.
+///
+/// `true` if anything actually moved. The whole read-modify-write happens under
+/// the manifest lock, and the *order* inside it is the reason this is one call
+/// rather than five at the call site: the cache is written first, so a process
+/// that dies between the two writes loses nothing — the next recompute
+/// re-applies it. `Lock::acquire` opens a fresh descriptor each call and so is
+/// not re-entrant, which is why both writes have to happen inside the closure
+/// and neither can be hoisted out by a caller trying to be helpful.
+///
+/// `pinned` is asked for the hunk that must keep the head, computed inside the
+/// lock because the head moves while a pass runs.
+///
+/// No compare-and-swap, unlike `commit_typed`, and the difference is worth
+/// stating. That one addresses a hunk by id, so it has to check the world did
+/// not move while it was unlocked. This is keyed by content: a hunk the user
+/// typed while the model was thinking is terminal and its rank is irrelevant,
+/// and one the agent reworked away simply has no entry. Applying it to whatever
+/// is pending *now* is self-verifying.
+pub fn absorb(
+    project: &ProjectPaths,
+    outcome: &Outcome,
+    pinned: &dyn Fn(&Manifest) -> Option<String>,
+) -> Result<bool> {
+    let (changed, _) = crate::session::with_session_maybe(project, |m| {
+        let pinned = pinned(m);
+        let entries = assign_ranks(&outcome.considered, &outcome.order, pinned.as_deref());
+
+        let mut cache = Cache::load(project, m.session_stamp());
+        cache.entries.extend(entries);
+        cache.save(project)?;
+        Ok(cache.apply(m).then_some(()))
+    })?;
+    Ok(changed.is_some())
 }
 
 /// The first balanced JSON value in a blob of text.
@@ -1130,14 +1194,12 @@ mod tests {
         (0..n).map(|i| format!("k-{i}")).collect()
     }
 
-    fn trigger<'a>(pending: &'a [String], cache: &'a Cache) -> Trigger<'a> {
+    fn trigger<'a>() -> Trigger<'a> {
         Trigger {
             enabled: true,
             in_flight: false,
             quiet: true,
             passes: 0,
-            pending_keys: pending,
-            cache,
             last_fingerprint: None,
         }
     }
@@ -1145,8 +1207,8 @@ mod tests {
     #[test]
     fn a_queue_with_one_hunk_is_not_worth_curating() {
         let cache = Cache::new("s");
-        assert!(should_curate(&trigger(&keys(1), &cache)).is_none());
-        assert!(should_curate(&trigger(&keys(2), &cache)).is_some());
+        assert!(should_curate(&trigger(), &keys(1), &cache).is_none());
+        assert!(should_curate(&trigger(), &keys(2), &cache).is_some());
     }
 
     #[test]
@@ -1169,10 +1231,10 @@ mod tests {
 
         for typed in 0..3 {
             let left = &all[typed..];
-            let mut t = trigger(left, &cache);
+            let mut t = trigger();
             t.last_fingerprint = Some(&fp);
             assert!(
-                should_curate(&t).is_none(),
+                should_curate(&t, left, &cache).is_none(),
                 "typing hunk {typed} must not spend a token"
             );
         }
@@ -1191,7 +1253,7 @@ mod tests {
         }
         for typed in 0..3 {
             assert!(
-                should_curate(&trigger(&all[typed..], &cache)).is_none(),
+                should_curate(&trigger(), &all[typed..], &cache).is_none(),
                 "after a failure, typing hunk {typed} must not retry it"
             );
         }
@@ -1205,34 +1267,34 @@ mod tests {
         }
         let mut grown = keys(3);
         grown.push("k-new".into());
-        assert!(should_curate(&trigger(&grown, &cache)).is_some());
+        assert!(should_curate(&trigger(), &grown, &cache).is_some());
     }
 
     #[test]
     fn nothing_starts_while_a_pass_is_in_flight() {
         let cache = Cache::new("s");
         let ks = keys(3);
-        let mut t = trigger(&ks, &cache);
+        let mut t = trigger();
         t.in_flight = true;
-        assert!(should_curate(&t).is_none());
+        assert!(should_curate(&t, &ks, &cache).is_none());
     }
 
     #[test]
     fn nothing_starts_while_the_agent_is_still_writing() {
         let cache = Cache::new("s");
         let ks = keys(3);
-        let mut t = trigger(&ks, &cache);
+        let mut t = trigger();
         t.quiet = false;
-        assert!(should_curate(&t).is_none());
+        assert!(should_curate(&t, &ks, &cache).is_none());
     }
 
     #[test]
     fn a_disabled_curator_never_starts() {
         let cache = Cache::new("s");
         let ks = keys(3);
-        let mut t = trigger(&ks, &cache);
+        let mut t = trigger();
         t.enabled = false;
-        assert!(should_curate(&t).is_none());
+        assert!(should_curate(&t, &ks, &cache).is_none());
     }
 
     #[test]
@@ -1240,9 +1302,12 @@ mod tests {
         let cache = Cache::new("s");
         let ks = keys(3);
         let fp = fingerprint(&ks);
-        let mut t = trigger(&ks, &cache);
+        let mut t = trigger();
         t.last_fingerprint = Some(&fp);
-        assert!(should_curate(&t).is_none(), "even with nothing cached yet");
+        assert!(
+            should_curate(&t, &ks, &cache).is_none(),
+            "even with nothing cached yet"
+        );
     }
 
     #[test]
@@ -1251,9 +1316,9 @@ mod tests {
         // an agent that keeps writing produces a new queue every time.
         let cache = Cache::new("s");
         let ks = keys(3);
-        let mut t = trigger(&ks, &cache);
+        let mut t = trigger();
         t.passes = MAX_PASSES_PER_SESSION;
-        assert!(should_curate(&t).is_none());
+        assert!(should_curate(&t, &ks, &cache).is_none());
     }
 
     // --------------------------------------------------------------- ranks

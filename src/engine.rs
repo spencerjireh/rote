@@ -1,11 +1,11 @@
 //! The watch engine: reclassify on save, advance the queue, publish snapshots.
 //!
 //! Everything that decides *when* rote acts lives here, and it is written to be
-//! testable without a filesystem or a stopwatch. Time enters through `Clock`
-//! rather than `Instant` — `Instant` has no constructor, so a fake one is
-//! impossible and every grace-window test would become a two-second sleep that
-//! is flaky under load. The divergence state machine is a separate `Watchdog`
-//! with no I/O at all.
+//! testable without a filesystem or a stopwatch. Time enters as a parameter:
+//! `step(ev, now)` is handed the moment rather than reading one, so a test names
+//! the moment it wants and every grace-window case is exact instead of a
+//! two-second sleep that is flaky under load. The divergence state machine is a
+//! separate `Watchdog` with no I/O at all.
 //!
 //! The engine is not privileged. It mutates the manifest through
 //! `session::with_session` exactly as the CLI does, and it re-verifies the hunk
@@ -50,28 +50,6 @@ pub struct Tick(pub u64);
 impl Tick {
     fn since(self, earlier: Tick) -> u64 {
         self.0.saturating_sub(earlier.0)
-    }
-}
-
-pub trait Clock: Send {
-    fn now(&self) -> Tick;
-}
-
-pub struct RealClock {
-    start: std::time::Instant,
-}
-
-impl Default for RealClock {
-    fn default() -> Self {
-        Self {
-            start: std::time::Instant::now(),
-        }
-    }
-}
-
-impl Clock for RealClock {
-    fn now(&self) -> Tick {
-        Tick(self.start.elapsed().as_millis() as u64)
     }
 }
 
@@ -285,7 +263,10 @@ enum Pending {
 pub struct Engine {
     project: ProjectPaths,
     cfg: Config,
-    clock: Box<dyn Clock>,
+    /// What `now()` counts from. `step` takes the moment as a parameter, so this
+    /// is only consulted by `run`'s own loop — which is why there is no clock
+    /// abstraction here: the tests drive `step` directly and never need one.
+    started_at: std::time::Instant,
     /// Each file's lines as of the last time its hunks became answerable.
     baselines: HashMap<String, Vec<String>>,
     watchdog: Watchdog,
@@ -329,12 +310,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(project: ProjectPaths, cfg: Config, clock: Box<dyn Clock>) -> Self {
+    pub fn new(project: ProjectPaths, cfg: Config) -> Self {
         let (curation_tx, curation_rx) = std::sync::mpsc::channel();
         Self {
             project,
             cfg,
-            clock,
+            started_at: std::time::Instant::now(),
             baselines: HashMap::new(),
             watchdog: Watchdog::default(),
             recompute: Pending::No,
@@ -354,7 +335,7 @@ impl Engine {
     }
 
     pub fn now(&self) -> Tick {
-        self.clock.now()
+        Tick(self.started_at.elapsed().as_millis() as u64)
     }
 
     /// How long the caller should block before calling `step(None, ..)` again.
@@ -951,22 +932,25 @@ impl Engine {
             };
 
         let manifest = Manifest::require(&self.project)?;
-        let cache = curator::Cache::load(&self.project, manifest.session_stamp());
-        let keys = curator::pending_keys(&manifest);
-        let Some(fingerprint) = curator::should_curate(&curator::Trigger {
-            enabled: self.cfg.curator_enabled,
-            in_flight: self.curation_in_flight,
-            quiet,
-            passes: self.curation_passes,
-            pending_keys: &keys,
-            cache: &cache,
-            last_fingerprint: self.last_curation_fingerprint.as_deref(),
-        }) else {
+        let Some(pass) = curator::start(
+            &self.project,
+            &manifest,
+            &curator::Trigger {
+                enabled: self.cfg.curator_enabled,
+                in_flight: self.curation_in_flight,
+                quiet,
+                passes: self.curation_passes,
+                last_fingerprint: self.last_curation_fingerprint.as_deref(),
+            },
+        ) else {
             return Ok(());
         };
 
-        let candidates = curator::candidates(&manifest, &cache);
-        let task = manifest.task.clone();
+        let curator::Pass {
+            fingerprint,
+            task,
+            candidates,
+        } = pass;
         let cfg = self.cfg.clone();
         let tx = self.curation_tx.clone();
         std::thread::spawn(move || {
@@ -986,39 +970,17 @@ impl Engine {
         Ok(())
     }
 
-    /// Write a finished pass to the cache and project it onto the manifest.
+    /// Take a finished pass, if there is still a session to take it into.
     ///
-    /// No compare-and-swap, unlike `commit_typed`, and the difference is worth
-    /// stating. That one addresses a hunk by id, so it has to check the world
-    /// did not move while it was unlocked. This is keyed by content: a hunk the
-    /// user typed while the model was thinking is terminal and its rank is
-    /// irrelevant, and one the agent reworked away simply has no entry. Applying
-    /// it to whatever is pending *now* is self-verifying.
+    /// The guard is the engine's business rather than the curator's: a manifest
+    /// archived while the model was thinking means dropping the outcome early
+    /// avoids a pointless warning during teardown. The session stamp would have
+    /// made a stray write inert anyway.
     fn absorb_curation(&self, outcome: &curator::Outcome) -> Result<bool> {
         if Manifest::load(&self.project)?.is_none() {
-            // Archived while the model was thinking. Dropping it early avoids a
-            // pointless warning during teardown; the session stamp would have
-            // made a stray write inert anyway.
             return Ok(false);
         }
-
-        let project = &self.project;
-        let (changed, _) = session::with_session_maybe(project, |m| {
-            // Computed under the lock, because the head moves while a pass runs.
-            let pinned = self.pinned_key(m);
-            let entries =
-                curator::assign_ranks(&outcome.considered, &outcome.order, pinned.as_deref());
-
-            let mut cache = curator::Cache::load(project, m.session_stamp());
-            cache.entries.extend(entries);
-            // Written inside the closure because `Lock::acquire` opens a fresh
-            // descriptor each call and so is not re-entrant — there is no way to
-            // hold the manifest lock across both writes from outside. Cache
-            // first: if the process dies here, the next recompute re-applies it.
-            cache.save(project)?;
-            Ok(cache.apply(m).then_some(()))
-        })?;
-        Ok(changed.is_some())
+        curator::absorb(&self.project, outcome, &|m| self.pinned_key(m))
     }
 
     /// The hunk that must keep the head, if any.
@@ -1061,15 +1023,14 @@ impl Engine {
         }
         self.last_published = Some(manifest.generation);
 
-        let anchor = match manifest.active() {
-            Some(h) => {
-                let real = self.project.repo_root.join(&h.file);
-                let lines = present::read_lines(&real)?;
-                let a = present::find_anchor(&lines, h);
-                Some((a.line, a.via, real.to_string_lossy().into_owned()))
-            }
-            None => None,
-        };
+        let anchor = manifest.active().map(|h| {
+            let l = present::locate(&self.project.repo_root, h);
+            (
+                l.anchor.line,
+                l.anchor.via,
+                l.real_path.to_string_lossy().into_owned(),
+            )
+        });
         let snap = state::Snapshot::build(&manifest, anchor, self.drift, notices);
         Ok(vec![state::Event::Snapshot(Box::new(snap))])
     }

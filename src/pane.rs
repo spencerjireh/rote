@@ -16,9 +16,10 @@
 
 use crate::config::Config;
 use crate::daemon;
-use crate::engine::{Engine, EngineEvent, RealClock, TICK};
+use crate::engine::{Engine, EngineEvent, TICK};
 use crate::http;
-use crate::paths::{Lock, ProjectPaths};
+use crate::lockfile::Lock;
+use crate::paths::ProjectPaths;
 use crate::present::{self, Anchor};
 use crate::state::{self, Snapshot};
 use crate::watcher;
@@ -287,7 +288,7 @@ pub fn run_local(project: &ProjectPaths, cfg: &Config, opts: Options) -> Result<
     let interactive = raw.is_some();
     let screen = Screen::enter(interactive);
 
-    let mut engine = Engine::new(project.clone(), cfg.clone(), Box::new(RealClock::default()));
+    let mut engine = Engine::new(project.clone(), cfg.clone());
     let deadline = opts
         .timeout_ms
         .map(|ms| Instant::now() + Duration::from_millis(ms));

@@ -8,7 +8,7 @@ use crate::hunks::{Hunk, Op};
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// How an anchor was located, worst case last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +235,29 @@ pub(crate) fn region<'a>(
     }
     let end = (start + expected_len).min(file_lines.len());
     &file_lines[start..end]
+}
+
+/// A hunk's anchor, and the file it was resolved against.
+#[derive(Debug, Clone)]
+pub struct Located {
+    pub anchor: Anchor,
+    pub real_path: PathBuf,
+}
+
+/// Where this hunk begins in the real file as it now stands.
+///
+/// Reads the file itself, because every caller that wanted an anchor read the
+/// file for no other reason — the printer, the snapshot builder, and the
+/// daemon's detail endpoint each wrote the same three lines. A file that cannot
+/// be read anchors at its stored hint, which is precisely what that hint is for:
+/// an unreadable file is not a reason to refuse to draw the hunk.
+pub fn locate(repo_root: &Path, hunk: &Hunk) -> Located {
+    let real_path = repo_root.join(&hunk.file);
+    let lines = read_lines(&real_path).unwrap_or_default();
+    Located {
+        anchor: find_anchor(&lines, hunk),
+        real_path,
+    }
 }
 
 /// The lines this hunk owns, as the file currently stands.

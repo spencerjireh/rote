@@ -6,13 +6,12 @@
 
 use crate::config::Config;
 use crate::diffparse::{self, DiffLine, ParsedDiff, RawHunk};
-use crate::git;
+use crate::pairdiff;
 use crate::paths::ProjectPaths;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 /// Context lines carried on each side of a hunk.
 pub const CONTEXT_LINES: usize = 3;
@@ -561,14 +560,6 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0)
 }
 
-fn read_opt(path: &Path) -> Result<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(b) => Ok(Some(b)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
-    }
-}
-
 /// An untypeable hunk: shown as a path and a note, gated on byte equality.
 fn untypeable_hunk(file: &str, real_exists: bool, shadow_exists: bool, note: &str) -> Hunk {
     let op = match (real_exists, shadow_exists) {
@@ -594,30 +585,24 @@ pub fn compute_hunks(project: &ProjectPaths, cfg: &Config) -> Result<Vec<Hunk>> 
         shadow.display()
     );
 
-    let mut candidates: Vec<PathBuf> = git::status_paths(shadow)?;
-    candidates.extend(git::status_paths(real)?);
-    candidates.sort();
-    candidates.dedup();
+    // Real on the left, shadow on the right: the diff reads in the direction the
+    // user has to type.
+    let pair = pairdiff::Pair {
+        left: real,
+        right: shadow,
+        status_from: &[shadow, real],
+        extra: &[],
+    };
 
     let verbatim = cfg.verbatim_set()?;
-    let devnull = PathBuf::from("/dev/null");
     let mut out = Vec::new();
 
-    for rel in candidates {
-        let rel_str = rel.to_string_lossy().to_string();
-        let real_path = real.join(&rel);
-        let shadow_path = shadow.join(&rel);
-
-        let real_bytes = read_opt(&real_path)?;
-        let shadow_bytes = read_opt(&shadow_path)?;
-        if real_bytes == shadow_bytes {
-            continue; // identical, or absent from both
-        }
-
-        let real_exists = real_bytes.is_some();
-        let shadow_exists = shadow_bytes.is_some();
-        let is_binary = real_bytes.as_deref().map(looks_binary).unwrap_or(false)
-            || shadow_bytes.as_deref().map(looks_binary).unwrap_or(false);
+    for c in pair.changed()? {
+        let rel_str = c.rel.to_string_lossy().to_string();
+        let real_exists = c.left_exists();
+        let shadow_exists = c.right_exists();
+        let is_binary = c.left.as_deref().map(looks_binary).unwrap_or(false)
+            || c.right.as_deref().map(looks_binary).unwrap_or(false);
 
         if is_binary {
             out.push(untypeable_hunk(
@@ -628,7 +613,7 @@ pub fn compute_hunks(project: &ProjectPaths, cfg: &Config) -> Result<Vec<Hunk>> 
             ));
             continue;
         }
-        if verbatim.is_match(&rel) {
+        if verbatim.is_match(&c.rel) {
             out.push(untypeable_hunk(
                 &rel_str,
                 real_exists,
@@ -638,13 +623,7 @@ pub fn compute_hunks(project: &ProjectPaths, cfg: &Config) -> Result<Vec<Hunk>> 
             continue;
         }
 
-        let a = if real_exists { &real_path } else { &devnull };
-        let b = if shadow_exists {
-            &shadow_path
-        } else {
-            &devnull
-        };
-        let diff = git::diff_no_index(a, b, CONTEXT_LINES)?;
+        let diff = pair.diff_one(&c, CONTEXT_LINES)?;
         let mut parsed = diffparse::parse(&diff)?;
         // `--no-index` against /dev/null reports a path, not a null side.
         parsed.old_is_devnull |= !real_exists;

@@ -125,7 +125,7 @@ fn endpoint_reports_an_owner_that_will_not_talk_rather_than_a_stale_address() {
     let cli = session();
     let project = cli.fx.project();
     project.ensure_state_dir().unwrap();
-    let _held = rote::paths::Lock::acquire(&project.watch_lock_path()).unwrap();
+    let _held = rote::lockfile::Lock::acquire(&project.watch_lock_path()).unwrap();
 
     let out = cli.run(&["endpoint", "--json", "--ensure"]);
     assert!(!out.status.success());

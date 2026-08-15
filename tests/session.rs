@@ -9,7 +9,7 @@ mod common;
 use common::Fixture;
 use rote::config::Config;
 use rote::hunks::Status;
-use rote::paths::Lock;
+use rote::lockfile::Lock;
 use rote::session::{self, Manifest, State, Terminal};
 use rote::shadow;
 

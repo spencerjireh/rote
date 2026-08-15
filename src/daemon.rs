@@ -12,9 +12,10 @@
 //! because the kernel maintains it and a file cannot.
 
 use crate::config::Config;
-use crate::engine::{Engine, EngineEvent, RealClock};
+use crate::engine::{Engine, EngineEvent};
 use crate::http;
-use crate::paths::{write_atomic_mode, Lock, ProjectPaths};
+use crate::lockfile::Lock;
+use crate::paths::{write_atomic_mode, ProjectPaths};
 use crate::session::{Manifest, Terminal};
 use crate::state;
 use crate::watcher;
@@ -305,7 +306,7 @@ pub fn reap(project: &ProjectPaths, terminal: Option<Terminal>) {
 fn wait_for_exit(pid: u32, ceiling: Duration) -> bool {
     let start = Instant::now();
     loop {
-        if !crate::paths::pid_is_live(pid) {
+        if !crate::lockfile::pid_is_live(pid) {
             return true;
         }
         if start.elapsed() >= ceiling {
@@ -392,7 +393,7 @@ pub fn fetch_state(ep: &Endpoint) -> Result<state::Snapshot> {
 
 /// The error for "something owns the queue but will not talk to us".
 pub fn opaque_owner_error(project: &ProjectPaths, pid: Option<u32>) -> anyhow::Error {
-    match pid.filter(|p| crate::paths::pid_is_live(*p)) {
+    match pid.filter(|p| crate::lockfile::pid_is_live(*p)) {
         Some(pid) => anyhow::anyhow!(
             "pid {pid} owns this project's queue but is not answering.\n\
              Stop it, then try again."
@@ -548,7 +549,7 @@ pub fn serve(project: &ProjectPaths, cfg: &Config, opts: ServeOptions) -> Result
     let engine_project = project.clone();
     let engine_cfg = cfg.clone();
     let engine_thread = std::thread::spawn(move || {
-        let mut engine = Engine::new(engine_project, engine_cfg, Box::new(RealClock::default()));
+        let mut engine = Engine::new(engine_project, engine_cfg);
         // `Engine::run`'s first caller. It was written for this and has been
         // waiting since the engine landed.
         let out = engine.run(&engine_rx, |ev| {
@@ -884,43 +885,10 @@ fn reject(ctx: &Ctx, request: &Request, path: &str, query: &str) -> Option<Respo
             )
         })
         .collect();
-    let find = |name: &str| http::header_of(&headers, name).map(|v| v.to_string());
-
-    // A hostile page can point its own name at 127.0.0.1; it cannot forge these.
-    if let Some(origin) = find("Origin") {
-        if !http::is_loopback_origin(&origin, ctx.port) {
-            return Some(error(403, "forbidden_origin"));
-        }
-    }
-    if let Some(host) = find("Host") {
-        if !http::is_loopback_host(&host) {
-            return Some(error(403, "forbidden_host"));
-        }
-    }
-
-    // `EventSource` cannot set headers, so the stream accepts a query token —
-    // and so does the page itself, because a browser address bar cannot set one
-    // either. Exactly those two paths.
-    //
-    // Widening this rather than exempting `/` from authorization: an exempt
-    // path would be the first unauthenticated route in a daemon whose whole
-    // doctrine is that `reject` runs before routing, and it would make the port
-    // fingerprintable by any page on the machine.
-    let query_token_ok = matches!(path, "/events" | "/");
-    let presented = find("Authorization")
-        .and_then(|v| v.strip_prefix("Bearer ").map(|t| t.to_string()))
-        .or_else(|| {
-            if query_token_ok {
-                query
-                    .split('&')
-                    .find_map(|kv| kv.strip_prefix("token=").map(|t| t.to_string()))
-            } else {
-                None
-            }
-        });
-    match presented {
-        Some(t) if http::constant_time_eq(t.as_bytes(), ctx.token.as_bytes()) => None,
-        _ => Some(error(401, "unauthorized")),
+    match http::authorize(&headers, path, query, ctx.port, &ctx.token)? {
+        http::Rejection::ForbiddenOrigin => Some(error(403, "forbidden_origin")),
+        http::Rejection::ForbiddenHost => Some(error(403, "forbidden_host")),
+        http::Rejection::Unauthorized => Some(error(401, "unauthorized")),
     }
 }
 
@@ -977,17 +945,15 @@ fn hunk_detail(ctx: &Ctx, id: &str) -> ResponseBox {
     let Some(hunk) = manifest.find(id) else {
         return error(404, "no_such_hunk");
     };
-    let real = ctx.project.repo_root.join(&hunk.file);
-    let lines = crate::present::read_lines(&real).unwrap_or_default();
-    let anchor = crate::present::find_anchor(&lines, hunk);
+    let located = crate::present::locate(&ctx.project.repo_root, hunk);
     json(
         200,
         &state::HunkDetail {
             generation: manifest.generation,
             hunk: hunk.clone(),
-            anchor_line: anchor.line,
-            anchor_via: anchor.via,
-            real_path: real.to_string_lossy().into_owned(),
+            anchor_line: located.anchor.line,
+            anchor_via: located.anchor.via,
+            real_path: located.real_path.to_string_lossy().into_owned(),
         },
     )
 }

@@ -12,7 +12,7 @@ mod common;
 
 use common::Fixture;
 use rote::config::Config;
-use rote::engine::{Engine, EngineEvent, Origin, RealClock, Tick};
+use rote::engine::{Engine, EngineEvent, Origin, Tick};
 use rote::hunks::Status;
 use rote::session::{self, Manifest};
 use rote::shadow;
@@ -45,7 +45,7 @@ fn started_with(
     Manifest::new(&project, "test task".into(), baseline)
         .save(&project)
         .unwrap();
-    let engine = Engine::new(project, cfg.clone(), Box::new(RealClock::default()));
+    let engine = Engine::new(project, cfg.clone());
     (fx, cfg, engine)
 }
 
@@ -478,7 +478,7 @@ fn three_hunks_with_curator(reply: &str) -> (Fixture, Engine, PathBuf) {
         .save(&project)
         .unwrap();
 
-    let engine = Engine::new(project, cfg, Box::new(RealClock::default()));
+    let engine = Engine::new(project, cfg);
     (fx, engine, calls)
 }
 

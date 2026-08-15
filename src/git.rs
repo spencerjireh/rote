@@ -113,19 +113,6 @@ pub fn head_commit(repo: &Path) -> Result<String> {
     Ok(out.stdout_trimmed())
 }
 
-/// Current branch name, or `None` when detached.
-pub fn current_branch(repo: &Path) -> Result<Option<String>> {
-    let out = run_in(
-        Some(repo),
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        &[0, 1],
-    )?;
-    if out.code == 1 {
-        return Ok(None);
-    }
-    Ok(Some(out.stdout_trimmed()))
-}
-
 /// An interrupted git operation in the real repo, if any.
 ///
 /// Sync cannot run while one of these is in flight, so `start` and `done` both

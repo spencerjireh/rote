@@ -272,7 +272,7 @@ pub fn with_session_maybe<T>(
     f: impl FnOnce(&mut Manifest) -> Result<Option<T>>,
 ) -> Result<(Option<T>, u64)> {
     project.ensure_state_dir()?;
-    let _lock = crate::paths::Lock::acquire(&project.lock_path())?;
+    let _lock = crate::lockfile::Lock::acquire(&project.lock_path())?;
 
     // Loaded *inside* the lock. Loading outside it is the bug this exists to fix.
     let mut manifest = Manifest::require(project)?;
@@ -299,7 +299,7 @@ pub fn with_session_recomputed<T>(
     f: impl FnOnce(&mut Manifest, &RecomputeReport) -> Result<T>,
 ) -> Result<T> {
     project.ensure_state_dir()?;
-    let _lock = crate::paths::Lock::acquire(&project.lock_path())?;
+    let _lock = crate::lockfile::Lock::acquire(&project.lock_path())?;
 
     let mut manifest = Manifest::require(project)?;
     let report = recompute(&mut manifest, project, cfg)?;

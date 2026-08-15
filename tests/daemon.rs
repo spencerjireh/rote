@@ -591,12 +591,12 @@ fn start_leaves_a_daemon_watching_in_the_background() {
         rote::daemon::discover(&cli.fx.project())
     });
     // And it survived the process that started it exec'ing away.
-    assert!(rote::paths::pid_is_live(ep.pid));
+    assert!(rote::lockfile::pid_is_live(ep.pid));
 
     // Clean up: nothing else in this test reaps it.
     let _ = cli.run_with_input(&["abort", "--yes"], "");
     common::daemon::wait_until("the daemon to be reaped", || {
-        !rote::paths::pid_is_live(ep.pid)
+        !rote::lockfile::pid_is_live(ep.pid)
     });
 }
 
@@ -686,7 +686,7 @@ fn declining_to_close_leaves_the_daemon_alone() {
     );
 
     assert!(
-        rote::paths::pid_is_live(pid),
+        rote::lockfile::pid_is_live(pid),
         "the daemon should still be up"
     );
     assert_eq!(d.get("/health").status, 200);
@@ -733,7 +733,7 @@ fn reap_refuses_to_signal_a_pid_belonging_to_another_project() {
     rote::daemon::reap(&project, Some(rote::session::Terminal::Done));
 
     assert!(
-        rote::paths::pid_is_live(pid),
+        rote::lockfile::pid_is_live(pid),
         "rote must not kill a process it cannot prove is its own"
     );
     let _ = victim.kill();
@@ -783,7 +783,7 @@ fn a_verb_refuses_when_something_owns_the_queue_but_answers_nothing() {
     let cli = session();
     let project = cli.fx.project();
     project.ensure_state_dir().unwrap();
-    let _held = rote::paths::Lock::try_acquire(&project.watch_lock_path())
+    let _held = rote::lockfile::Lock::try_acquire(&project.watch_lock_path())
         .unwrap()
         .expect("the token should be free");
 

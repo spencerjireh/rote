@@ -66,7 +66,7 @@ pub fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a 
 /// `==` on byte slices short-circuits at the first difference, which over
 /// enough requests tells an attacker how much of a token they have guessed.
 /// The length is compared first and separately — that much is public.
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -82,7 +82,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Exact match on scheme, host and port. Anything looser is the bug: a check
 /// that accepts a prefix lets `http://127.0.0.1.evil.com` through, and one that
 /// accepts a suffix lets `http://evil-127.0.0.1` through.
-pub fn is_loopback_origin(origin: &str, port: u16) -> bool {
+fn is_loopback_origin(origin: &str, port: u16) -> bool {
     ["127.0.0.1", "localhost", "[::1]"]
         .iter()
         .any(|h| origin == format!("http://{h}:{port}"))
@@ -93,7 +93,7 @@ pub fn is_loopback_origin(origin: &str, port: u16) -> bool {
 /// The DNS-rebinding defence. A page on `evil.com` can make a browser resolve
 /// its own name to 127.0.0.1 and then talk to whatever is listening; what it
 /// cannot do is change the `Host` header the browser sends.
-pub fn is_loopback_host(host: &str) -> bool {
+fn is_loopback_host(host: &str) -> bool {
     let name = match host.rsplit_once(':') {
         // Not a port if it is part of a bracketless IPv6 address.
         Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => h,
@@ -102,12 +102,71 @@ pub fn is_loopback_host(host: &str) -> bool {
     matches!(name, "127.0.0.1" | "localhost" | "[::1]" | "::1")
 }
 
+/// Why a request was turned away, in the order the checks run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    ForbiddenOrigin,
+    ForbiddenHost,
+    Unauthorized,
+}
+
+/// Every check a loopback request must pass before anything looks at its path.
+///
+/// One call rather than four exported predicates, because the *order* is part of
+/// the rule and an order assembled at the call site is an order that can be
+/// assembled differently next time. Returns a verdict rather than a response, so
+/// this stays a function over bytes and the daemon keeps its own opinions about
+/// status codes.
+pub fn authorize(
+    headers: &[(String, String)],
+    path: &str,
+    query: &str,
+    port: u16,
+    token: &str,
+) -> Option<Rejection> {
+    let find = |name: &str| header_of(headers, name);
+
+    // A hostile page can point its own name at 127.0.0.1; it cannot forge these.
+    if let Some(origin) = find("Origin") {
+        if !is_loopback_origin(origin, port) {
+            return Some(Rejection::ForbiddenOrigin);
+        }
+    }
+    if let Some(host) = find("Host") {
+        if !is_loopback_host(host) {
+            return Some(Rejection::ForbiddenHost);
+        }
+    }
+
+    // `EventSource` cannot set headers, so the stream accepts a query token —
+    // and so does the page itself, because a browser address bar cannot set one
+    // either. Exactly those two paths.
+    //
+    // Widening this rather than exempting `/` from authorization: an exempt path
+    // would be the first unauthenticated route in a daemon whose whole doctrine
+    // is that this runs before routing, and it would make the port
+    // fingerprintable by any page on the machine.
+    let query_token_ok = matches!(path, "/events" | "/");
+    let presented = find("Authorization")
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| {
+            query_token_ok
+                .then(|| query.split('&').find_map(|kv| kv.strip_prefix("token=")))
+                .flatten()
+        });
+
+    match presented {
+        Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => None,
+        _ => Some(Rejection::Unauthorized),
+    }
+}
+
 /// Is this content type JSON?
 ///
 /// Requiring it is what stops a hostile page firing a simple-CORS form POST at
 /// every port on your loopback: a form can only send three content types, and
 /// this is not one of them.
-pub fn is_json_content_type(value: &str) -> bool {
+pub(crate) fn is_json_content_type(value: &str) -> bool {
     value
         .split(';')
         .next()
