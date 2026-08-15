@@ -84,11 +84,25 @@ pub struct Divergence {
 
 /// How the content of a hunk arrived in the real tree.
 ///
-/// Reported by the front end, not inferred: nvim knows `TextChangedI` from a
-/// paste and a browser knows its paste event, but the filesystem cannot tell
-/// them apart — a careful typist writes a whole hunk into the buffer and saves
-/// once, which is byte-identical to a paste. Advisory, and surfaced rather than
-/// enforced.
+/// Two producers, and the difference between them is the whole design.
+///
+/// The **engine** infers, from the save history rather than from the bytes. A
+/// hunk observed `InProgress` — the region a line-wise prefix of the proposal —
+/// had a human in the loop at that moment, and one paste of a whole hunk cannot
+/// produce that: it classifies `Typed` on the first save and never passes
+/// through the prefix rule. This is deliberately weaker than "every character
+/// was typed" — pasting the first half and then the second is recorded as
+/// `typed`, and so is accepting a completion over a typed prefix. What the
+/// engine will never do is assert `Pasted`, because a careful typist who writes
+/// a whole hunk into the buffer and saves once is byte-identical to a paste.
+/// That is why `Unknown` is a first-class answer rather than a null.
+///
+/// A **front end** reports, from something the filesystem cannot see: nvim knows
+/// a bracketed paste from `TextChangedI`. A report always wins; an inference
+/// only ever fills in `Unknown`. So a wrong report can be corrected by another
+/// one, and an inference can never quietly overwrite what a front end saw.
+///
+/// Advisory throughout, and surfaced rather than enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Input {
@@ -96,6 +110,44 @@ pub enum Input {
     Unknown,
     Typed,
     Pasted,
+}
+
+impl Input {
+    /// Omitted from the wire when unset, like every other optional hunk field.
+    pub fn is_unknown(&self) -> bool {
+        *self == Input::Unknown
+    }
+
+    /// The engine's write: only ever into `Unknown`.
+    ///
+    /// An inference must not overwrite what a front end reported — you paste a
+    /// hunk, the plugin says so, and then you fix a character in it, which the
+    /// engine sees as typing. Without this guard that correction would erase the
+    /// report.
+    pub fn fill(&mut self, value: Input) -> bool {
+        if !self.is_unknown() || value == *self {
+            return false;
+        }
+        *self = value;
+        true
+    }
+
+    /// A front end's write: always lands.
+    ///
+    /// Last write wins, which is what makes `rote report … typed` able to
+    /// correct a heuristic that misfired. Two front ends disagreeing is
+    /// therefore order-dependent; that is rarer than a heuristic being wrong,
+    /// and correctable by hand either way.
+    ///
+    /// Returns whether anything moved, so a repeated report writes nothing and
+    /// does not move the generation.
+    pub fn set(&mut self, value: Input) -> bool {
+        if *self == value {
+            return false;
+        }
+        *self = value;
+        true
+    }
 }
 
 impl std::fmt::Display for Input {
@@ -139,7 +191,8 @@ pub struct Hunk {
     /// Curator-assigned teaching order. `None` sorts after everything ranked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curator_rank: Option<u32>,
-    #[serde(default)]
+    /// How this hunk's content arrived. See `Input`.
+    #[serde(default, skip_serializing_if = "Input::is_unknown")]
     pub input: Input,
 }
 
@@ -1090,5 +1143,56 @@ mod tests {
     fn binary_sniffing_uses_nul_bytes() {
         assert!(looks_binary(b"abc\0def"));
         assert!(!looks_binary(b"plain text\nwith newlines\n"));
+    }
+
+    // ------------------------------------------------------------ how it came
+
+    #[test]
+    fn an_unknown_input_is_omitted_from_the_wire() {
+        // Every optional hunk field is absent when unset, and this one was the
+        // exception — it serialized `"input":"unknown"` into every manifest and
+        // every snapshot, contradicting the schema in DESIGN §4.
+        let h = Hunk::new(
+            "a.rs",
+            Op::Insert,
+            Lines {
+                new: lines(&["work();"]),
+                ..Default::default()
+            },
+            1,
+            None,
+        );
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(!json.contains("input"), "{json}");
+
+        let mut typed = h.clone();
+        typed.input = Input::Typed;
+        assert!(serde_json::to_string(&typed)
+            .unwrap()
+            .contains("\"input\":\"typed\""));
+    }
+
+    #[test]
+    fn an_inference_only_ever_fills_in_an_unknown() {
+        let mut i = Input::Unknown;
+        assert!(i.fill(Input::Typed));
+        assert_eq!(i, Input::Typed);
+        // Already decided: a second inference changes nothing and says so, so
+        // it cannot move the generation.
+        assert!(!i.fill(Input::Typed));
+
+        // And the case the guard exists for: you paste a hunk, the plugin says
+        // so, then you fix a character in it. The engine must not erase that.
+        let mut reported = Input::Pasted;
+        assert!(!reported.fill(Input::Typed));
+        assert_eq!(reported, Input::Pasted);
+    }
+
+    #[test]
+    fn a_report_always_lands_so_a_wrong_one_can_be_corrected() {
+        let mut i = Input::Pasted;
+        assert!(i.set(Input::Typed), "a heuristic misfire is correctable");
+        assert_eq!(i, Input::Typed);
+        assert!(!i.set(Input::Typed), "but repeating it writes nothing");
     }
 }

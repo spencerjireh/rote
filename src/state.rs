@@ -194,12 +194,39 @@ pub enum Resolution {
     Retry,
 }
 
+/// What a front end may report about how a hunk arrived.
+///
+/// Deliberately not `hunks::Input`: `unknown` is not something a front end can
+/// assert — it is the absence of an assertion — and an unrepresentable illegal
+/// state beats a runtime rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reported {
+    Typed,
+    Pasted,
+}
+
+impl From<Reported> for crate::hunks::Input {
+    fn from(r: Reported) -> Self {
+        match r {
+            Reported::Typed => crate::hunks::Input::Typed,
+            Reported::Pasted => crate::hunks::Input::Pasted,
+        }
+    }
+}
+
 /// What a front end may ask for.
 ///
 /// Deliberately excludes `done`, `abort` and `start`: those confirm
 /// interactively and `exec`, so they stay CLI-only. Note there is no verb that
 /// sets a hunk to `typed` — that is producible only by the classifier, whose
 /// input came from the shadow.
+///
+/// `report` does not weaken that. It writes `input` and nothing else: not
+/// `status`, not `pending_divergence`, not `last_presented`. It cannot create a
+/// hunk or resurrect one, and it is accepted on a hunk that has already reached
+/// a terminal status — precisely so that a paste report cannot lose a race
+/// against the classifier that is about to mark the same hunk typed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum Command {
@@ -214,6 +241,11 @@ pub enum Command {
     Show {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hunk_id: Option<String>,
+    },
+    /// Say how a hunk's content arrived. Advisory; changes no status.
+    Report {
+        hunk_id: String,
+        input: Reported,
     },
     /// Force a full recompute.
     Refresh,
@@ -383,6 +415,25 @@ mod tests {
         // `refresh` carries nothing at all.
         let req: Request = serde_json::from_str(r#"{"wire_version":1,"verb":"refresh"}"#).unwrap();
         assert_eq!(req.command, Command::Refresh);
+
+        // `report` says how content arrived, and nothing else.
+        let text = r#"{"wire_version":1,"verb":"report","hunk_id":"h-1a2b","input":"pasted"}"#;
+        let req: Request = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            req.command,
+            Command::Report {
+                hunk_id: "h-1a2b".into(),
+                input: Reported::Pasted,
+            }
+        );
+    }
+
+    #[test]
+    fn a_front_end_cannot_report_that_it_does_not_know() {
+        // `unknown` is the absence of an assertion. Making it unrepresentable on
+        // the wire beats rejecting it at runtime.
+        let text = r#"{"wire_version":1,"verb":"report","hunk_id":"h-1","input":"unknown"}"#;
+        assert!(serde_json::from_str::<Request>(text).is_err());
     }
 
     #[test]

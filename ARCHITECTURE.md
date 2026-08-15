@@ -144,8 +144,8 @@ These are independent invocations; nothing links them.
 
 - Multiple concurrent sessions per project
 - Non-git projects
-- The nvim plugin and the browser front end (they will consume the same `state::Snapshot` the watch pane renders from — see DESIGN.md §12)
-- Paste prevention (honor system in v0)
+- Multiple front ends editing one hunk at once (they may all watch; the engine is still the only classifier)
+- Paste *prevention* (rote records how content arrived and says so at `done`; it never withholds text or refuses a paste — see DESIGN §6)
 - Windows support (Linux/macOS only)
 - Any Claude Code hooks, MCP servers, or SDK usage
 

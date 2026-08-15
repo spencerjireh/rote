@@ -179,6 +179,10 @@ pub fn observe(
 enum Decision<T> {
     Apply(T),
     Reject(String),
+    /// Nothing to write. Reported as applied — the caller asked for a state the
+    /// manifest is already in — but no write, so no generation bump and no
+    /// snapshot invalidated for every subscriber.
+    Nothing,
 }
 
 /// Either the value a mutation produced, or the reason there was not one.
@@ -307,6 +311,21 @@ pub struct Engine {
     /// When the *agent* last wrote. Separate from `recompute`, which the user's
     /// own typing arms as well.
     last_shadow_change: Option<Tick>,
+    /// Hunk `key`s seen mid-transcription — the region a proper prefix of the
+    /// proposal at some save. That is proof a human was in the loop, and it is
+    /// the only thing rote can honestly infer about how content arrived.
+    ///
+    /// By `key` rather than `id` because ids churn as the user types near a
+    /// hunk, and by content rather than by file because that is what survives.
+    /// In memory, and deliberately: a daemon restart degrades one hunk to
+    /// `unknown`, which is a designed answer, and persisting it would mean a
+    /// fourth on-disk artifact with its own version and session stamps for an
+    /// advisory counter that gates nothing.
+    ///
+    /// Untouched by `retake_baseline` and `disarm`, which is the obvious wrong
+    /// guess: those are about file contents and the watchdog, and this is keyed
+    /// by content identity.
+    typing: HashSet<String>,
 }
 
 impl Engine {
@@ -330,6 +349,7 @@ impl Engine {
             curation_passes: 0,
             last_curation_fingerprint: None,
             last_shadow_change: None,
+            typing: HashSet::new(),
         }
     }
 
@@ -480,8 +500,11 @@ impl Engine {
             if hunk.is_untypeable() {
                 // No line-by-line typing for these; the gate is byte equality.
                 let shadow = self.project.shadow_dir.join(rel);
+                // `false`: a binary or generated file that matched byte for
+                // byte was verified, not typed, and claiming otherwise would be
+                // the one lie this whole feature exists to avoid.
                 if present::classify_by_bytes(&real, &shadow) == Classification::Typed
-                    && self.commit_typed(&hunk.id, &hunk.key)?
+                    && self.commit_typed(&hunk.id, &hunk.key, false)?
                 {
                     typed_any = true;
                 }
@@ -489,15 +512,23 @@ impl Engine {
             }
 
             let outcome = observe(&before, &after, hunk, strict);
+            let in_progress = outcome == Observation::InProgress;
             self.watchdog.observe(&hunk.id, &outcome, now);
             match outcome {
                 Observation::Typed => {
-                    if self.commit_typed(&hunk.id, &hunk.key)? {
+                    let saw_typing = self.typing.contains(&hunk.key);
+                    if self.commit_typed(&hunk.id, &hunk.key, saw_typing)? {
                         typed_any = true;
                         notices.push(Notice::info(format!("typed — {}", hunk.file)));
                     }
                 }
                 Observation::InProgress | Observation::Untouched => {
+                    if in_progress {
+                        // Mid-hunk: the region is a proper prefix of the
+                        // proposal, which one paste of the whole thing cannot
+                        // produce — that lands on `Typed` at the first save.
+                        self.typing.insert(hunk.key.clone());
+                    }
                     // If a question was open and the text is now on its way to
                     // the proposal, withdraw it rather than making them answer.
                     if hunk.pending_divergence.is_some() {
@@ -536,7 +567,7 @@ impl Engine {
     /// has never seen.
     /// A miss here writes nothing, so it does not move the generation and does
     /// not invalidate any client's view of the world.
-    fn commit_typed(&self, id: &str, key: &str) -> Result<bool> {
+    fn commit_typed(&self, id: &str, key: &str, saw_typing: bool) -> Result<bool> {
         let (out, _) = session::with_session_maybe(&self.project, |m| {
             let Some(h) = m.find_mut(id) else {
                 return Ok(None);
@@ -546,6 +577,13 @@ impl Engine {
             }
             h.status = Status::Typed;
             h.pending_divergence = None;
+            // Inside the compare-and-swap, not beside it: a verdict written
+            // after a rejected commit would land on a hunk the guard above just
+            // refused. `fill` rather than `set` — an inference must never
+            // overwrite what a front end reported.
+            if saw_typing {
+                h.input.fill(crate::hunks::Input::Typed);
+            }
             m.last_presented = Some(id.to_string());
             Ok(Some(()))
         })?;
@@ -647,8 +685,16 @@ impl Engine {
             }
         }
 
-        let report =
-            session::with_session_recomputed(&self.project, &self.cfg, |_m, r| Ok(r.clone()))?;
+        // The pending keys come back from the same closure rather than a second
+        // read: it already holds the manifest under the lock.
+        let (report, pending) =
+            session::with_session_recomputed(&self.project, &self.cfg, |m, r| {
+                Ok((r.clone(), curator::pending_keys(m)))
+            })?;
+        // A hunk that has left the queue can never be committed again, so its
+        // evidence is dead weight. Bounded by the queue, not by the session.
+        let live: HashSet<String> = pending.into_iter().collect();
+        self.typing.retain(|k| live.contains(k));
         self.recompute = Pending::No;
         self.last_recompute = Some(now);
         self.drift = report.drift;
@@ -787,6 +833,27 @@ impl Engine {
                     Mutated::Refused(o) => o,
                 })
             }
+            state::Command::Report { hunk_id, input } => {
+                let value = crate::hunks::Input::from(*input);
+                let (out, _) = self.mutate(want, |m| {
+                    let Some(h) = m.find_mut(hunk_id) else {
+                        return Ok(Decision::Reject("no such hunk".into()));
+                    };
+                    // `input` and nothing else. Not status, not the question,
+                    // not `last_presented` — a front end reports how content
+                    // arrived, it does not move the queue.
+                    if !h.input.set(value) {
+                        return Ok(Decision::Nothing);
+                    }
+                    Ok(Decision::Apply(()))
+                })?;
+                // No notice: a report is not news. The republished snapshot
+                // carries the new value like any other field.
+                Ok(match out {
+                    Mutated::Applied(()) => state::Outcome::Applied,
+                    Mutated::Refused(o) => o,
+                })
+            }
             state::Command::Refresh => {
                 self.recompute = Pending::At(now);
                 self.last_recompute = None;
@@ -822,6 +889,9 @@ impl Engine {
                     refusal = Some(state::Outcome::Rejected { reason });
                     Ok(None)
                 }
+                // `refusal` stays unset, which the tail below already maps to
+                // `Applied`.
+                Decision::Nothing => Ok(None),
             }
         })?;
         Ok(match applied {

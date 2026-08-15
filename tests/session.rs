@@ -124,6 +124,35 @@ fn a_curator_note_survives_the_edit_that_re_identifies_its_hunk() {
 }
 
 #[test]
+fn a_typed_hunk_returned_to_the_queue_forgets_how_it_arrived() {
+    // `input` describes how the content *currently in the tree* got there, and
+    // rule 3 fires precisely because it is no longer there. Carrying the verdict
+    // forward would credit the user for typing something since overwritten.
+    let (fx, cfg, mut manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let project = fx.project();
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+
+    let id = manifest.head_of_queue().unwrap().id.clone();
+    {
+        let h = manifest.find_mut(&id).unwrap();
+        h.status = Status::Typed;
+        h.input = rote::hunks::Input::Typed;
+    }
+    fx.write("a.rs", "fn a() {\n    work();\n}\n");
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+    assert_eq!(manifest.find(&id).unwrap().input, rote::hunks::Input::Typed);
+
+    // Something overwrites their work: the region differs from the shadow again.
+    fx.write("a.rs", "fn a() {\n}\n");
+    let report = session::recompute(&mut manifest, &project, &cfg).unwrap();
+    assert!(!report.warnings.is_empty(), "rule 3 says so out loud");
+
+    let back = manifest.find(&id).unwrap();
+    assert_eq!(back.status, Status::Pending);
+    assert_eq!(back.input, rote::hunks::Input::Unknown);
+}
+
+#[test]
 fn typing_a_hunk_retires_it_from_the_queue() {
     // The self-truing property: recompute needs no help to notice.
     let (fx, cfg, mut manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");

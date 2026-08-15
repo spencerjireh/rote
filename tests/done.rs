@@ -409,3 +409,75 @@ fn talk_prints_the_shadow_path() {
         "talk without --attach just names the shadow"
     );
 }
+
+// ------------------------------------------------------------- how it came
+
+#[test]
+fn done_says_nothing_about_input_when_it_observed_nothing() {
+    // The no-plugin, no-autosave case, which is almost everyone. "0 of 12
+    // observed" is technically true and reads as an accusation, so the honest
+    // answer to no signal is silence.
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    let (stub, _) = stub_claude(cli.fx.root.path(), "claude-stub", "ok", 0);
+    cli.use_claude_stub(&stub);
+
+    cli.run(&["start", "--no-launch", "t"]);
+    std::fs::write(cli.shadow().join("a.rs"), "fn a() {\n    work();\n}\n").unwrap();
+
+    // Type it in one save, with a watcher running: typed, but not observed.
+    let watcher = cli.spawn(&[
+        "watch",
+        "--headless",
+        "--exit-when-empty",
+        "--timeout",
+        "20000",
+    ]);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    cli.fx.write("a.rs", "fn a() {\n    work();\n}\n");
+    assert!(watcher.wait_with_output().unwrap().status.success());
+
+    let done = cli.run_with_input(&["done", "--no-checks", "--no-review"], "y\n");
+    let text = stdout(&done);
+    assert!(text.contains("session closed"), "{text}");
+    assert!(
+        !text.contains("observed") && !text.contains("told apart"),
+        "no signal means no line: {text}"
+    );
+}
+
+#[test]
+fn done_says_how_the_typed_hunks_arrived() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    let (stub, _) = stub_claude(cli.fx.root.path(), "claude-stub", "ok", 0);
+    cli.use_claude_stub(&stub);
+
+    cli.run(&["start", "--no-launch", "t"]);
+    std::fs::write(cli.shadow().join("a.rs"), "fn a() {\n    work();\n}\n").unwrap();
+
+    // Type it a piece at a time, so the engine sees it mid-hunk.
+    let watcher = cli.spawn(&[
+        "watch",
+        "--headless",
+        "--exit-when-empty",
+        "--timeout",
+        "20000",
+    ]);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    cli.fx.write("a.rs", "fn a() {\n    wo\n}\n");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    cli.fx.write("a.rs", "fn a() {\n    work();\n}\n");
+    assert!(watcher.wait_with_output().unwrap().status.success());
+
+    let done = cli.run_with_input(&["done", "--no-checks", "--no-review"], "y\n");
+    let text = stdout(&done);
+    assert!(
+        text.contains("all 1 typed hunks were observed being typed."),
+        "{text}"
+    );
+}

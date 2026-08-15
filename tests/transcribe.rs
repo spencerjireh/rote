@@ -303,3 +303,45 @@ fn a_generated_file_is_gated_on_bytes_not_typing() {
     let after = stdout(&cli.run(&["next"]));
     assert!(after.contains("nothing to transcribe"), "{after}");
 }
+
+#[test]
+fn report_records_how_a_hunk_arrived_without_touching_its_status() {
+    // The manual half of the input signal, on the path where nobody owns the
+    // queue. It is also the only way a user with no editor plugin can correct
+    // what the engine could not observe.
+    let cli = session_with_agent_edit();
+    let out = cli.run(&["next", "--json"]);
+    let id = serde_json::from_str::<serde_json::Value>(stdout(&out).trim()).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let reported = cli.run(&["report", &id, "pasted"]);
+    assert!(reported.status.success(), "{}", stdout(&reported));
+    assert!(
+        stdout(&reported).contains("pasted"),
+        "{}",
+        stdout(&reported)
+    );
+
+    let m = rote::session::Manifest::load(&cli.fx.project())
+        .unwrap()
+        .unwrap();
+    let h = m.find(&id).unwrap();
+    assert_eq!(h.input, rote::hunks::Input::Pasted);
+    assert_eq!(h.status, rote::hunks::Status::Pending, "status untouched");
+
+    // And a correction lands: last write wins, which is the point of having it.
+    assert!(cli.run(&["report", &id, "typed"]).status.success());
+    let m = rote::session::Manifest::load(&cli.fx.project())
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.find(&id).unwrap().input, rote::hunks::Input::Typed);
+}
+
+#[test]
+fn report_names_a_hunk_that_does_not_exist() {
+    let cli = session_with_agent_edit();
+    let out = cli.run(&["report", "h-nope", "typed"]);
+    assert!(!out.status.success());
+}

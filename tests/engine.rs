@@ -671,3 +671,185 @@ fn a_curation_that_lands_after_the_session_closed_writes_nothing() {
         "closing wins over an outcome still in flight: {out:?}"
     );
 }
+
+// -------------------------------------------------------------- how it came
+
+/// The manifest's verdict for the one hunk in `a.rs`.
+fn arrival(fx: &Fixture) -> rote::hunks::Input {
+    manifest(fx).hunks[0].input
+}
+
+#[test]
+fn a_hunk_typed_a_few_characters_at_a_time_is_recorded_as_typed() {
+    // The only thing rote can honestly infer. A partial save proves a human was
+    // in the loop; one paste of the whole hunk never produces one.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+
+    fx.write("a.rs", "fn a() {\n    wo\n}\n");
+    engine.step(Some(changed()), Tick(100)).unwrap();
+    fx.write("a.rs", "fn a() {\n    work();\n}\n");
+    engine.step(Some(changed()), Tick(200)).unwrap();
+
+    let m = manifest(&fx);
+    assert_eq!(m.count(Status::Typed), 1);
+    assert_eq!(m.hunks[0].input, rote::hunks::Input::Typed);
+}
+
+#[test]
+fn a_hunk_that_arrives_whole_in_one_save_is_left_unknown() {
+    // A paste and a careful typist who saves once are byte-identical, so this
+    // has to stay `unknown` rather than guess. `unknown` is a real answer.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+
+    fx.write("a.rs", "fn a() {\n    work();\n}\n");
+    engine.step(Some(changed()), Tick(100)).unwrap();
+
+    assert_eq!(manifest(&fx).count(Status::Typed), 1);
+    assert_eq!(arrival(&fx), rote::hunks::Input::Unknown);
+}
+
+#[test]
+fn the_engine_never_records_a_hunk_as_pasted() {
+    // Whatever the save pattern. Only a front end may say this word.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    for (i, body) in [
+        "fn a() {\n    w\n}\n",
+        "fn a() {\n    work\n}\n",
+        "fn a() {\n    work();\n}\n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        fx.write("a.rs", body);
+        engine
+            .step(Some(changed()), Tick(100 + i as u64 * 100))
+            .unwrap();
+    }
+    assert_ne!(arrival(&fx), rote::hunks::Input::Pasted);
+}
+
+#[test]
+fn an_inference_never_overwrites_a_reported_paste() {
+    // You paste a hunk, your plugin says so, then you fix a character in it —
+    // which the engine sees as typing. Without the guard in `Input::fill` that
+    // correction erases the report.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let id = manifest(&fx).active().unwrap().id.clone();
+
+    engine
+        .step(
+            Some(EngineEvent::Command(
+                state::Command::Report {
+                    hunk_id: id.clone(),
+                    input: state::Reported::Pasted,
+                }
+                .into(),
+            )),
+            Tick(50),
+        )
+        .unwrap();
+    assert_eq!(arrival(&fx), rote::hunks::Input::Pasted);
+
+    // Now type it, partially and then fully.
+    fx.write("a.rs", "fn a() {\n    wo\n}\n");
+    engine.step(Some(changed()), Tick(100)).unwrap();
+    fx.write("a.rs", "fn a() {\n    work();\n}\n");
+    engine.step(Some(changed()), Tick(200)).unwrap();
+
+    assert_eq!(manifest(&fx).count(Status::Typed), 1);
+    assert_eq!(
+        arrival(&fx),
+        rote::hunks::Input::Pasted,
+        "the engine fills in unknowns; it does not overrule a front end"
+    );
+}
+
+#[test]
+fn reporting_how_a_hunk_arrived_does_not_move_its_status_or_the_queue() {
+    // The constitutional one. DESIGN §1: a front end cannot assert its way to a
+    // finished session, and `report` must not be the crack in that.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let before = manifest(&fx);
+    let id = before.active().unwrap().id.clone();
+
+    engine
+        .step(
+            Some(EngineEvent::Command(
+                state::Command::Report {
+                    hunk_id: id.clone(),
+                    input: state::Reported::Typed,
+                }
+                .into(),
+            )),
+            Tick(50),
+        )
+        .unwrap();
+
+    let after = manifest(&fx);
+    assert_eq!(after.hunks[0].status, Status::Pending, "still to be typed");
+    assert_eq!(after.pending().count(), before.pending().count());
+    assert_eq!(after.active().unwrap().id, id, "the queue did not move");
+    assert_eq!(after.hunks[0].input, rote::hunks::Input::Typed);
+}
+
+#[test]
+fn a_repeated_report_does_not_move_the_generation() {
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let id = manifest(&fx).active().unwrap().id.clone();
+
+    let report = |engine: &mut Engine, t: u64| {
+        engine
+            .step(
+                Some(EngineEvent::Command(
+                    state::Command::Report {
+                        hunk_id: id.clone(),
+                        input: state::Reported::Pasted,
+                    }
+                    .into(),
+                )),
+                Tick(t),
+            )
+            .unwrap();
+    };
+
+    report(&mut engine, 50);
+    let first = manifest(&fx).generation;
+    report(&mut engine, 60);
+    assert_eq!(
+        manifest(&fx).generation,
+        first,
+        "nothing changed, so no subscriber's snapshot is invalidated"
+    );
+}
+
+#[test]
+fn a_report_for_a_hunk_that_does_not_exist_is_refused() {
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let before = manifest(&fx).generation;
+
+    let mut notices = Vec::new();
+    let outcome = engine
+        .apply(
+            &state::Request {
+                wire_version: state::WIRE_VERSION,
+                generation: None,
+                command: state::Command::Report {
+                    hunk_id: "h-nope".into(),
+                    input: state::Reported::Pasted,
+                },
+            },
+            Tick(50),
+            &mut notices,
+        )
+        .unwrap();
+
+    assert!(matches!(outcome, state::Outcome::Rejected { .. }));
+    assert_eq!(manifest(&fx).generation, before);
+}

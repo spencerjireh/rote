@@ -123,7 +123,7 @@ Conventions for all milestones:
 
 ## Out of scope — do not build
 
-Multi-session, non-git backends, nvim plugin, paste prevention, Windows, any Claude Code hooks/MCP/SDK integration, `rote gc`, telemetry of any kind. From M7: a TUI wizard, publishing the tap, prebuilt binaries, GitHub Releases, or release CI.
+Multi-session, non-git backends, paste *prevention* (M11 records and reports; it never withholds), Windows, any Claude Code hooks/MCP/SDK integration, `rote gc`, telemetry of any kind. From M7: a TUI wizard, publishing the tap, prebuilt binaries, GitHub Releases, or release CI.
 
 ---
 
@@ -226,3 +226,42 @@ leaves the file order, warns once, and is not asked again.
 Edge cases this milestone adds to §9: a curation landing mid-transcription (13),
 a daemon restarted mid-curation (14), and a curator child outliving the session
 (15).
+
+---
+
+## M11 — how the content arrived
+
+The tool's whole premise is that you type the code rather than paste it, and it
+could not say a word about whether you did. `Hunk.input` has existed since the
+v2 manifest with one write — `Input::default()` — and zero reads anywhere.
+
+The old doc comment said the value was "reported by the front end, not
+inferred", arguing that a careful typist who saves once is byte-identical to a
+paste. That is correct *about the final bytes* and wrong as a general claim: the
+engine does not only see the final bytes, it sees the save history. A hunk
+observed *in progress* — the region a line-wise prefix of the proposal — had a
+human in the loop, and one paste of a whole hunk never produces that.
+
+Scope:
+- `Input::fill` (the engine's write, only ever into `unknown`) and `Input::set`
+  (a front end's, always lands), both reporting whether anything moved.
+  `skip_serializing_if` so the field is finally omitted when unset, as §4 has
+  claimed all along.
+- The engine records in-progress observations by hunk `key`, in memory, pruned
+  to the pending queue on every recompute. The verdict is written inside
+  `commit_typed`'s compare-and-swap; the byte-compare gate passes `false`,
+  because a file that matched byte for byte was verified, not typed.
+- `Command::Report` and `state::Reported`, plus `Decision::Nothing` so a repeat
+  writes nothing and moves no generation.
+- `reconcile` rule 3 clears `input`: the field describes how the content
+  *currently in the tree* arrived, and that rule fires because it is not there.
+- `rote report <HUNK_ID> typed|pasted`, and a line at `done`.
+
+Acceptance: typing a hunk a few characters at a time and saving as you go leaves
+`typed` on it; pasting the whole hunk in one save leaves `unknown` and never
+`pasted`; `rote report` overrides either and moves no status; `rote done` names
+how the typed hunks arrived, and says nothing at all in a session where it
+observed nothing.
+
+Edge cases this milestone adds to §9: a hunk half-typed then pasted (16), a
+daemon restarted mid-hunk (17), and a hunk re-identified mid-typing (18).

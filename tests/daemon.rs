@@ -939,3 +939,42 @@ fn a_daemon_with_the_curator_off_never_runs_the_model() {
         "a test suite must never reach a model on its own"
     );
 }
+
+// ------------------------------------------------------------- how it came
+
+#[test]
+fn a_reported_paste_reaches_the_manifest_through_the_socket() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+    wait_until("a first snapshot", || d.get("/state").status == 200);
+
+    let snap: state::Snapshot = d.get("/state").json().unwrap();
+    let id = snap.active.expect("an active hunk").hunk.id;
+
+    let r = d.post(
+        "/command",
+        &serde_json::json!({
+            "wire_version": state::WIRE_VERSION,
+            "verb": "report",
+            "hunk_id": id,
+            "input": "pasted",
+        }),
+    );
+    assert_eq!(r.status, 200);
+    let body: state::Response = r.json().unwrap();
+    assert!(matches!(body.outcome, state::Outcome::Applied));
+
+    wait_until("the report to reach a snapshot", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .ok()
+            .and_then(|s| s.active)
+            .map(|p| p.hunk.input == rote::hunks::Input::Pasted)
+            .unwrap_or(false)
+    });
+
+    // And it moved nothing else.
+    let after: state::Snapshot = d.get("/state").json().unwrap();
+    assert_eq!(after.counts.pending, snap.counts.pending);
+    assert_eq!(after.counts.typed, 0);
+}

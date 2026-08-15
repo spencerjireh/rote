@@ -421,6 +421,11 @@ pub fn reconcile(
     for h in manifest.hunks.iter_mut() {
         if h.status == Status::Typed && fresh_ids.contains(h.id.as_str()) {
             h.status = Status::Pending;
+            // `input` describes how the content *currently in the tree* got
+            // there, and this rule fires precisely because it is no longer
+            // there. Carrying the old verdict forward would credit the user for
+            // typing something that has since been overwritten.
+            h.input = crate::hunks::Input::Unknown;
             report.warnings.push(format!(
                 "{} (hunk {}) differs from the shadow again — it was typed earlier this session. \
                  Back in the queue.",

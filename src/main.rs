@@ -16,6 +16,17 @@ use rote::shadow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// How a hunk's content arrived, on the command line.
+///
+/// No `unknown`: that is the absence of an assertion, not something to assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Arrival {
+    /// You typed it.
+    Typed,
+    /// You pasted it.
+    Pasted,
+}
+
 /// How to answer a divergence question, on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Resolution {
@@ -91,6 +102,13 @@ enum Command {
         hunk_id: String,
         #[arg(value_enum)]
         choice: Resolution,
+    },
+
+    /// Say how a hunk's content arrived. Changes no status.
+    Report {
+        hunk_id: String,
+        #[arg(value_enum)]
+        input: Arrival,
     },
 
     /// Watch your tree and classify as you type. The transcription loop.
@@ -291,6 +309,10 @@ fn run() -> Result<ExitCode> {
         }
         Command::Resolve { hunk_id, choice } => {
             cmd_resolve(&project, &hunk_id, choice)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Report { hunk_id, input } => {
+            cmd_report(&project, &hunk_id, input)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Watch {
@@ -825,16 +847,70 @@ fn cmd_done(
     //    archiving a stale manifest would file the wrong record.
     let _lock = Lock::acquire(&project.lock_path())?;
     let mut manifest = Manifest::require(project)?;
+    // Read before archiving: `archive_and_clear` sets the terminal state, and
+    // this is a statement about the session that just happened.
+    let arrival = describe_arrival(&manifest);
     let archived = session::archive_and_clear(&mut manifest, project, cfg, Terminal::Done)?;
     shadow::sync(project, cfg)?;
 
     if !quiet {
         println!("session closed. state: idle");
+        if let Some(line) = arrival {
+            println!("{line}");
+        }
         if let Some(msg) = review::describe_residue(&archived.patch, archived.residue_bytes) {
             println!("{msg}");
         }
     }
     Ok(())
+}
+
+/// How the typed hunks arrived, or `None` when there is nothing honest to say.
+///
+/// Over `typed` hunks only — a skipped or diverged hunk was not typed, and
+/// counting it would make the denominator a different question.
+///
+/// **Silence when nothing was observed**, which is the no-plugin case with no
+/// autosave. "0 of 12 observed" is technically true and reads as an accusation,
+/// and it would be the line almost everyone saw. The phrasing everywhere else
+/// puts the limitation on rote rather than on the user, because it *is* rote's:
+/// a careful typist who saves once is byte-identical to a paste.
+fn describe_arrival(manifest: &Manifest) -> Option<String> {
+    use rote::hunks::Input;
+
+    let typed: Vec<Input> = manifest
+        .hunks
+        .iter()
+        .filter(|h| h.status == Status::Typed)
+        .map(|h| h.input)
+        .collect();
+    if typed.is_empty() {
+        return None;
+    }
+
+    let observed = typed.iter().filter(|i| **i == Input::Typed).count();
+    let pasted = typed.iter().filter(|i| **i == Input::Pasted).count();
+    if observed == 0 && pasted == 0 {
+        return None;
+    }
+
+    let total = typed.len();
+    let unknown = total - observed - pasted;
+    let mut line = if observed == total {
+        format!("all {total} typed hunks were observed being typed.")
+    } else {
+        format!("{observed} of {total} typed hunks were observed being typed")
+    };
+    if observed != total {
+        if pasted > 0 {
+            line.push_str(&format!(", {pasted} reported pasted"));
+        }
+        if unknown > 0 {
+            line.push_str(&format!("; {unknown} could not be told apart"));
+        }
+        line.push('.');
+    }
+    Some(line)
 }
 
 /// The transcription loop: watch, classify, advance.
@@ -1048,6 +1124,57 @@ fn cmd_resolve(project: &ProjectPaths, hunk_id: &str, choice: Resolution) -> Res
     }
     Ok(())
 }
+/// Record how a hunk's content arrived.
+///
+/// The manual half of the input signal: the engine infers `typed` only when it
+/// watched the region pass through a partial state, and anything else stays
+/// `unknown`. This is how a user with no editor plugin corrects the record, and
+/// how one whose plugin guessed wrong corrects it back.
+fn cmd_report(project: &ProjectPaths, hunk_id: &str, input: Arrival) -> Result<()> {
+    let reported = match input {
+        Arrival::Typed => rote::state::Reported::Typed,
+        Arrival::Pasted => rote::state::Reported::Pasted,
+    };
+    let value = rote::hunks::Input::from(reported);
+
+    match daemon::owner(project)? {
+        // An engine owns the queue: it must make the write, or its next
+        // classification would publish a snapshot that disagrees with the file.
+        daemon::Owner::Daemon(ep) => {
+            let response = daemon::send_command(
+                &ep,
+                &rote::state::Request {
+                    wire_version: rote::state::WIRE_VERSION,
+                    generation: None,
+                    command: rote::state::Command::Report {
+                        hunk_id: hunk_id.to_string(),
+                        input: reported,
+                    },
+                },
+            )?;
+            match response.outcome {
+                rote::state::Outcome::Applied => {}
+                rote::state::Outcome::Rejected { reason } => bail!("{reason} ({hunk_id})"),
+                rote::state::Outcome::Stale { current } => {
+                    bail!("the queue moved underneath that (now at generation {current})")
+                }
+            }
+        }
+        daemon::Owner::Nobody(_guard) => {
+            session::with_session_maybe(project, |m| {
+                let h = m
+                    .find_mut(hunk_id)
+                    .with_context(|| format!("no hunk {hunk_id} in this session"))?;
+                Ok(h.input.set(value).then_some(()))
+            })?;
+        }
+        daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
+    }
+
+    println!("recorded {hunk_id} as {value}.");
+    Ok(())
+}
+
 /// Leave a hunk untyped, by id or by "whatever is active".
 ///
 /// Addressed by id rather than by position. Resolving "the active hunk" and then

@@ -72,6 +72,9 @@ Answers an open divergence question (§6). `keep` records both versions and make
 ### `rote skip [HUNK_ID]`
 Marks a hunk `skipped`, defaulting to the active one. Skip is **durable**: a skipped hunk stays skipped across recomputes (§5 rule 4), even though its region still differs between the trees. Skipped hunks are reported at `done` time and require explicit confirmation to close the session.
 
+### `rote report <HUNK_ID> typed|pasted`
+Records how a hunk's content arrived (§6). Changes no status and moves nothing in the queue; it exists so a user with no editor plugin can correct what the engine could not observe, and so one whose plugin guessed wrong can correct it back. Last write wins.
+
 ### `rote talk`
 Prints the shadow path and, with `--attach`, execs `claude --continue` (configurable) in the shadow so the user can resume arguing with the session agent.
 
@@ -182,7 +185,7 @@ There is no `session_start_snapshot` field. The session-start baseline is `basel
   "note": null,                     // optional one-liner rote attaches (e.g. "file is new")
   "curator_note": null,             // one line of ordering rationale (§8b)
   "curator_rank": null,             // teaching order; absent sorts after everything ranked
-  "input": "unknown"                // unknown | typed | pasted
+  "input": "typed"                  // unknown | typed | pasted; omitted when unknown
 }
 ```
 
@@ -278,6 +281,18 @@ rote does not launch an editor as part of the loop. It offers to, from the `o` k
 Resolution is `$ROTE_EDITOR`, else `config.toml editor`, else `nvim`. **`$EDITOR` and `$VISUAL` are deliberately not consulted** — the invocation uses a specific `+LINE` calling convention, and silently inheriting whatever `$EDITOR` happens to be (including `ed`, or a pager, or something with no `+LINE` support) is a worse failure than the explicit chain.
 
 Invocation: `<editor> +<anchor_line> <real_file_abs_path>`. The pane leaves the alternate screen and restores cooked mode first, and the exit status is ignored — rote is not waiting on the editor to decide anything. Events queue while it has the terminal, so the user returns to a hunk that has already been classified. A machine with no editor is fully usable; `doctor` reports this as informational, never a failure.
+
+### How the content arrived
+
+Orthogonal to classification, and reported at `done` rather than enforced anywhere. `Hunk.input` is `unknown | typed | pasted`, omitted from the wire when unknown, and has two producers.
+
+The **engine** infers, from the save history rather than from the bytes: a hunk observed *in progress* — the region a line-wise prefix of the proposal — had a human in the loop at that moment, and a single paste of the whole hunk cannot produce that, because it classifies `typed` on the first save and never passes through the prefix rule. The inference is deliberately weaker than "every character was typed": pasting the first half and then the second is recorded as `typed`, and so is accepting a completion over a typed prefix. What the engine will never do is assert `pasted` — a careful typist who writes a whole hunk into the buffer and saves once is byte-identical to a paste, which is why `unknown` is a first-class answer rather than a null.
+
+A **front end** reports, from something the filesystem cannot see: nvim knows a bracketed paste from `TextChangedI`. A report always lands; an inference only ever fills in `unknown`. So an inference can never overwrite what a front end saw, and a wrong report is correctable by another one.
+
+The evidence lives in the engine's memory, keyed by hunk `key` (§4) so it survives the id churn of typing near a hunk, and pruned to the pending queue on every recompute. It is deliberately not persisted: a daemon restart degrades one hunk to `unknown`, and a fourth on-disk artifact with its own version and session stamps is not worth an advisory counter that gates nothing.
+
+`rote done` reports the tally over `typed` hunks, and **says nothing at all when it observed nothing** — that is the no-plugin, no-autosave case, and "0 of 12 observed" is technically true and reads as an accusation. `rote status` deliberately does not carry it: mid-session the number only grows and is not actionable, and a retrospective is not a scoreboard.
 
 ### Classification (on save)
 Re-locate the region via context matching as above, extract the lines between the context blocks, compare to `new_lines`:
@@ -478,7 +493,10 @@ Identical to the reviewer's: `model::TOOL_FLAGS`, an empty temp cwd, and a hard 
 13. **A curation landing mid-transcription** — the pass runs unlocked and takes seconds, so the queue moves underneath it. No compare-and-swap is needed, unlike the classifier's: the cache is keyed by content, so a hunk typed while the model was thinking is terminal and its rank is irrelevant, and one the agent reworked away simply has no entry. The *pin* does need care and is computed inside the lock, because the head moves too. A hunk that appears during the call has no entry and so sorts after every ranked hunk rather than in file position; the next pass picks it up. See §8b.
 14. **A daemon restarted mid-curation** — the job thread dies with the process and no tombstones were written, so the fingerprint is `None` and the next engine re-fires: one duplicate call per crash, which is correct. Deliberately **no on-disk in-flight marker** — after a `kill -9` a stale one would disable the curator permanently, which is the exact failure `watch.lock`'s doctrine exists to avoid (§13).
 15. **A curator child outliving the session** — `serve` joins the engine thread within `JOIN_CEILING` and exits, but a `claude` spawned by a curation can outlive `rote done` by up to `CURATOR_TIMEOUT`. It runs in an empty temp cwd with no tools, so it can do nothing; reaping it would mean holding a child handle somewhere with no business holding one.
-16. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
+16. **A hunk half-typed then pasted** — the in-progress observation stands and the verdict is `typed`. Deliberate: the inference proves a human was in the loop, not that every character was typed, and it is stated that way in §6 rather than quietly overclaimed.
+17. **A daemon restarted mid-hunk** — the typing evidence is in memory and goes with the process, so that hunk degrades to `unknown`, never to `pasted`. Persisting it would be a fourth on-disk artifact with its own version and session stamps for an advisory counter that gates nothing.
+18. **A hunk re-identified mid-typing** — a floor sweep re-diffs the region as (half-typed → proposal), which changes `old_lines` and therefore the `key` too, so the evidence is lost and the next save re-creates it. The window is one save and the cost is `unknown`, which is why the record is keyed by `key` and not by a proposal-only hash: the latter would survive this but would alias two hunks in one file with identical `new_lines`, turning "typed the first, pasted the second" into a false `typed`. A false negative is the right failure.
+19. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
 
 ---
 
@@ -586,10 +604,16 @@ to keep in agreement forever, and they would disagree.
   needs a resync story, and a client that misses one frame is silently wrong
   from then on, which is the worst failure mode available because nothing looks
   broken. `generation` is already the resync token.
-- `Command` — `skip` | `resolve` | `show` | `refresh`, tagged on `verb`.
-  Deliberately excludes `done`, `abort` and `start`: those confirm interactively
-  and `exec`, so they stay CLI-only. And there is no verb that sets a hunk to
-  `typed` (§1).
+- `Command` — `skip` | `resolve` | `show` | `report` | `refresh`, tagged on
+  `verb`. Deliberately excludes `done`, `abort` and `start`: those confirm
+  interactively and `exec`, so they stay CLI-only. And there is no verb that sets
+  a hunk to `typed` (§1) — `report` does not weaken that, because it writes
+  `input` and nothing else: not status, not the open question, not
+  `last_presented`. It is accepted on a hunk that has already gone terminal,
+  precisely so a paste report cannot lose a race against the classifier.
+- `Reported` — `typed` | `pasted`, what a front end may say about how content
+  arrived. Deliberately not `Input`: `unknown` is the *absence* of an assertion,
+  and making it unrepresentable on the wire beats rejecting it at runtime.
 - `Health` — the handshake: wire and manifest versions, pid, port, project hash,
   and the session's state. A front end reads this first and can refuse politely
   rather than misinterpreting a payload it does not understand. `project_hash`
