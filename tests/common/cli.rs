@@ -91,6 +91,8 @@ pub struct Cli {
     /// Prepended to `PATH`, for stubbing binaries rote looks up by name.
     pub bin: PathBuf,
     editor: Option<PathBuf>,
+    /// Whether this fixture lets the curator run. Off unless a test asks.
+    curator: bool,
 }
 
 impl Cli {
@@ -105,6 +107,7 @@ impl Cli {
             fx,
             bin,
             editor: None,
+            curator: false,
         }
     }
 
@@ -146,6 +149,7 @@ impl Cli {
             .env("XDG_DATA_HOME", &self.fx.xdg_data)
             .env("XDG_CONFIG_HOME", &self.fx.xdg_config)
             .env("NO_COLOR", "1")
+            .env("ROTE_CURATOR", self.curator())
             // Never inherit the developer's editor: a test that depends on the
             // machine it runs on is worse than no test.
             .env_remove("ROTE_EDITOR")
@@ -185,12 +189,38 @@ impl Cli {
             .env("XDG_DATA_HOME", &self.fx.xdg_data)
             .env("XDG_CONFIG_HOME", &self.fx.xdg_config)
             .env("NO_COLOR", "1")
+            .env("ROTE_CURATOR", self.curator())
             .env_remove("ROTE_EDITOR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap()
+    }
+
+    /// The curator is off in every test unless one opts in.
+    ///
+    /// Set as an environment variable rather than in a config file, and that is
+    /// forced rather than merely convenient: `use_claude_stub` overwrites the
+    /// whole global config and `write_project_config` overwrites the whole
+    /// `.rote.toml`, so a config-file switch would be silently clobbered by
+    /// tests that predate it. `PATH` here still carries the developer's real
+    /// directories, so the default `claude_cmd` resolves to their real binary —
+    /// leaving this on would have `tests/daemon.rs` alone spend tokens fifteen
+    /// times per run.
+    fn curator(&self) -> &'static str {
+        if self.curator {
+            "on"
+        } else {
+            "off"
+        }
+    }
+
+    /// Let this fixture run a curator pass, against a stub.
+    pub fn enable_curator(&mut self, stub: &Path) {
+        self.curator = true;
+        self.use_claude_stub(stub);
+        self.write_project_config("[curator]\nenabled = true\n");
     }
 
     pub fn shadow(&self) -> PathBuf {

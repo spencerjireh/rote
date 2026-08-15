@@ -26,6 +26,14 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 400;
 /// starts one on demand instead.
 pub const DEFAULT_DAEMON_AUTOSTART: bool = true;
 
+/// Whether a headless pass puts the queue in teaching order.
+///
+/// On by default, matching `[review]`: file order hands you a caller before the
+/// thing it calls, and one call per session is a small price for a queue that
+/// teaches rather than one that merely lists. It fails soft in every direction,
+/// so the worst case is exactly the order rote had before the curator existed.
+pub const DEFAULT_CURATOR_ENABLED: bool = true;
+
 fn default_editor() -> String {
     "nvim".into()
 }
@@ -70,6 +78,14 @@ struct GlobalFile {
     color: Option<bool>,
     max_hunk_lines: Option<usize>,
     strict_whitespace: Option<bool>,
+    /// The one table the global file carries.
+    ///
+    /// Every other table is project-only, because it describes a repository.
+    /// This one answers "may rote spend tokens in the background without being
+    /// asked", which is a property of the machine and the person at it — nobody
+    /// on a metered plan wants to turn it off once per repo.
+    #[serde(default)]
+    curator: Option<CuratorFile>,
 }
 
 /// Raw project file.
@@ -90,6 +106,8 @@ struct ProjectFile {
     watch: Option<WatchFile>,
     #[serde(default)]
     daemon: Option<DaemonFile>,
+    #[serde(default)]
+    curator: Option<CuratorFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -122,6 +140,13 @@ struct ReviewFile {
 #[serde(deny_unknown_fields)]
 struct DaemonFile {
     autostart: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CuratorFile {
+    enabled: Option<bool>,
+    model_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -159,6 +184,10 @@ pub struct Config {
     pub watch_ignore: Vec<String>,
     /// Whether `rote start` leaves a daemon watching in the background.
     pub daemon_autostart: bool,
+    /// Whether the engine runs a curator pass over the queue.
+    pub curator_enabled: bool,
+    /// Extra args appended to the curator's `claude -p`, e.g. a cheaper model.
+    pub curator_model_args: Vec<String>,
 }
 
 impl Default for Config {
@@ -180,6 +209,8 @@ impl Default for Config {
             watch_debounce_ms: DEFAULT_DEBOUNCE_MS,
             watch_ignore: Vec::new(),
             daemon_autostart: DEFAULT_DAEMON_AUTOSTART,
+            curator_enabled: DEFAULT_CURATOR_ENABLED,
+            curator_model_args: Vec::new(),
         }
     }
 }
@@ -209,6 +240,14 @@ impl Config {
             }
             if let Some(v) = g.strict_whitespace {
                 cfg.strict_whitespace = v;
+            }
+            if let Some(c) = g.curator {
+                if let Some(v) = c.enabled {
+                    cfg.curator_enabled = v;
+                }
+                if let Some(v) = c.model_args {
+                    cfg.curator_model_args = v;
+                }
             }
         }
 
@@ -261,6 +300,14 @@ impl Config {
             if let Some(d) = p.daemon {
                 if let Some(v) = d.autostart {
                     cfg.daemon_autostart = v;
+                }
+            }
+            if let Some(c) = p.curator {
+                if let Some(v) = c.enabled {
+                    cfg.curator_enabled = v;
+                }
+                if let Some(v) = c.model_args {
+                    cfg.curator_model_args = v;
                 }
             }
         }
@@ -401,6 +448,16 @@ ignore = []
 # Whether `rote start` leaves a daemon watching in the background. With it off,
 # `rote watch` starts one on demand instead.
 autostart = true
+
+[curator]
+# A headless pass that puts the queue in teaching order -- definitions before
+# uses -- and writes one line per hunk saying why it comes where it does. Runs
+# in the background once the agent's work settles. A curator that cannot run
+# just leaves the file-order fallback, so this never blocks anything.
+# ROTE_CURATOR=off turns it off for one invocation.
+enabled = true
+# Extra args appended to `claude -p`, e.g. ["--model", "claude-haiku-4-5"]
+model_args = []
 "#,
         preserve = toml_list(&default_preserve()),
         verbatim = toml_list(&detected.verbatim),
@@ -429,6 +486,8 @@ mod tests {
         assert_eq!(cfg.max_hunk_lines, 20);
         assert!(!cfg.strict_whitespace);
         assert!(cfg.review_enabled);
+        assert!(cfg.curator_enabled);
+        assert!(cfg.curator_model_args.is_empty());
         assert!(cfg.verbatim.contains(&"Cargo.lock".to_string()));
         assert!(cfg.shadow_preserve.contains(&"target/".to_string()));
     }
@@ -483,7 +542,8 @@ mod tests {
              [checks]\ncommands = [\"cargo test\"]\n\
              [review]\nenabled = false\nmodel_args = [\"--model\", \"claude-haiku-4-5\"]\n\
              [watch]\ndivergence_grace_ms = 0\ndebounce_ms = 50\nignore = [\"*.log\"]\n\
-             [daemon]\nautostart = false\n",
+             [daemon]\nautostart = false\n\
+             [curator]\nenabled = false\nmodel_args = [\"--model\", \"haiku\"]\n",
         );
         let cfg = Config::load(&dir.path().join("absent.toml"), &p).unwrap();
         assert_eq!(cfg.shadow_copy, vec![".env", ".envrc"]);
@@ -497,6 +557,29 @@ mod tests {
         assert_eq!(cfg.watch_debounce_ms, 50);
         assert_eq!(cfg.watch_ignore, vec!["*.log"]);
         assert!(!cfg.daemon_autostart, "the project may turn the daemon off");
+        assert!(!cfg.curator_enabled);
+        assert_eq!(cfg.curator_model_args, vec!["--model", "haiku"]);
+    }
+
+    #[test]
+    fn the_global_file_may_turn_the_curator_off_for_the_whole_machine() {
+        // The only table the global file carries. "Do not spend tokens in the
+        // background" is a property of the person and the plan, not of one
+        // repository, and having to say it once per repo is how it ends up
+        // unsaid somewhere.
+        let dir = tempfile::tempdir().unwrap();
+        let g = write(dir.path(), "config.toml", "[curator]\nenabled = false\n");
+        let cfg = Config::load(&g, &dir.path().join("absent.toml")).unwrap();
+        assert!(!cfg.curator_enabled);
+    }
+
+    #[test]
+    fn a_project_may_turn_the_curator_back_on_over_the_global_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = write(dir.path(), "config.toml", "[curator]\nenabled = false\n");
+        let p = write(dir.path(), ".rote.toml", "[curator]\nenabled = true\n");
+        let cfg = Config::load(&g, &p).unwrap();
+        assert!(cfg.curator_enabled, "project wins, as everywhere else");
     }
 
     #[test]
@@ -538,6 +621,7 @@ mod tests {
                 cfg.daemon_autostart, DEFAULT_DAEMON_AUTOSTART,
                 "for {kind:?}"
             );
+            assert_eq!(cfg.curator_enabled, DEFAULT_CURATOR_ENABLED, "for {kind:?}");
         }
     }
 

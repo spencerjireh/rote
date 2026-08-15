@@ -200,6 +200,25 @@ fn find_repo(cli: &Cli) -> Result<PathBuf> {
     }
 }
 
+/// Environment overrides, applied at the process boundary.
+///
+/// Deliberately not inside `Config::load`: that stays a pure function of two
+/// file paths, and its unit tests run in parallel, where process-global
+/// environment would make them lie to each other.
+///
+/// `ROTE_CURATOR=off` is the one-invocation escape hatch for the only thing
+/// rote does that spends money without being asked. A detached daemon inherits
+/// the variable, so turning it off for a `rote start` also turns it off for the
+/// session that start leaves running.
+fn apply_env_overrides(cfg: &mut Config) {
+    if let Some(v) = std::env::var_os("ROTE_CURATOR") {
+        let v = v.to_string_lossy().to_ascii_lowercase();
+        if matches!(v.as_str(), "0" | "off" | "no" | "false") {
+            cfg.curator_enabled = false;
+        }
+    }
+}
+
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
@@ -214,10 +233,21 @@ fn run() -> Result<ExitCode> {
         None
     };
 
+    // Applied before anything reads a config, and to both branches below, so no
+    // command can be the one that forgot.
+    let mut resolved = resolved;
+    if let Some((_, cfg)) = resolved.as_mut() {
+        apply_env_overrides(cfg);
+    }
+
     // Fall back to a repo-less config for the two commands that allow it.
     let cfg = match &resolved {
         Some((_, cfg)) => cfg.clone(),
-        None => Config::load(&paths::global_config_path()?, Path::new("/nonexistent"))?,
+        None => {
+            let mut cfg = Config::load(&paths::global_config_path()?, Path::new("/nonexistent"))?;
+            apply_env_overrides(&mut cfg);
+            cfg
+        }
     };
     // --no-color wins over config; NO_COLOR is honored as the de facto standard.
     let color = cfg.color && !cli.no_color && std::env::var_os("NO_COLOR").is_none();
