@@ -183,6 +183,299 @@ pub fn is_rankable(h: &Hunk) -> bool {
     !h.key.is_empty()
 }
 
+// ------------------------------------------------------- asking, and reading
+
+/// The curator's instructions. A constant so the payload is reproducible.
+///
+/// Two things it is deliberately *not* asked for. Not a summary of the change —
+/// the user is about to read the hunk line by line and type it, so describing it
+/// first would be the thing they read instead of the code. Not typing hazards —
+/// noticing those is the exercise. What is left is the one judgement a reader
+/// cannot make until they have seen everything: what has to exist before this
+/// makes sense.
+pub const CURATOR_PROMPT: &str = "You are ordering a set of code changes for \
+someone who is about to type every line of them by hand, in the order you give, \
+to learn them. Order them so that each hunk makes sense to a reader who has seen \
+everything above it and nothing below it: definitions before uses, a data model \
+before the code that reads it, the core change before the knock-on edits, tests \
+and generated files last. For each hunk write one short line of ORDERING \
+RATIONALE — what it depends on, or what depends on it (\"the Tag model \
+everything below refers to\", \"uses Tag; type this after the model exists\"). Do \
+not summarize what the hunk does; the reader is about to read it. Do not warn \
+about typos or tricky syntax. Reply with JSON only, no prose and no code fence, \
+in exactly this shape: {\"order\":[{\"hunk\":3,\"note\":\"...\"},...]}, listing \
+every hunk number exactly once, best first.";
+
+/// How long the curator gets. Shorter than the reviewer's five minutes: this is
+/// a ranking task over material already summarized, and it runs while the user
+/// waits to see a queue.
+pub const CURATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How many hunks are offered in one payload.
+///
+/// Past this the ordering task stops being one a model does well and the payload
+/// stops being cheap. Everything beyond the cap is still *considered* — it gets
+/// a tombstone so typing does not re-fire the pass — and simply keeps file
+/// order, which is the documented fallback.
+pub const MAX_HUNKS: usize = 60;
+
+/// Lines of each side of a hunk that go into the payload.
+///
+/// Ordering is a question about what a hunk touches, not about its every line,
+/// and a single 400-line hunk must not crowd out the other fifty.
+pub const MAX_LINES_PER_HUNK: usize = 30;
+
+/// The longest note worth rendering above a hunk. Anything more is a paragraph,
+/// and a paragraph is the summary the prompt asked it not to write.
+pub const MAX_NOTE_CHARS: usize = 160;
+
+/// One hunk as the curator sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub key: String,
+    pub file: String,
+    pub anchor_hint: usize,
+    pub op: crate::hunks::Op,
+    /// The innermost line of context above, as a "which symbol is this in" hint.
+    pub in_symbol: Option<String>,
+    pub old_lines: Vec<String>,
+    pub new_lines: Vec<String>,
+    /// The mechanical note (`possible rename from x`, or why a file is
+    /// untypeable), which the model cannot reconstruct.
+    pub note: Option<String>,
+    /// What a previous pass already said, offered back as a hint.
+    pub cached_note: Option<String>,
+}
+
+/// The pending hunks worth curating, in queue order, one per distinct key.
+///
+/// Deduplicated because two hunks in one file with the same `old -> new` pair
+/// share a key by design (`disambiguate_ids` splits ids, not keys) — offering
+/// the same change twice would only invite the model to rank it inconsistently
+/// with itself.
+pub fn candidates(manifest: &Manifest, cache: &Cache) -> Vec<Candidate> {
+    let mut seen = std::collections::HashSet::new();
+    manifest
+        .queue_view()
+        .iter()
+        .filter(|h| is_rankable(h))
+        .filter(|h| seen.insert(h.key.clone()))
+        .map(|h| Candidate {
+            key: h.key.clone(),
+            file: h.file.clone(),
+            anchor_hint: h.anchor_hint,
+            op: h.op,
+            in_symbol: h
+                .context_before
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .cloned(),
+            old_lines: h.old_lines.clone(),
+            new_lines: h.new_lines.clone(),
+            note: h.note.clone(),
+            cached_note: cache.entries.get(&h.key).and_then(|e| e.note.clone()),
+        })
+        .collect()
+}
+
+/// Assemble the payload, in the `== SECTION ==` shape DESIGN §8 established.
+///
+/// Hunks are labelled with small integers rather than their keys, and that is
+/// not cosmetic: a model asked to echo `k-3f9a1c...` will eventually mangle one,
+/// and a mangled key is a silently misplaced hunk. Index to key is a mapping we
+/// own and can check.
+pub fn build_payload(task: &str, candidates: &[Candidate]) -> String {
+    let mut out = String::new();
+    out.push_str("== TASK ==\n");
+    out.push_str(if task.is_empty() {
+        "(unspecified)"
+    } else {
+        task
+    });
+
+    out.push_str("\n\n== HOW TO ANSWER ==\n");
+    out.push_str("{\"order\":[{\"hunk\":3,\"note\":\"...\"},...]} — every hunk number below\n");
+    out.push_str("exactly once, best first. JSON only.\n");
+
+    out.push_str("\n== HUNKS ==\n");
+    for (i, c) in candidates.iter().take(MAX_HUNKS).enumerate() {
+        out.push_str(&format!(
+            "[{}] {}:{}  {}\n",
+            i + 1,
+            c.file,
+            c.anchor_hint,
+            op_label(c.op)
+        ));
+        if let Some(sym) = &c.in_symbol {
+            out.push_str(&format!("    in: {}\n", sym.trim_end()));
+        }
+        if let Some(note) = &c.note {
+            out.push_str(&format!("    note: {note}\n"));
+        }
+        if let Some(prev) = &c.cached_note {
+            // Offered back so an unchanged hunk keeps a stable line rather than
+            // being re-described slightly differently on every pass.
+            out.push_str(&format!("    previously: {prev}\n"));
+        }
+        for l in c.old_lines.iter().take(MAX_LINES_PER_HUNK) {
+            out.push_str(&format!("    - {l}\n"));
+        }
+        if c.old_lines.len() > MAX_LINES_PER_HUNK {
+            out.push_str(&format!(
+                "    - … {} more removed lines\n",
+                c.old_lines.len() - MAX_LINES_PER_HUNK
+            ));
+        }
+        for l in c.new_lines.iter().take(MAX_LINES_PER_HUNK) {
+            out.push_str(&format!("    + {l}\n"));
+        }
+        if c.new_lines.len() > MAX_LINES_PER_HUNK {
+            out.push_str(&format!(
+                "    + … {} more added lines\n",
+                c.new_lines.len() - MAX_LINES_PER_HUNK
+            ));
+        }
+        if c.old_lines.is_empty() && c.new_lines.is_empty() {
+            // An untypeable file — presented whole and byte-compared rather than
+            // typed. It still belongs somewhere in the order, usually last.
+            out.push_str("    (no lines to type; verified by byte comparison)\n");
+        }
+    }
+    out
+}
+
+fn op_label(op: crate::hunks::Op) -> &'static str {
+    use crate::hunks::Op;
+    match op {
+        Op::Insert => "insert",
+        Op::Replace => "replace",
+        Op::Delete => "delete",
+        Op::CreateFile => "new file",
+        Op::DeleteFile => "delete file",
+    }
+}
+
+/// One entry of the model's answer, already range-checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ranked {
+    /// Zero-based index into the candidates that were offered.
+    pub index: usize,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawOrder {
+    order: Vec<RawRanked>,
+}
+
+#[derive(Deserialize)]
+struct RawRanked {
+    hunk: i64,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Read the model's answer, forgivingly.
+///
+/// Forgiving in specific, bounded ways, because the failure mode of strictness
+/// here is discarding a perfectly good ordering over a code fence. It accepts a
+/// fenced reply, a reply wrapped in prose, a bare top-level array, and unknown
+/// keys. It does not accept an answer it cannot make sense of at all — that
+/// returns `Err` so the caller can tombstone the batch and warn once, rather
+/// than silently producing an empty ordering that looks like success.
+pub fn parse_response(text: &str, n: usize) -> Result<Vec<Ranked>> {
+    let body = extract_json(text).context("no JSON object or array in the reply")?;
+
+    let raw: Vec<RawRanked> = if body.starts_with('[') {
+        serde_json::from_str(&body).context("the reply is not a list of hunks")?
+    } else {
+        serde_json::from_str::<RawOrder>(&body)
+            .context("the reply has no usable `order`")?
+            .order
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let out: Vec<Ranked> = raw
+        .into_iter()
+        .filter_map(|r| {
+            // 1-based on the wire, because that is what the payload showed.
+            let index = usize::try_from(r.hunk).ok()?.checked_sub(1)?;
+            if index >= n || !seen.insert(index) {
+                // Out of range, or named twice: the first position wins. A model
+                // that repeats itself has still told us where it wanted the hunk
+                // the first time.
+                return None;
+            }
+            Some(Ranked {
+                index,
+                note: r.note.and_then(|n| tidy_note(&n)),
+            })
+        })
+        .collect();
+
+    if out.is_empty() {
+        anyhow::bail!("the reply named no hunk that exists");
+    }
+    Ok(out)
+}
+
+/// One line, trimmed, bounded. `None` for a note that says nothing.
+fn tidy_note(raw: &str) -> Option<String> {
+    let line = raw.lines().find(|l| !l.trim().is_empty())?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut out: String = line.chars().take(MAX_NOTE_CHARS).collect();
+    if line.chars().count() > MAX_NOTE_CHARS {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// The first balanced JSON value in a blob of text.
+///
+/// Brace matching rather than "find the last `}`", and it tracks string literals
+/// and their escapes, because a note containing a brace or a quote is entirely
+/// likely in this of all applications — the material being described is code.
+fn extract_json(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.iter().position(|c| *c == '{' || *c == '[')?;
+    let (open, close) = if chars[start] == '{' {
+        ('{', '}')
+    } else {
+        ('[', ']')
+    };
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in chars.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *c == '\\' {
+                escaped = true;
+            } else if *c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *c {
+            '"' => in_string = true,
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(chars[start..=i].iter().collect());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +722,241 @@ mod tests {
         cache.apply(&mut m);
         assert_eq!(m.hunks[0].curator_rank, Some(2));
         assert_eq!(m.hunks[1].curator_rank, Some(2));
+    }
+
+    // ------------------------------------------------------------- payload
+
+    #[test]
+    fn the_payload_labels_hunks_with_small_integers_not_keys() {
+        // A model asked to echo `k-3f9a1c...` will eventually mangle one, and a
+        // mangled key is a hunk silently placed somewhere it does not belong.
+        let m = manifest(vec![hunk("k-aaaa1111", "a.rs"), hunk("k-bbbb2222", "b.rs")]);
+        let payload = build_payload("add tagging", &candidates(&m, &Cache::new("s")));
+
+        assert!(payload.contains("[1] a.rs:1"), "{payload}");
+        assert!(payload.contains("[2] b.rs:1"), "{payload}");
+        assert!(
+            !payload.contains("k-aaaa1111"),
+            "no key reaches the model: {payload}"
+        );
+        assert!(payload.contains("== TASK ==\nadd tagging"), "{payload}");
+    }
+
+    #[test]
+    fn two_hunks_that_share_a_key_are_offered_to_the_model_once() {
+        let mut m = manifest(vec![hunk("k-1", "a.rs"), hunk("k-1", "a.rs")]);
+        m.hunks[1].id = "h-k-1.2".into();
+        assert_eq!(candidates(&m, &Cache::new("s")).len(), 1);
+    }
+
+    #[test]
+    fn the_payload_carries_the_note_a_hunk_already_has() {
+        let mut m = manifest(vec![hunk("k-1", "a.rs")]);
+        m.hunks[0].note = Some("possible rename from old_name".into());
+        m.hunks[0].context_before = vec!["".into(), "impl Tag {".into()];
+
+        let mut cache = Cache::new("s");
+        cache.entries.insert(
+            "k-1".into(),
+            Entry {
+                rank: Some(1),
+                note: Some("the model everything refers to".into()),
+            },
+        );
+
+        let payload = build_payload("t", &candidates(&m, &cache));
+        assert!(
+            payload.contains("note: possible rename from old_name"),
+            "{payload}"
+        );
+        assert!(
+            payload.contains("previously: the model everything refers to"),
+            "an unchanged hunk should keep a stable line: {payload}"
+        );
+        assert!(
+            payload.contains("in: impl Tag {"),
+            "the innermost non-blank context line: {payload}"
+        );
+    }
+
+    #[test]
+    fn the_payload_stops_at_the_cap() {
+        let hunks: Vec<Hunk> = (0..MAX_HUNKS + 5)
+            .map(|i| hunk(&format!("k-{i:03}"), &format!("f{i:03}.rs")))
+            .collect();
+        let m = manifest(hunks);
+        let all = candidates(&m, &Cache::new("s"));
+        assert_eq!(all.len(), MAX_HUNKS + 5, "the caller still sees the rest");
+
+        let payload = build_payload("t", &all);
+        assert!(payload.contains(&format!("[{MAX_HUNKS}] ")), "{payload}");
+        assert!(
+            !payload.contains(&format!("[{}] ", MAX_HUNKS + 1)),
+            "and stops there"
+        );
+    }
+
+    #[test]
+    fn a_long_hunk_does_not_crowd_out_the_others() {
+        let mut h = hunk("k-1", "a.rs");
+        h.new_lines = (0..MAX_LINES_PER_HUNK + 20)
+            .map(|i| format!("line {i}"))
+            .collect();
+        let m = manifest(vec![h]);
+
+        let payload = build_payload("t", &candidates(&m, &Cache::new("s")));
+        assert!(payload.contains(&format!("+ line {}", MAX_LINES_PER_HUNK - 1)));
+        assert!(!payload.contains(&format!("+ line {MAX_LINES_PER_HUNK}\n")));
+        assert!(payload.contains("20 more added lines"), "{payload}");
+    }
+
+    #[test]
+    fn an_untypeable_hunk_still_goes_into_the_order() {
+        // A lockfile is verified by byte comparison rather than typed, but it
+        // still belongs somewhere in the sequence — usually last.
+        let mut h = hunk("k-1", "Cargo.lock");
+        h.new_lines = vec![];
+        h.note = Some("generated; run the command that produces it".into());
+        let m = manifest(vec![h]);
+
+        let payload = build_payload("t", &candidates(&m, &Cache::new("s")));
+        assert!(payload.contains("[1] Cargo.lock:1"), "{payload}");
+        assert!(payload.contains("no lines to type"), "{payload}");
+    }
+
+    #[test]
+    fn the_curator_prompt_asks_for_ordering_rationale_not_a_summary() {
+        // The one thing that separates a useful note from a distraction. If this
+        // wording drifts, the notes quietly become descriptions of code the user
+        // is about to read anyway.
+        assert!(CURATOR_PROMPT.contains("ORDERING RATIONALE"));
+        assert!(CURATOR_PROMPT.contains("Do not summarize what the hunk does"));
+        assert!(CURATOR_PROMPT.contains("Do not warn about typos"));
+        assert!(CURATOR_PROMPT.contains("definitions before uses"));
+    }
+
+    // -------------------------------------------------------------- parsing
+
+    #[test]
+    fn a_plain_reply_is_read() {
+        let got = parse_response(r#"{"order":[{"hunk":2,"note":"first"},{"hunk":1}]}"#, 2).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Ranked {
+                    index: 1,
+                    note: Some("first".into())
+                },
+                Ranked {
+                    index: 0,
+                    note: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fenced_json_reply_is_read_anyway() {
+        let text = "```json\n{\"order\":[{\"hunk\":1,\"note\":\"a\"}]}\n```";
+        assert_eq!(parse_response(text, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_reply_wrapped_in_prose_is_read_anyway() {
+        // Discarding a good ordering because the model said hello first would be
+        // a silly way to lose a token spend.
+        let text = "Here is the order:\n{\"order\":[{\"hunk\":1}]}\nHope that helps!";
+        assert_eq!(parse_response(text, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_bare_array_is_read_too() {
+        assert_eq!(
+            parse_response(r#"[{"hunk":1,"note":"x"}]"#, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_note_containing_a_brace_does_not_truncate_the_object() {
+        // The material being described is code, so a brace or a quote inside a
+        // note is not an edge case. Matching on the last `}` would cut here.
+        let text = r#"{"order":[{"hunk":1,"note":"the impl Tag { } block"},{"hunk":2}]}"#;
+        let got = parse_response(text, 2).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].note.as_deref(), Some("the impl Tag { } block"));
+    }
+
+    #[test]
+    fn a_note_containing_an_escaped_quote_survives() {
+        let text = r#"{"order":[{"hunk":1,"note":"sets name=\"tag\" first"}]}"#;
+        let got = parse_response(text, 1).unwrap();
+        assert_eq!(got[0].note.as_deref(), Some(r#"sets name="tag" first"#));
+    }
+
+    #[test]
+    fn a_reply_naming_a_hunk_that_does_not_exist_is_ignored() {
+        let got = parse_response(r#"{"order":[{"hunk":99},{"hunk":0},{"hunk":1}]}"#, 2).unwrap();
+        assert_eq!(
+            got,
+            vec![Ranked {
+                index: 0,
+                note: None
+            }]
+        );
+    }
+
+    #[test]
+    fn a_reply_that_names_a_hunk_twice_keeps_the_first_position() {
+        let text = r#"{"order":[{"hunk":2,"note":"here"},{"hunk":1},{"hunk":2,"note":"no"}]}"#;
+        let got = parse_response(text, 2).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0],
+            Ranked {
+                index: 1,
+                note: Some("here".into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_multi_line_note_is_reduced_to_one_line() {
+        let text = "{\"order\":[{\"hunk\":1,\"note\":\"\\n  first line\\nsecond line\"}]}";
+        let got = parse_response(text, 1).unwrap();
+        assert_eq!(got[0].note.as_deref(), Some("first line"));
+    }
+
+    #[test]
+    fn an_essay_of_a_note_is_cut_to_something_that_fits_above_a_hunk() {
+        let long = "x".repeat(MAX_NOTE_CHARS + 50);
+        let text = format!(r#"{{"order":[{{"hunk":1,"note":"{long}"}}]}}"#);
+        let note = parse_response(&text, 1).unwrap()[0].note.clone().unwrap();
+        assert_eq!(
+            note.chars().count(),
+            MAX_NOTE_CHARS + 1,
+            "plus the ellipsis"
+        );
+        assert!(note.ends_with('…'));
+    }
+
+    #[test]
+    fn an_empty_note_is_dropped_rather_than_rendered_blank() {
+        let got = parse_response(r#"{"order":[{"hunk":1,"note":"   "}]}"#, 1).unwrap();
+        assert_eq!(got[0].note, None);
+    }
+
+    #[test]
+    fn a_reply_with_nothing_usable_in_it_is_an_error() {
+        // An error, not an empty ordering: the caller has to be able to tell
+        // "the model declined" from "the model put them in this order", because
+        // the first one deserves a warning and a tombstone.
+        assert!(parse_response("I could not do that.", 3).is_err());
+        assert!(parse_response(r#"{"order":[]}"#, 3).is_err());
+        assert!(parse_response(r#"{"order":[{"hunk":9}]}"#, 3).is_err());
+        assert!(parse_response("", 3).is_err());
     }
 
     #[test]
