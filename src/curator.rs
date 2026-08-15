@@ -433,6 +433,171 @@ fn tidy_note(raw: &str) -> Option<String> {
     Some(out)
 }
 
+// ------------------------------------------------------------ when, and what
+
+/// A queue of one has no order, and asking about it is a token round trip
+/// spent on a rank nobody can observe.
+pub const MIN_HUNKS_TO_CURATE: usize = 2;
+
+/// How long the shadow must sit still before the agent is presumed finished.
+///
+/// Its own signal rather than the recompute debounce, which is armed by the
+/// user's typing too: gating on that would delay curation for as long as
+/// somebody is working, and under steady typing a comparable window may never
+/// elapse at all.
+pub const CURATOR_SETTLE_MS: u64 = 1500;
+
+/// A backstop on total spend for one session.
+///
+/// One attempt per distinct queue bounds cost per queue but not overall — an
+/// agent that keeps writing produces a new queue each time. In memory, so a
+/// daemon restart resets it, which is right: a restart is not a loop.
+pub const MAX_PASSES_PER_SESSION: u32 = 8;
+
+/// Everything the decision needs, and nothing it could act on.
+///
+/// Pure so the policy is testable with no clock, no filesystem and no model —
+/// the same argument that made `Watchdog` pure.
+pub struct Trigger<'a> {
+    pub enabled: bool,
+    pub in_flight: bool,
+    /// The agent has stopped writing and no re-diff is owed.
+    pub quiet: bool,
+    pub passes: u32,
+    pub pending_keys: &'a [String],
+    pub cache: &'a Cache,
+    pub last_fingerprint: Option<&'a str>,
+}
+
+/// The fingerprint to record if a pass should start now, or `None`.
+///
+/// The subtle condition is the second-to-last one. Firing needs at least one
+/// pending key the cache has never *considered* — and because a completed pass
+/// writes an entry for every key it was given, success or failure, typing a hunk
+/// can never bring that set back from empty. Typing removes a hunk from
+/// `pending`; it does not uncurate anything. So ordinary work never re-fires the
+/// curator, and only the agent adding something does.
+pub fn should_curate(t: &Trigger) -> Option<String> {
+    if !t.enabled || t.in_flight || !t.quiet {
+        return None;
+    }
+    if t.passes >= MAX_PASSES_PER_SESSION {
+        return None;
+    }
+    if t.pending_keys.len() < MIN_HUNKS_TO_CURATE {
+        return None;
+    }
+    if t.pending_keys.iter().all(|k| t.cache.considered(k)) {
+        return None;
+    }
+    let fp = fingerprint(t.pending_keys);
+    if t.last_fingerprint == Some(fp.as_str()) {
+        return None;
+    }
+    Some(fp)
+}
+
+/// Turn the model's ordering into the entries to store, pin included.
+///
+/// Every key in `considered` gets an entry, including the ones the model left
+/// out and the ones past the payload cap — that is what stops a failed or
+/// partial pass being retried on every keystroke.
+///
+/// The pin is baked in here rather than applied when writing, and it has to be:
+/// the cache is re-applied after every `reconcile`, so a pin held anywhere else
+/// would be overwritten by the next recompute a second later and the screen
+/// would jump after all.
+pub fn assign_ranks(
+    considered: &[String],
+    order: &[(String, Option<String>)],
+    pinned: Option<&str>,
+) -> BTreeMap<String, Entry> {
+    let mut out: BTreeMap<String, Entry> = considered
+        .iter()
+        .map(|k| (k.clone(), Entry::default()))
+        .collect();
+
+    for (position, (key, note)) in order.iter().enumerate() {
+        // Ranks start at 1 so that 0 is free for the pin. `try_from` rather than
+        // `as`: `u32::MAX` is the sentinel `queue_view` uses for "unranked", and
+        // a real rank colliding with it would sort a hunk to the end.
+        let rank = u32::try_from(position + 1).unwrap_or(u32::MAX - 1);
+        let entry = out.entry(key.clone()).or_default();
+        entry.rank = Some(rank);
+        if note.is_some() {
+            entry.note = note.clone();
+        }
+    }
+
+    if let Some(key) = pinned {
+        if let Some(entry) = out.get_mut(key) {
+            entry.rank = Some(0);
+        }
+    }
+    out
+}
+
+/// What a finished pass has to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// Every key that was offered, cap or no cap. All of these get an entry.
+    pub considered: Vec<String>,
+    /// Key and note, in teaching order.
+    pub order: Vec<(String, Option<String>)>,
+    /// How many were past `MAX_HUNKS` and so keep file order.
+    pub beyond_cap: usize,
+    pub error: Option<String>,
+}
+
+/// Run one pass. Called on its own thread: it must never touch the manifest,
+/// take a lock, or block the engine.
+pub fn run_pass(cfg: &crate::config::Config, task: &str, candidates: Vec<Candidate>) -> Outcome {
+    let considered: Vec<String> = candidates.iter().map(|c| c.key.clone()).collect();
+    let beyond_cap = considered.len().saturating_sub(MAX_HUNKS);
+    let offered = considered.len().min(MAX_HUNKS);
+    let payload = build_payload(task, &candidates);
+
+    let fail = |e: String| Outcome {
+        considered: considered.clone(),
+        order: Vec::new(),
+        beyond_cap,
+        error: Some(e),
+    };
+
+    let completed = match crate::model::run(
+        &crate::model::Invocation {
+            claude_cmd: &cfg.claude_cmd,
+            prompt: CURATOR_PROMPT,
+            extra_args: &cfg.curator_model_args,
+            timeout: CURATOR_TIMEOUT,
+        },
+        &payload,
+    ) {
+        Ok(c) => c,
+        Err(e) => return fail(format!("{e:#}")),
+    };
+    if !completed.status.success() {
+        return fail(format!(
+            "exit {}: {}",
+            completed.status.code().unwrap_or(-1),
+            completed.complaint()
+        ));
+    }
+
+    match parse_response(&completed.stdout, offered) {
+        Ok(ranked) => Outcome {
+            order: ranked
+                .into_iter()
+                .filter_map(|r| candidates.get(r.index).map(|c| (c.key.clone(), r.note)))
+                .collect(),
+            considered,
+            beyond_cap,
+            error: None,
+        },
+        Err(e) => fail(format!("{e:#}")),
+    }
+}
+
 /// The first balanced JSON value in a blob of text.
 ///
 /// Brace matching rather than "find the last `}`", and it tracks string literals
@@ -957,6 +1122,226 @@ mod tests {
         assert!(parse_response(r#"{"order":[]}"#, 3).is_err());
         assert!(parse_response(r#"{"order":[{"hunk":9}]}"#, 3).is_err());
         assert!(parse_response("", 3).is_err());
+    }
+
+    // ------------------------------------------------------------- trigger
+
+    fn keys(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("k-{i}")).collect()
+    }
+
+    fn trigger<'a>(pending: &'a [String], cache: &'a Cache) -> Trigger<'a> {
+        Trigger {
+            enabled: true,
+            in_flight: false,
+            quiet: true,
+            passes: 0,
+            pending_keys: pending,
+            cache,
+            last_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn a_queue_with_one_hunk_is_not_worth_curating() {
+        let cache = Cache::new("s");
+        assert!(should_curate(&trigger(&keys(1), &cache)).is_none());
+        assert!(should_curate(&trigger(&keys(2), &cache)).is_some());
+    }
+
+    #[test]
+    fn typing_a_hunk_does_not_ask_the_curator_to_run_again() {
+        // Half the cost bound. A completed pass writes an entry for every key it
+        // was given, so the uncached set is empty afterwards — and typing only
+        // removes hunks from `pending`, it never uncurates one.
+        let all = keys(4);
+        let mut cache = Cache::new("s");
+        for (i, k) in all.iter().enumerate() {
+            cache.entries.insert(
+                k.clone(),
+                Entry {
+                    rank: Some(i as u32 + 1),
+                    note: None,
+                },
+            );
+        }
+        let fp = fingerprint(&all);
+
+        for typed in 0..3 {
+            let left = &all[typed..];
+            let mut t = trigger(left, &cache);
+            t.last_fingerprint = Some(&fp);
+            assert!(
+                should_curate(&t).is_none(),
+                "typing hunk {typed} must not spend a token"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pass_that_failed_is_not_retried_for_the_same_queue() {
+        // The other half, and the reason a tombstone exists at all. Without one,
+        // a failed pass leaves every key uncached — and then typing *shrinks*
+        // that set, moving the fingerprint and buying another failed call for
+        // every hunk the user gets through.
+        let all = keys(4);
+        let mut cache = Cache::new("s");
+        for k in &all {
+            cache.entries.insert(k.clone(), Entry::default()); // tombstones
+        }
+        for typed in 0..3 {
+            assert!(
+                should_curate(&trigger(&all[typed..], &cache)).is_none(),
+                "after a failure, typing hunk {typed} must not retry it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hunk_the_agent_added_asks_the_curator_to_run_again() {
+        let mut cache = Cache::new("s");
+        for k in keys(3) {
+            cache.entries.insert(k, Entry::default());
+        }
+        let mut grown = keys(3);
+        grown.push("k-new".into());
+        assert!(should_curate(&trigger(&grown, &cache)).is_some());
+    }
+
+    #[test]
+    fn nothing_starts_while_a_pass_is_in_flight() {
+        let cache = Cache::new("s");
+        let ks = keys(3);
+        let mut t = trigger(&ks, &cache);
+        t.in_flight = true;
+        assert!(should_curate(&t).is_none());
+    }
+
+    #[test]
+    fn nothing_starts_while_the_agent_is_still_writing() {
+        let cache = Cache::new("s");
+        let ks = keys(3);
+        let mut t = trigger(&ks, &cache);
+        t.quiet = false;
+        assert!(should_curate(&t).is_none());
+    }
+
+    #[test]
+    fn a_disabled_curator_never_starts() {
+        let cache = Cache::new("s");
+        let ks = keys(3);
+        let mut t = trigger(&ks, &cache);
+        t.enabled = false;
+        assert!(should_curate(&t).is_none());
+    }
+
+    #[test]
+    fn the_same_queue_is_not_curated_twice() {
+        let cache = Cache::new("s");
+        let ks = keys(3);
+        let fp = fingerprint(&ks);
+        let mut t = trigger(&ks, &cache);
+        t.last_fingerprint = Some(&fp);
+        assert!(should_curate(&t).is_none(), "even with nothing cached yet");
+    }
+
+    #[test]
+    fn a_session_cannot_spend_more_than_a_handful_of_passes() {
+        // One attempt per distinct queue bounds cost per queue but not overall:
+        // an agent that keeps writing produces a new queue every time.
+        let cache = Cache::new("s");
+        let ks = keys(3);
+        let mut t = trigger(&ks, &cache);
+        t.passes = MAX_PASSES_PER_SESSION;
+        assert!(should_curate(&t).is_none());
+    }
+
+    // --------------------------------------------------------------- ranks
+
+    fn order(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(k, n)| (k.to_string(), n.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn ranks_follow_the_order_the_model_gave() {
+        let considered = keys(3);
+        let got = assign_ranks(
+            &considered,
+            &order(&[("k-2", Some("first")), ("k-0", None), ("k-1", None)]),
+            None,
+        );
+        assert_eq!(got["k-2"].rank, Some(1));
+        assert_eq!(got["k-2"].note.as_deref(), Some("first"));
+        assert_eq!(got["k-0"].rank, Some(2));
+        assert_eq!(got["k-1"].rank, Some(3));
+    }
+
+    #[test]
+    fn a_hunk_the_model_left_out_sorts_after_every_hunk_it_ranked() {
+        let considered = keys(3);
+        let got = assign_ranks(&considered, &order(&[("k-0", None)]), None);
+        assert_eq!(got["k-0"].rank, Some(1));
+        assert_eq!(
+            (got["k-1"].rank, got["k-2"].rank),
+            (None, None),
+            "unranked, which `queue_view` sorts last"
+        );
+        assert!(
+            got.contains_key("k-1") && got.contains_key("k-2"),
+            "but still considered, so nothing re-fires"
+        );
+    }
+
+    #[test]
+    fn no_rank_can_collide_with_the_unranked_sentinel() {
+        // `queue_view` maps `None` to `u32::MAX`. A real rank landing there
+        // would sort a hunk to the very end while claiming to be ranked.
+        let considered = keys(3);
+        let got = assign_ranks(
+            &considered,
+            &order(&[("k-0", None), ("k-1", None), ("k-2", None)]),
+            None,
+        );
+        assert!(got.values().all(|e| e.rank != Some(u32::MAX)));
+    }
+
+    #[test]
+    fn the_hunk_the_user_is_on_keeps_the_head_however_the_curator_ranked_it() {
+        let considered = keys(3);
+        let got = assign_ranks(
+            &considered,
+            &order(&[("k-2", None), ("k-1", None), ("k-0", None)]),
+            Some("k-0"),
+        );
+        assert_eq!(got["k-0"].rank, Some(0), "pinned ahead of everything");
+        assert_eq!(got["k-2"].rank, Some(1), "and the rest keep their order");
+    }
+
+    #[test]
+    fn with_nothing_engaged_the_curators_first_choice_leads() {
+        let considered = keys(3);
+        let got = assign_ranks(&considered, &order(&[("k-2", None), ("k-0", None)]), None);
+        assert_eq!(got["k-2"].rank, Some(1));
+    }
+
+    #[test]
+    fn a_pin_on_a_key_the_model_never_saw_is_still_honoured() {
+        // A hunk that appeared while the model was thinking has no entry of its
+        // own, but it can still be the head by the time the answer lands.
+        let considered = keys(2);
+        let mut got = assign_ranks(&considered, &order(&[("k-0", None)]), Some("k-1"));
+        assert_eq!(got.remove("k-1").unwrap().rank, Some(0));
+    }
+
+    #[test]
+    fn a_failed_pass_tombstones_everything_it_was_given() {
+        let considered = keys(3);
+        let got = assign_ranks(&considered, &[], None);
+        assert_eq!(got.len(), 3);
+        assert!(got.values().all(|e| *e == Entry::default()));
     }
 
     #[test]

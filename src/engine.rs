@@ -13,6 +13,7 @@
 //! outside the lock, so the queue can move underneath it.
 
 use crate::config::Config;
+use crate::curator;
 use crate::hunks::{Divergence, Hunk, Status};
 use crate::paths::ProjectPaths;
 use crate::present::{self, Classification};
@@ -21,6 +22,7 @@ use crate::state::{self, Notice};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 /// Minimum wall time between two full re-diffs of the trees.
@@ -255,6 +257,19 @@ impl Watchdog {
     }
 }
 
+/// What to say once a curation lands.
+fn curated_line(outcome: &curator::Outcome) -> String {
+    if outcome.beyond_cap > 0 {
+        format!(
+            "curated the first {} hunks; the other {} keep file order",
+            curator::MAX_HUNKS,
+            outcome.beyond_cap
+        )
+    } else {
+        "the queue is now in teaching order".to_string()
+    }
+}
+
 /// Why a full recompute is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
@@ -278,10 +293,25 @@ pub struct Engine {
     drift: bool,
     degraded: bool,
     started: bool,
+    /// Results from curator threads.
+    ///
+    /// The engine keeps its own `Sender`, so `try_recv` can never report
+    /// `Disconnected` and there is no spurious-shutdown case to handle. An
+    /// `EngineEvent` variant would have worked too, but this needs no change to
+    /// a type that is deliberately not `PartialEq`.
+    curation_tx: Sender<curator::Outcome>,
+    curation_rx: Receiver<curator::Outcome>,
+    curation_in_flight: bool,
+    curation_passes: u32,
+    last_curation_fingerprint: Option<String>,
+    /// When the *agent* last wrote. Separate from `recompute`, which the user's
+    /// own typing arms as well.
+    last_shadow_change: Option<Tick>,
 }
 
 impl Engine {
     pub fn new(project: ProjectPaths, cfg: Config, clock: Box<dyn Clock>) -> Self {
+        let (curation_tx, curation_rx) = std::sync::mpsc::channel();
         Self {
             project,
             cfg,
@@ -294,6 +324,12 @@ impl Engine {
             drift: false,
             degraded: false,
             started: false,
+            curation_tx,
+            curation_rx,
+            curation_in_flight: false,
+            curation_passes: 0,
+            last_curation_fingerprint: None,
+            last_shadow_change: None,
         }
     }
 
@@ -352,6 +388,7 @@ impl Engine {
                 }
                 EngineEvent::Changed(Origin::Shadow, _) => {
                     // The agent worked. Only a full re-diff can say what it did.
+                    self.last_shadow_change = Some(now);
                     self.arm_recompute(now);
                 }
                 EngineEvent::Command(req) => {
@@ -387,6 +424,7 @@ impl Engine {
 
         self.raise_due_questions(now, &mut notices)?;
         self.run_due_recompute(now, &mut notices)?;
+        self.run_due_curation(now, &mut notices);
 
         self.publish(notices)
     }
@@ -793,6 +831,153 @@ impl Engine {
                 generation,
             ),
         })
+    }
+
+    // ------------------------------------------------------------- curation
+
+    /// Absorb any finished pass, then consider starting one.
+    ///
+    /// Returns nothing and propagates nothing. An `Err` from here would reach
+    /// `Engine::run`, which reports "the engine stopped" and takes the daemon
+    /// with it — so a curator that cannot write its cache would kill the thing
+    /// that watches you type. Every failure is a notice instead. That is not
+    /// defensiveness; it is the whole contract of an advisory pass.
+    fn run_due_curation(&mut self, now: Tick, notices: &mut Vec<Notice>) {
+        // Absorb first, and unconditionally: a result must land even when the
+        // conditions that started it no longer hold.
+        while let Ok(outcome) = self.curation_rx.try_recv() {
+            self.curation_in_flight = false;
+            if let Some(e) = &outcome.error {
+                notices.push(Notice::warn(format!(
+                    "the curator did not run ({e}). Keeping the file order."
+                )));
+            }
+            match self.absorb_curation(&outcome) {
+                Ok(true) => notices.push(Notice::info(curated_line(&outcome))),
+                Ok(false) => {}
+                Err(e) => notices.push(Notice::warn(format!(
+                    "the curation could not be recorded ({e:#}). Keeping the file order."
+                ))),
+            }
+        }
+
+        if let Err(e) = self.start_curation(now, notices) {
+            notices.push(Notice::warn(format!("the curator did not start ({e:#}).")));
+        }
+    }
+
+    fn start_curation(&mut self, now: Tick, notices: &mut Vec<Notice>) -> Result<()> {
+        // Quiet means the agent has stopped *and* no re-diff is owed, so the
+        // pending set is not about to change under the pass. `last_recompute`
+        // being set is what proves a queue was ever built.
+        let quiet = self.recompute == Pending::No
+            && self.last_recompute.is_some()
+            && match self.last_shadow_change {
+                // Nothing from the agent since this engine started, which is the
+                // ordinary `rote start` case: the work landed before the daemon
+                // did, and there is nothing to wait for.
+                None => true,
+                Some(t) => now.since(t) >= curator::CURATOR_SETTLE_MS,
+            };
+
+        let manifest = Manifest::require(&self.project)?;
+        let cache = curator::Cache::load(&self.project, manifest.session_stamp());
+        let keys = curator::pending_keys(&manifest);
+        let Some(fingerprint) = curator::should_curate(&curator::Trigger {
+            enabled: self.cfg.curator_enabled,
+            in_flight: self.curation_in_flight,
+            quiet,
+            passes: self.curation_passes,
+            pending_keys: &keys,
+            cache: &cache,
+            last_fingerprint: self.last_curation_fingerprint.as_deref(),
+        }) else {
+            return Ok(());
+        };
+
+        let candidates = curator::candidates(&manifest, &cache);
+        let task = manifest.task.clone();
+        let cfg = self.cfg.clone();
+        let tx = self.curation_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(curator::run_pass(&cfg, &task, candidates));
+        });
+
+        // Recorded at spawn rather than when the outcome lands. That covers the
+        // in-flight window, and — the case that actually bites — it covers a
+        // cache write that fails: without it, a full or read-only state dir
+        // would have the curator retry forever.
+        self.curation_in_flight = true;
+        self.curation_passes += 1;
+        self.last_curation_fingerprint = Some(fingerprint);
+        notices.push(Notice::info(
+            "curating — putting the queue in teaching order",
+        ));
+        Ok(())
+    }
+
+    /// Write a finished pass to the cache and project it onto the manifest.
+    ///
+    /// No compare-and-swap, unlike `commit_typed`, and the difference is worth
+    /// stating. That one addresses a hunk by id, so it has to check the world
+    /// did not move while it was unlocked. This is keyed by content: a hunk the
+    /// user typed while the model was thinking is terminal and its rank is
+    /// irrelevant, and one the agent reworked away simply has no entry. Applying
+    /// it to whatever is pending *now* is self-verifying.
+    fn absorb_curation(&self, outcome: &curator::Outcome) -> Result<bool> {
+        if Manifest::load(&self.project)?.is_none() {
+            // Archived while the model was thinking. Dropping it early avoids a
+            // pointless warning during teardown; the session stamp would have
+            // made a stray write inert anyway.
+            return Ok(false);
+        }
+
+        let project = &self.project;
+        let (changed, _) = session::with_session_maybe(project, |m| {
+            // Computed under the lock, because the head moves while a pass runs.
+            let pinned = self.pinned_key(m);
+            let entries =
+                curator::assign_ranks(&outcome.considered, &outcome.order, pinned.as_deref());
+
+            let mut cache = curator::Cache::load(project, m.session_stamp());
+            cache.entries.extend(entries);
+            // Written inside the closure because `Lock::acquire` opens a fresh
+            // descriptor each call and so is not re-entrant — there is no way to
+            // hold the manifest lock across both writes from outside. Cache
+            // first: if the process dies here, the next recompute re-applies it.
+            cache.save(project)?;
+            Ok(cache.apply(m).then_some(()))
+        })?;
+        Ok(changed.is_some())
+    }
+
+    /// The hunk that must keep the head, if any.
+    ///
+    /// "Freeze current, reorder ahead": a curation landing mid-session must not
+    /// move what you are looking at. But only once you are *in* it — with
+    /// nothing typed and nothing started, there is no place to lose, and the
+    /// curator's opinion about what to do first is the entire point of asking.
+    ///
+    /// The touched test goes through `observe` rather than `is_in_progress`,
+    /// which returns true for an empty region ("the state before the first
+    /// keystroke") and so cannot tell started from not-started. `observe`
+    /// compares the region against the baseline first and answers `Untouched`.
+    fn pinned_key(&self, m: &Manifest) -> Option<String> {
+        let head = m.head_of_queue()?;
+        let engaged = m.hunks.iter().any(|h| h.status != Status::Pending)
+            || head.pending_divergence.is_some()
+            || self.head_is_touched(head);
+        engaged.then(|| head.key.clone())
+    }
+
+    fn head_is_touched(&self, head: &Hunk) -> bool {
+        let Some(before) = self.baselines.get(&head.file) else {
+            return false;
+        };
+        let Ok(after) = present::read_lines(&self.project.repo_root.join(&head.file)) else {
+            return false;
+        };
+        observe(before, &after, head, self.cfg.strict_whitespace) != Observation::Untouched
     }
 
     /// Build a snapshot, emitting one only when something actually moved.

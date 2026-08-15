@@ -17,16 +17,29 @@ use rote::hunks::Status;
 use rote::session::{self, Manifest};
 use rote::shadow;
 use rote::state;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A started session with the agent's edit already in the shadow.
+///
+/// The curator is off. `Config::default()` turns it on, and these tests drive a
+/// real engine against a real tree — leaving it on would have every one of them
+/// try to spawn the developer's actual `claude`. `curated` below is the opt-in.
 fn started(real: &str, shadow_body: &str) -> (Fixture, Config, Engine) {
+    started_with(real, shadow_body, |cfg| cfg.curator_enabled = false)
+}
+
+fn started_with(
+    real: &str,
+    shadow_body: &str,
+    tune: impl FnOnce(&mut Config),
+) -> (Fixture, Config, Engine) {
     let fx = Fixture::new();
     fx.write("a.rs", real);
     fx.commit_all("initial");
     let project = fx.project();
     project.ensure_state_dir().unwrap();
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    tune(&mut cfg);
     let baseline = shadow::sync(&project, &cfg).unwrap();
     std::fs::write(project.shadow_dir.join("a.rs"), shadow_body).unwrap();
     Manifest::new(&project, "test task".into(), baseline)
@@ -403,5 +416,258 @@ fn a_closed_session_ends_the_loop() {
     assert!(
         matches!(out.as_slice(), [state::Event::Closed { .. }]),
         "the session going away means exit, not redraw: {out:?}"
+    );
+}
+
+// ------------------------------------------------------------------ curator
+
+/// A `claude` stand-in for the curator that records every invocation.
+///
+/// `stub_claude` overwrites its argv log each call, which is exactly what a
+/// "how many times was this asked?" test must not do.
+fn curator_stub(dir: &Path, name: &str, body: &str) -> (PathBuf, PathBuf) {
+    let script = dir.join(name);
+    let calls = dir.join(format!("{name}.calls"));
+    common::cli::write_exec(
+        &script,
+        &format!(
+            "#!/bin/sh\n\
+             cat > /dev/null\n\
+             echo call >> {calls}\n\
+             {body}\n",
+            calls = calls.display(),
+        ),
+    );
+    (script, calls)
+}
+
+fn call_count(calls: &Path) -> usize {
+    std::fs::read_to_string(calls)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// Three hunks, in three files, with a curator that answers `reply`.
+///
+/// `a.rs` leads on file order, so a curator that puts `c.rs` first has visibly
+/// done something. Three rather than two so that typing one still leaves a
+/// queue worth curating — at two, `MIN_HUNKS_TO_CURATE` would suppress the
+/// second pass by itself and mask whatever the tombstone is doing.
+fn three_hunks_with_curator(reply: &str) -> (Fixture, Engine, PathBuf) {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.write("b.rs", "fn b() {\n}\n");
+    fx.write("c.rs", "fn c() {\n}\n");
+    fx.commit_all("initial");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+
+    let (stub, calls) = curator_stub(fx.root.path(), "curator-stub", reply);
+    let mut cfg = Config::default();
+    cfg.claude_cmd = vec![stub.to_string_lossy().into_owned()];
+
+    let baseline = shadow::sync(&project, &cfg).unwrap();
+    std::fs::write(project.shadow_dir.join("a.rs"), "fn a() {\n    one();\n}\n").unwrap();
+    std::fs::write(project.shadow_dir.join("b.rs"), "fn b() {\n    two();\n}\n").unwrap();
+    std::fs::write(
+        project.shadow_dir.join("c.rs"),
+        "fn c() {\n    three();\n}\n",
+    )
+    .unwrap();
+    Manifest::new(&project, "test task".into(), baseline)
+        .save(&project)
+        .unwrap();
+
+    let engine = Engine::new(project, cfg, Box::new(RealClock::default()));
+    (fx, engine, calls)
+}
+
+/// Keep stepping until the manifest satisfies `done`, or give up loudly.
+///
+/// A curation runs on its own thread, so there is nothing to join and a fixed
+/// sleep would be either slow or flaky.
+fn step_until(
+    engine: &mut Engine,
+    fx: &Fixture,
+    what: &str,
+    mut done: impl FnMut(&Manifest) -> bool,
+) {
+    for i in 0..200u64 {
+        engine.step(None, Tick(10_000 + i * 50)).unwrap();
+        if done(&manifest(fx)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// The order of the pending queue, by file.
+fn queue_files(m: &Manifest) -> Vec<String> {
+    m.queue_view().iter().map(|h| h.file.clone()).collect()
+}
+
+const REORDER: &str = concat!(
+    r#"printf '%s' '{"order":[{"hunk":3,"note":"needed by the rest"},"#,
+    r#"{"hunk":2,"note":"needed by a"},{"hunk":1,"note":"uses b"}]}'"#
+);
+
+#[test]
+fn the_curator_puts_the_queue_in_the_order_it_chose() {
+    let (fx, mut engine, calls) = three_hunks_with_curator(REORDER);
+
+    // Nothing typed and nothing started, so there is no place to lose — the
+    // curator's first choice wins outright.
+    engine.step(None, Tick(0)).unwrap();
+    assert_eq!(
+        queue_files(&manifest(&fx)),
+        vec!["a.rs", "b.rs", "c.rs"],
+        "file order"
+    );
+
+    step_until(&mut engine, &fx, "the curation to land", |m| {
+        m.hunks.iter().any(|h| h.curator_rank.is_some())
+    });
+
+    let m = manifest(&fx);
+    assert_eq!(
+        queue_files(&m),
+        vec!["c.rs", "b.rs", "a.rs"],
+        "teaching order"
+    );
+    let head = m.head_of_queue().unwrap();
+    assert_eq!(head.curator_note.as_deref(), Some("needed by the rest"));
+    assert_eq!(call_count(&calls), 1, "one pass, not one per step");
+}
+
+#[test]
+fn a_curation_that_lands_mid_transcription_leaves_the_head_alone() {
+    // "Freeze current, reorder ahead." Once you are in a hunk, a curation that
+    // arrives must not move it out from under your cursor — only the queue
+    // behind it may be reordered.
+    let (fx, mut engine, _) = three_hunks_with_curator(REORDER);
+
+    // A shadow write starts the settle clock, so nothing is curated yet.
+    engine
+        .step(
+            Some(EngineEvent::Changed(Origin::Shadow, PathBuf::from("a.rs"))),
+            Tick(0),
+        )
+        .unwrap();
+    engine.step(None, Tick(500)).unwrap();
+    assert_eq!(queue_files(&manifest(&fx)), vec!["a.rs", "b.rs", "c.rs"]);
+
+    // The user starts typing the head. Half a line is enough to be "in it".
+    fx.write("a.rs", "fn a() {\n    on\n}\n");
+    step_until(&mut engine, &fx, "the curation to land", |m| {
+        m.hunks.iter().any(|h| h.curator_rank.is_some())
+    });
+
+    let m = manifest(&fx);
+    assert_eq!(
+        queue_files(&m),
+        vec!["a.rs", "c.rs", "b.rs"],
+        "the hunk being typed keeps the head; everything behind it reorders"
+    );
+    assert_eq!(
+        m.queue_view()[1].curator_note.as_deref(),
+        Some("needed by the rest")
+    );
+}
+
+#[test]
+fn a_curator_that_cannot_run_leaves_the_deterministic_order_alone() {
+    let (fx, mut engine, calls) = three_hunks_with_curator("echo 'no thanks' >&2\nexit 4");
+
+    engine.step(None, Tick(0)).unwrap();
+    step_until(&mut engine, &fx, "the failed pass to be recorded", |_| {
+        call_count(&calls) >= 1
+    });
+    // Let the outcome be absorbed.
+    for i in 0..10 {
+        engine.step(None, Tick(20_000 + i * 50)).unwrap();
+    }
+
+    let m = manifest(&fx);
+    assert_eq!(
+        queue_files(&m),
+        vec!["a.rs", "b.rs", "c.rs"],
+        "exactly as before"
+    );
+    assert!(m.hunks.iter().all(|h| h.curator_rank.is_none()));
+    assert!(m.hunks.iter().all(|h| h.curator_note.is_none()));
+}
+
+#[test]
+fn a_curator_that_cannot_run_is_not_asked_again_for_the_same_queue() {
+    // Without a tombstone on failure this is one wasted call per keystroke: the
+    // uncached set would still be the pending set, and typing shrinks it.
+    let (fx, mut engine, calls) = three_hunks_with_curator("exit 4");
+
+    engine.step(None, Tick(0)).unwrap();
+    step_until(&mut engine, &fx, "the failed pass", |_| {
+        call_count(&calls) >= 1
+    });
+    for i in 0..10 {
+        engine.step(None, Tick(20_000 + i * 50)).unwrap();
+    }
+
+    // The part that matters. Typing removes a hunk from `pending`, which
+    // *shrinks* the set the trigger fingerprints — so the fingerprint guard
+    // alone does not survive it. Only an entry written for every key the failed
+    // pass was given does.
+    fx.write("a.rs", "fn a() {\n    one();\n}\n");
+    engine.step(Some(changed()), Tick(30_000)).unwrap();
+    assert_eq!(manifest(&fx).pending().count(), 2, "still worth curating");
+    for i in 0..40 {
+        engine.step(None, Tick(31_000 + i * 200)).unwrap();
+    }
+
+    assert_eq!(call_count(&calls), 1, "asked once, not once per hunk typed");
+}
+
+#[test]
+fn the_note_the_curator_wrote_survives_typing_next_to_its_hunk() {
+    let (fx, mut engine, _) = three_hunks_with_curator(REORDER);
+    engine.step(None, Tick(0)).unwrap();
+    step_until(&mut engine, &fx, "the curation to land", |m| {
+        m.hunks.iter().any(|h| h.curator_note.is_some())
+    });
+
+    let before = manifest(&fx);
+    let b_id = before
+        .hunks
+        .iter()
+        .find(|h| h.file == "b.rs")
+        .unwrap()
+        .id
+        .clone();
+
+    // Type a.rs. b.rs is in another file, so its id does not move here — what
+    // this proves is that ordinary progress does not clear the curation.
+    fx.write("a.rs", "fn a() {\n    one();\n}\n");
+    engine.step(Some(changed()), Tick(30_000)).unwrap();
+
+    let after = manifest(&fx);
+    let b = after.find(&b_id).expect("b.rs still queued");
+    assert_eq!(b.curator_note.as_deref(), Some("needed by a"));
+    assert_eq!(after.count(Status::Typed), 1, "and a.rs was typed");
+}
+
+#[test]
+fn a_curation_that_lands_after_the_session_closed_writes_nothing() {
+    let (fx, mut engine, calls) = three_hunks_with_curator(REORDER);
+    engine.step(None, Tick(0)).unwrap();
+    step_until(&mut engine, &fx, "the pass to be launched", |_| {
+        call_count(&calls) >= 1
+    });
+
+    let project = fx.project();
+    std::fs::remove_file(project.session_json()).unwrap();
+    let out = engine.step(None, Tick(30_000)).unwrap();
+
+    assert!(
+        matches!(out.as_slice(), [state::Event::Closed { .. }]),
+        "closing wins over an outcome still in flight: {out:?}"
     );
 }
