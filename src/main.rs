@@ -130,6 +130,10 @@ enum Command {
         /// For debugging, and for a machine where a daemon cannot start.
         #[arg(long)]
         local: bool,
+        /// Print a URL for the browser front end instead of taking the
+        /// terminal. The daemon keeps watching either way.
+        #[arg(long, conflicts_with = "local")]
+        web: bool,
         /// Print frames instead of taking the terminal. Inferred off a pipe.
         #[arg(long)]
         headless: bool,
@@ -335,10 +339,15 @@ fn run() -> Result<ExitCode> {
         } => cmd_endpoint(&project, json, token, ensure),
         Command::Watch {
             local,
+            web,
             headless,
             exit_when_empty,
             timeout,
         } => {
+            if web {
+                cmd_watch_web(&project, cli.quiet)?;
+                return Ok(ExitCode::SUCCESS);
+            }
             cmd_watch(
                 &project,
                 &cfg,
@@ -879,6 +888,30 @@ fn cmd_done(
         if let Some(msg) = review::describe_residue(&archived.patch, archived.residue_bytes) {
             println!("{msg}");
         }
+    }
+    Ok(())
+}
+
+/// Print a URL for the browser front end, and return.
+///
+/// Deliberately does not take the terminal: you are going to a browser, and the
+/// detached daemon watches until the session closes whether or not this process
+/// is alive.
+///
+/// **Prints, never opens.** Auto-opening would put a bearer token into whichever
+/// browser happens to be default — into its history and its session restore —
+/// without being asked.
+fn cmd_watch_web(project: &ProjectPaths, quiet: bool) -> Result<()> {
+    shadow::ensure_no_operation_in_progress(project)?;
+    Manifest::require(project)?;
+
+    let endpoint = daemon::ensure_running(project)?;
+    // The token rides in the query because a browser address bar cannot set an
+    // Authorization header. Same-origin from here on, which is why the daemon
+    // needs no CORS headers at all.
+    println!("{}/?token={}", endpoint.base_url(), endpoint.token);
+    if !quiet {
+        println!("open that in a browser. The daemon keeps watching whether or not you do.");
     }
     Ok(())
 }

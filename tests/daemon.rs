@@ -9,6 +9,7 @@ use common::cli::{stderr, stdout, Cli};
 use common::daemon::{wait_until, Daemon};
 use common::Fixture;
 use rote::daemon::Endpoint;
+use rote::http;
 use rote::state;
 use std::time::Duration;
 
@@ -191,7 +192,7 @@ fn every_response_carries_a_content_length() {
     // what lets the hand-rolled client refuse chunked outright.
     let cli = session();
     let d = Daemon::start(&cli);
-    for path in ["/health", "/state", "/nope"] {
+    for path in ["/", "/health", "/state", "/nope"] {
         let r = d.get(path);
         assert!(
             r.header("Content-Length").is_some(),
@@ -977,4 +978,76 @@ fn a_reported_paste_reaches_the_manifest_through_the_socket() {
     let after: state::Snapshot = d.get("/state").json().unwrap();
     assert_eq!(after.counts.pending, snap.counts.pending);
     assert_eq!(after.counts.typed, 0);
+}
+
+// ------------------------------------------------------------ the browser app
+
+#[test]
+fn the_root_path_serves_the_browser_app() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+
+    let r = d.get("/");
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.header("Content-Type"),
+        Some("text/html; charset=utf-8"),
+        "so a browser renders it rather than downloading it"
+    );
+    assert!(String::from_utf8_lossy(&r.body).contains("<title>"));
+}
+
+#[test]
+fn the_page_is_refused_without_a_token_and_served_with_a_query_one() {
+    // A browser address bar cannot set an Authorization header, so the page
+    // takes the token the way the event stream does.
+    let cli = session();
+    let d = Daemon::start(&cli);
+
+    assert_eq!(d.get_with_token("/", "wrong").status, 401);
+
+    let r = http::send(
+        d.port(),
+        "",
+        "GET",
+        &format!("/?token={}", d.token()),
+        None,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(r.status, 200, "the query token opens the page");
+}
+
+#[test]
+fn the_query_token_still_buys_nothing_on_any_other_path() {
+    // The guard that the widening did not leak. Everything except the page and
+    // the event stream still needs a real Authorization header.
+    let cli = session();
+    let d = Daemon::start(&cli);
+
+    for path in ["/state", "/health", "/hunk/h-1"] {
+        let r = http::send(
+            d.port(),
+            "",
+            "GET",
+            &format!("{path}?token={}", d.token()),
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(r.status, 401, "{path} accepted a query token");
+    }
+}
+
+#[test]
+fn the_page_is_served_with_a_policy_that_forbids_loading_anything_off_this_origin() {
+    let cli = session();
+    let d = Daemon::start(&cli);
+
+    let r = d.get("/");
+    let csp = r.header("Content-Security-Policy").expect("a CSP");
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    assert!(csp.contains("connect-src 'self'"), "{csp}");
+    assert_eq!(r.header("Referrer-Policy"), Some("no-referrer"));
+    assert_eq!(r.header("X-Content-Type-Options"), Some("nosniff"));
 }

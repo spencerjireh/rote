@@ -149,10 +149,10 @@ These are independent invocations; nothing links them.
 - Windows support (Linux/macOS only)
 - Any Claude Code hooks, MCP servers, or SDK usage
 
-The repository now carries non-Rust artifacts — `lua/` for the nvim plugin — and that does not weaken the single-static-binary goal above. The *binary* is still one file with no runtime assets: the plugin is installed by a plugin manager, not by `cargo install`, and finds the daemon by shelling out to `rote endpoint` rather than by reimplementing the project hashing.
+The repository now carries non-Rust artifacts — `lua/` for the nvim plugin, `src/web/index.html` for the browser page — and that does not weaken the single-static-binary goal above. The *binary* is still one file with no runtime assets: the page is `include_str!`'d into it, and the plugin is installed by a plugin manager rather than by `cargo install`, finding the daemon by shelling out to `rote endpoint` rather than reimplementing the project hashing.
 
 ## v2 seam
 
-That swap has happened. The engine lives in a daemon (`rote daemon`, started for you by `rote start`); `rote watch` is a client of it, and so is the nvim plugin in `lua/`. Its thread topology is five kinds of thread over `mpsc` with no shared mutable state at all — main accepts, one owns the engine, a hub fans out to subscribers, the watcher pumps, and each event stream blocks on its own.
+That swap has happened. The engine lives in a daemon (`rote daemon`, started for you by `rote start`); `rote watch` is a client of it, and so are the nvim plugin in `lua/` and the browser page the daemon serves at `/`. Its thread topology is five kinds of thread over `mpsc` with no shared mutable state at all — main accepts, one owns the engine, a hub fans out to subscribers, the watcher pumps, and each event stream blocks on its own.
 
 Rendering is a pure function of a `state::Snapshot` (DESIGN.md §12). The watch pane reads no files and consults no manifest — everything it draws arrives in one value, and its keystrokes go out as `state::Command` verbs. Putting a daemon and a socket between the two was therefore a transport swap rather than a rewrite, and any front end that can render a snapshot and send a verb is a peer.

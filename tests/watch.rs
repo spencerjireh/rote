@@ -174,3 +174,46 @@ fn the_pane_prints_the_curators_line_above_the_hunk() {
         "the curator's line, above the hunk: {text}"
     );
 }
+
+#[test]
+fn watch_web_prints_a_url_with_a_token_and_returns() {
+    // It must return rather than take the terminal: you are going to a browser,
+    // and the daemon keeps watching without this process.
+    let cli = session("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+
+    let out = cli.run(&["watch", "--web"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let url = text.lines().next().expect("a url");
+    assert!(url.starts_with("http://127.0.0.1:"), "{text}");
+    assert!(url.contains("/?token="), "{text}");
+
+    // And the URL actually opens the page.
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let path = &url[url.find("/?token=").unwrap()..];
+    let r = rote::http::send(port, "", "GET", path, None, Duration::from_secs(5)).unwrap();
+    assert_eq!(r.status, 200);
+    assert!(String::from_utf8_lossy(&r.body).contains("<title>"));
+
+    let _ = cli.run_with_input(&["abort"], "y\n");
+}
+
+#[test]
+fn watch_web_and_local_are_refused_together() {
+    // `--local` runs the engine in this process and publishes no address at
+    // all, so there is no URL to print. Incoherent, not merely unsupported.
+    let cli = session("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let out = cli.run(&["watch", "--web", "--local"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("cannot be used with"),
+        "{}",
+        stderr(&out)
+    );
+}

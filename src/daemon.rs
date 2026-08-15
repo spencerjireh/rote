@@ -700,6 +700,7 @@ fn handle(ctx: &Ctx, request: Request) {
 
     let mut request = request;
     let response = match (method.as_str(), path.as_str()) {
+        ("GET", "/") => crate::web::page(),
         ("GET", "/health") => health(ctx),
         ("GET", "/state") => snapshot(ctx),
         ("GET", p) if p.starts_with("/hunk/") => hunk_detail(ctx, &p["/hunk/".len()..]),
@@ -897,11 +898,19 @@ fn reject(ctx: &Ctx, request: &Request, path: &str, query: &str) -> Option<Respo
         }
     }
 
-    // `EventSource` cannot set headers, so the stream accepts a query token.
+    // `EventSource` cannot set headers, so the stream accepts a query token —
+    // and so does the page itself, because a browser address bar cannot set one
+    // either. Exactly those two paths.
+    //
+    // Widening this rather than exempting `/` from authorization: an exempt
+    // path would be the first unauthenticated route in a daemon whose whole
+    // doctrine is that `reject` runs before routing, and it would make the port
+    // fingerprintable by any page on the machine.
+    let query_token_ok = matches!(path, "/events" | "/");
     let presented = find("Authorization")
         .and_then(|v| v.strip_prefix("Bearer ").map(|t| t.to_string()))
         .or_else(|| {
-            if path == "/events" {
+            if query_token_ok {
                 query
                     .split('&')
                     .find_map(|kv| kv.strip_prefix("token=").map(|t| t.to_string()))

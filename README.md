@@ -135,6 +135,26 @@ terminal pane, and it is why the count at `done` means anything.
 
 Note the binary is installed separately — a plugin manager only takes the Lua.
 
+### In a browser
+
+```
+rote watch --web
+```
+
+Prints a URL. The daemon serves the page itself, so it is same-origin and the
+token it already uses covers it — there is no separate server and nothing to
+install. It shows the same hunk the pane does, updating as you type, with `s`,
+`k`, `r` and `g` on the keyboard.
+
+It prints rather than opens, deliberately: the URL carries a bearer token, and
+putting that into whichever browser happens to be default — into its history and
+its session restore — is not something to do without being asked.
+
+One asymmetry worth knowing: if the daemon restarts, the page cannot follow it.
+A new daemon has a new port *and* a new token, and a page has no way to re-read
+either. It will say so and ask you to re-run the command. The pane and the nvim
+plugin both reconnect on their own.
+
 ### The three-pane workflow
 
 The intended shape, in ghostty or any splittable terminal: claude on the left,

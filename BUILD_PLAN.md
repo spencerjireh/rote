@@ -310,3 +310,40 @@ pinned wire version against the daemon's, and every `:Rote*` command against
 
 Edge cases this milestone adds to §9: a paste outside the active hunk's region
 (19).
+
+---
+
+## M13 — the browser app
+
+The third front end, and the last thing the M8 wire types were written for. The
+daemon serves it at `/`, which is not a convenience: DESIGN §13 has said since
+M9 that the page would be daemon-served and same-origin, and that is the reason
+there are no CORS headers anywhere. A page served from anywhere else has no
+business talking to a server that hands out your source code.
+
+Scope:
+- `src/web.rs` and `src/web/index.html`, `include_str!`'d — one hand-written
+  self-contained file, no build step, no asset pipeline.
+- `GET /` in the router, and the query-token acceptance widened from `/events`
+  to `/` — a widening rather than an exemption, because an exempt route would be
+  the first unauthenticated one in a daemon whose doctrine is that `reject` runs
+  before routing.
+- A CSP, `Referrer-Policy: no-referrer` (the token is in the URL), and a chunked
+  threshold that keeps the page out of `Transfer-Encoding: chunked`.
+- `rote watch --web`, conflicting with `--local`.
+
+Acceptance: `rote watch --web` prints a URL that opens a page showing the same
+hunk the pane does, updating as you type, with skip and resolve working from the
+keyboard; the page is refused without its token; the query token still buys
+nothing on any other path.
+
+Verified by hand against a live daemon, since there is no headless browser here
+and adding one for a single page would be a harness nobody runs: the JavaScript
+parses; the page is served 200 with a token and 401 without; `/health`, `/state`
+and `POST /command` all answer the way the page calls them; a same-origin
+`Origin` is accepted and a hostile one is refused 403. Three Rust unit tests
+guard what would actually rot — that the page never assigns markup as a string,
+loads nothing off-origin, and pins the daemon's wire version.
+
+Edge cases this milestone adds to §9: a browser page whose daemon restarted
+(20).

@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>rote</title>
+<!-- Inline, so the browser never asks for a favicon it would get a 401 for. -->
+<link rel="icon" href="data:,">
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa; --fg: #1c1c1a; --dim: #6b6b66; --line: #e2e2dd;
+  --panel: #ffffff; --add: #e6f4e6; --add-fg: #14611e;
+  --del: #fbeaea; --del-fg: #8a1c1c; --accent: #2f6f4f; --warn: #8a5a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161614; --fg: #e6e6e0; --dim: #9a9a92; --line: #2c2c28;
+    --panel: #1c1c19; --add: #16301c; --add-fg: #8fd6a0;
+    --del: #33191a; --del-fg: #e39a9a; --accent: #7fc3a0; --warn: #d8b25c;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  position: sticky; top: 0; z-index: 2;
+}
+h1 { font-size: 14px; font-weight: 600; margin: 0; }
+h1 span { color: var(--dim); font-weight: 400; }
+.counts { color: var(--dim); font-size: 13px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); display: inline-block; }
+.dot.live { background: var(--accent); }
+.dot.lost { background: var(--warn); }
+.spacer { flex: 1; }
+
+main { display: grid; grid-template-columns: 1fr 300px; gap: 0; align-items: start; }
+@media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+
+section { padding: 16px; min-width: 0; }
+aside {
+  padding: 16px; border-left: 1px solid var(--line);
+  position: sticky; top: 49px; max-height: calc(100vh - 49px); overflow: auto;
+}
+@media (max-width: 800px) { aside { border-left: none; border-top: 1px solid var(--line); position: static; } }
+
+.note { color: var(--dim); font-style: italic; margin: 0 0 10px; }
+.where { color: var(--dim); font-size: 13px; margin: 0 0 10px; }
+.where button {
+  font: inherit; font-family: ui-monospace, monospace; color: var(--fg);
+  background: none; border: 1px dashed var(--line); border-radius: 4px;
+  padding: 1px 6px; cursor: pointer;
+}
+.where button:hover { border-color: var(--accent); }
+
+.hunk {
+  border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+  background: var(--panel);
+}
+.hunk .bar {
+  display: flex; gap: 10px; align-items: center;
+  padding: 6px 10px; border-bottom: 1px solid var(--line);
+  color: var(--dim); font-size: 12px;
+}
+pre.body { margin: 0; padding: 0; overflow-x: auto; }
+pre.body .row { display: block; padding: 0 10px; white-space: pre; }
+pre.body .add { background: var(--add); color: var(--add-fg); }
+pre.body .del { background: var(--del); color: var(--del-fg); }
+pre.body .ctx { color: var(--dim); }
+
+.question { margin-top: 12px; border: 1px solid var(--warn); border-radius: 6px; padding: 10px; }
+.question h2 { font-size: 13px; margin: 0 0 8px; color: var(--warn); }
+
+.queue { list-style: none; margin: 0; padding: 0; }
+.queue li { border-bottom: 1px solid var(--line); }
+.queue button {
+  display: block; width: 100%; text-align: left; background: none; border: 0;
+  color: inherit; font: inherit; padding: 8px 4px; cursor: pointer;
+}
+.queue button:hover { background: var(--panel); }
+.queue .f { font-family: ui-monospace, monospace; font-size: 13px; }
+.queue .n { color: var(--dim); font-size: 12px; }
+.queue li.on { border-left: 2px solid var(--accent); }
+.queue li.q .f::after { content: " ?"; color: var(--warn); }
+
+.keys { color: var(--dim); font-size: 12px; padding: 10px 16px; border-top: 1px solid var(--line); }
+.keys kbd {
+  font-family: ui-monospace, monospace; border: 1px solid var(--line);
+  border-radius: 3px; padding: 0 4px;
+}
+button.act {
+  font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 4px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--fg); cursor: pointer;
+}
+button.act:hover { border-color: var(--accent); }
+
+.banner { padding: 10px 16px; background: var(--del); color: var(--del-fg); font-size: 13px; }
+.banner:empty { display: none; }
+.notices { margin: 12px 0 0; padding: 0; list-style: none; color: var(--dim); font-size: 13px; }
+.empty { color: var(--dim); padding: 24px 0; }
+</style>
+</head>
+<body>
+
+<div class="banner" id="banner"></div>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1 id="task">rote <span>connecting…</span></h1>
+  <span class="spacer"></span>
+  <span class="counts" id="counts"></span>
+</header>
+
+<main>
+  <section>
+    <div id="active"></div>
+    <ul class="notices" id="notices"></ul>
+  </section>
+  <aside>
+    <div class="counts" style="margin-bottom:8px">queue</div>
+    <ul class="queue" id="queue"></ul>
+  </aside>
+</main>
+
+<div class="keys">
+  <kbd>s</kbd> skip · <kbd>k</kbd> keep yours · <kbd>r</kbd> keep typing ·
+  <kbd>g</kbd> refresh — the same keys the terminal pane uses.
+</div>
+
+<script>
+"use strict";
+
+// Pinned against the daemon's state::WIRE_VERSION; a Rust test asserts these
+// two are equal. A page that misreads a payload silently is worse than one that
+// refuses to start.
+const WIRE_VERSION = 1;
+
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+
+const el = {
+  banner: document.getElementById("banner"),
+  dot: document.getElementById("dot"),
+  task: document.getElementById("task"),
+  counts: document.getElementById("counts"),
+  active: document.getElementById("active"),
+  queue: document.getElementById("queue"),
+  notices: document.getElementById("notices"),
+};
+
+let snapshot = null;
+let stream = null;
+
+function say(text) {
+  el.banner.textContent = text || "";
+}
+
+// Everything below builds nodes and sets textContent. Assigning markup as a
+// string is forbidden here and a Rust test enforces it by searching this file
+// for the property names: the content being rendered is the agent's source
+// code, which makes this page the most plausible injection surface in the tool.
+function node(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = text;
+  return n;
+}
+
+function clear(parent) {
+  while (parent.firstChild) parent.removeChild(parent.firstChild);
+}
+
+// ------------------------------------------------------------------ requests
+
+async function api(path, opts) {
+  const init = opts || {};
+  init.headers = Object.assign({ "Authorization": "Bearer " + TOKEN }, init.headers || {});
+  return fetch(path, init);
+}
+
+async function verb(command) {
+  const body = Object.assign(
+    { wire_version: WIRE_VERSION, generation: snapshot ? snapshot.generation : null },
+    command
+  );
+  try {
+    // Fire and mostly forget: the next snapshot is the source of truth about
+    // what actually happened, exactly as in the terminal pane.
+    const res = await api("/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const out = await res.json();
+    if (out.outcome === "rejected") say("rote: " + out.reason);
+    else if (out.outcome === "stale") say("the queue moved — that did not land");
+  } catch (e) {
+    say("could not reach the daemon");
+  }
+}
+
+const activeId = () => (snapshot && snapshot.active ? snapshot.active.hunk.id : null);
+
+const act = {
+  skip: () => { const id = activeId(); if (id) verb({ verb: "skip", hunk_id: id }); },
+  keep: () => { const id = activeId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "keep" }); },
+  retry: () => { const id = activeId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "retry" }); },
+  refresh: () => verb({ verb: "refresh" }),
+  show: (id) => verb({ verb: "show", hunk_id: id }),
+  pasted: () => { const id = activeId(); if (id) verb({ verb: "report", hunk_id: id, input: "pasted" }); },
+};
+
+// ------------------------------------------------------------------ drawing
+
+function drawLines(pre, hunk) {
+  const row = (text, cls) => {
+    const r = node("span", "row " + cls, text.length ? text : " ");
+    pre.appendChild(r);
+  };
+  (hunk.context_before || []).forEach((l) => row("  " + l, "ctx"));
+  (hunk.old_lines || []).forEach((l) => row("- " + l, "del"));
+  (hunk.new_lines || []).forEach((l) => row("+ " + l, "add"));
+  (hunk.context_after || []).forEach((l) => row("  " + l, "ctx"));
+  if (!(hunk.old_lines || []).length && !(hunk.new_lines || []).length) {
+    row("  " + (hunk.note || "verified by byte comparison, not typed"), "ctx");
+  }
+}
+
+function drawActive(p) {
+  clear(el.active);
+  if (!p) {
+    const total = snapshot && snapshot.counts ? snapshot.counts.total : 0;
+    el.active.appendChild(
+      node("p", "empty", total
+        ? "every hunk is accounted for — `rote done` closes the session."
+        : "waiting for the agent's work to land.")
+    );
+    return;
+  }
+  const h = p.hunk;
+
+  if (h.curator_note) el.active.appendChild(node("p", "note", h.curator_note));
+
+  const where = node("p", "where");
+  const target = h.file + ":" + p.anchor_line;
+  const copy = node("button", null, target);
+  copy.title = "copy";
+  // A browser cannot open your editor, and inventing a URL scheme that only
+  // works for some people would be worse than not trying.
+  copy.addEventListener("click", () => {
+    navigator.clipboard && navigator.clipboard.writeText(target);
+    copy.textContent = "copied";
+    setTimeout(() => { copy.textContent = target; }, 900);
+  });
+  where.appendChild(copy);
+  el.active.appendChild(where);
+
+  const card = node("div", "hunk");
+  const bar = node("div", "bar");
+  bar.appendChild(node("span", null, "hunk " + p.position + " of " + p.total + " · " + h.op));
+  bar.appendChild(node("span", "spacer"));
+  if (h.input && h.input !== "unknown") bar.appendChild(node("span", null, h.input));
+  const mark = node("button", "act", "mark as pasted");
+  // Explicit and manual, because it has to be: this page has no editable
+  // element, so it cannot observe typing and must not pretend to.
+  mark.addEventListener("click", act.pasted);
+  bar.appendChild(mark);
+  card.appendChild(bar);
+
+  const pre = node("pre", "body");
+  drawLines(pre, h);
+  card.appendChild(pre);
+  el.active.appendChild(card);
+
+  if (h.pending_divergence) {
+    const d = h.pending_divergence;
+    const q = node("div", "question");
+    q.appendChild(node("h2", null, "this differs from the proposal"));
+    const pre2 = node("pre", "body");
+    (d.actual || []).forEach((l) => pre2.appendChild(node("span", "row del", "yours: " + l)));
+    (d.proposed || []).forEach((l) => pre2.appendChild(node("span", "row add", "  its: " + l)));
+    q.appendChild(pre2);
+    const keep = node("button", "act", "keep yours (k)");
+    keep.addEventListener("click", act.keep);
+    const retry = node("button", "act", "keep typing (r)");
+    retry.addEventListener("click", act.retry);
+    q.appendChild(keep);
+    q.appendChild(document.createTextNode(" "));
+    q.appendChild(retry);
+    el.active.appendChild(q);
+  }
+}
+
+function drawQueue(items, active) {
+  clear(el.queue);
+  (items || []).forEach((q) => {
+    const li = node("li", (active && q.id === active ? "on " : "") + (q.has_question ? "q" : ""));
+    const b = node("button");
+    b.appendChild(node("span", "f", q.file));
+    if (q.curator_note) b.appendChild(node("div", "n", q.curator_note));
+    b.addEventListener("click", () => act.show(q.id));
+    li.appendChild(b);
+    el.queue.appendChild(li);
+  });
+}
+
+function draw() {
+  if (!snapshot) return;
+  clear(el.task);
+  el.task.appendChild(document.createTextNode("rote "));
+  el.task.appendChild(node("span", null, snapshot.task || ""));
+
+  const c = snapshot.counts || {};
+  el.counts.textContent =
+    c.pending + " pending · " + c.typed + " typed · " + c.diverged + " diverged · " + c.skipped + " skipped";
+
+  drawActive(snapshot.active);
+  drawQueue(snapshot.queue, activeId());
+
+  clear(el.notices);
+  (snapshot.notices || []).forEach((n) => el.notices.appendChild(node("li", null, n.text)));
+
+  if (snapshot.drift) {
+    say("the repository moved under this session — hunks are recomputed as it is now");
+  }
+}
+
+// ------------------------------------------------------------------ the wire
+
+async function handshake() {
+  const res = await api("/health");
+  if (res.status === 401) throw new Error("this URL is missing its token — re-run `rote watch --web`");
+  if (!res.ok) throw new Error("the daemon answered " + res.status);
+  const h = await res.json();
+  if (h.wire_version !== WIRE_VERSION) {
+    throw new Error("this daemon speaks wire version " + h.wire_version + ", this page speaks " + WIRE_VERSION);
+  }
+  document.title = "rote — " + (h.task || h.repo_root);
+  return h;
+}
+
+function connect() {
+  stream = new EventSource("/events?token=" + encodeURIComponent(TOKEN));
+
+  // `addEventListener` per name, not `onmessage`: the daemon always writes an
+  // `event:` line, and onmessage only fires for the default `message` type. It
+  // would never be called once.
+  stream.addEventListener("snapshot", (e) => {
+    el.dot.className = "dot live";
+    say("");
+    snapshot = JSON.parse(e.data);
+    draw();
+  });
+
+  stream.addEventListener("notice", (e) => {
+    const n = JSON.parse(e.data);
+    if (n.level === "warn") say(n.text);
+  });
+
+  stream.addEventListener("closed", (e) => {
+    const c = JSON.parse(e.data);
+    el.dot.className = "dot";
+    say(c.terminal === "done" ? "session closed."
+      : c.terminal === "aborted" ? "session aborted."
+      : "the session ended.");
+    stream.close();
+  });
+
+  stream.addEventListener("error", () => {
+    el.dot.className = "dot lost";
+    // A page cannot recover from a restarted daemon: the new one has a new port
+    // *and* a new token, and there is no daemon.json to re-read from here. The
+    // pane and the nvim plugin both can, which is a real asymmetry — so stop
+    // retrying against a dead address and say what to do instead.
+    if (stream.readyState === EventSource.CLOSED) {
+      stream.close();
+      say("lost the daemon. It may have restarted with a new address — re-run `rote watch --web`.");
+    } else {
+      say("reconnecting…");
+    }
+  });
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+  const hit = { s: act.skip, k: act.keep, r: act.retry, g: act.refresh }[e.key];
+  if (hit) { e.preventDefault(); hit(); }
+});
+
+handshake()
+  .then(connect)
+  .catch((err) => {
+    el.dot.className = "dot lost";
+    say(err.message);
+  });
+</script>
+</body>
+</html>

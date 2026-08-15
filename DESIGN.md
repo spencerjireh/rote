@@ -500,7 +500,8 @@ Identical to the reviewer's: `model::TOOL_FLAGS`, an empty temp cwd, and a hard 
 17. **A daemon restarted mid-hunk** — the typing evidence is in memory and goes with the process, so that hunk degrades to `unknown`, never to `pasted`. Persisting it would be a fourth on-disk artifact with its own version and session stamps for an advisory counter that gates nothing.
 18. **A hunk re-identified mid-typing** — a floor sweep re-diffs the region as (half-typed → proposal), which changes `old_lines` and therefore the `key` too, so the evidence is lost and the next save re-creates it. The window is one save and the cost is `unknown`, which is why the record is keyed by `key` and not by a proposal-only hash: the latter would survive this but would alias two hunks in one file with identical `new_lines`, turning "typed the first, pasted the second" into a false `typed`. A false negative is the right failure.
 19. **A paste outside the active hunk's region** — not reported, and the verdict stays `unknown`. The active hunk is the only one whose id a front end holds reliably: `QueueItem` carries `anchor_hint`, which is where a hunk was at the last recompute rather than where it is now. Attributing a paste to the wrong hunk is worse than attributing it to none.
-20. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
+20. **A browser page whose daemon restarted** — the new one has a new port *and* a new token, and a page cannot re-read `daemon.json` from inside a browser. `EventSource` would retry against a dead address forever, so the page closes the stream on a terminal error and says to re-run `rote watch --web`. This is a real asymmetry with the pane and the plugin, which both re-read the address book on every attempt.
+21. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
 
 ---
 
@@ -527,6 +528,7 @@ src/
   daemon.rs        # the daemon: endpoint, threads, HTTP surface (§13)
   http.rs          # transport as pure functions over bytes
   pane.rs          # the terminal front end, local or client
+  web.rs           # the browser front end, compiled in with include_str!
 ```
 
 Plus `lua/rote/` and `plugin/rote.lua`: the nvim front end, and the repository's
@@ -700,7 +702,12 @@ with no pane open is most of what it is for.
 `daemon.json`, mode 0600, in a state directory that is 0700.
 
 `Authorization: Bearer <token>` on everything, compared in constant time.
-`GET /events` also accepts `?token=`, because `EventSource` cannot set headers.
+`GET /events` and `GET /` also accept `?token=`, because neither an
+`EventSource` nor a browser address bar can set a header. Exactly those two
+paths: the page is *authorized*, not exempted, because an exempt route would be
+the first unauthenticated one in a daemon whose whole doctrine is that `reject`
+runs before routing — and it would make the port fingerprintable by any page on
+the machine.
 `Origin` and `Host`, when present, must be loopback — the second is the
 DNS-rebinding defence, and it costs four lines now versus a CVE the week a
 browser front end ships. **No CORS headers at all**: the webapp will be served
@@ -709,6 +716,7 @@ can only send three content types, none of them this one) and cap at 64 KiB.
 
 | Method + path | Success | Failures |
 |---|---|---|
+| `GET /` | `200 text/html` (the browser app) | `401`, `403` |
 | `GET /health` | `200` `Health` | `401`, `403` |
 | `GET /state` | `200` `Snapshot` | `401`, `403`, `503 warming_up`, `503 hub_timeout` |
 | `GET /hunk/<id>` | `200` `HunkDetail` | `401`, `403`, `404`, `503 no_session` |
@@ -733,8 +741,11 @@ git per request, and could disagree with what every subscriber was just told.
 
 ### The event stream
 
-`event:` mirrors the `type` tag so a browser can `addEventListener("snapshot",
-…)`; `data:` is the whole event, so a client that only listens to `onmessage`
+`event:` mirrors the `type` tag, and a browser **must** use
+`addEventListener("snapshot", …)`: because the daemon always writes an `event:`
+line, `onmessage` — which handles only the default `message` type — never fires
+at all. The pane gets away with ignoring the name because its parser is
+hand-rolled. `data:` is the whole event, so a hand-rolled client
 and parses is equally correct. The first frame after connecting is always the
 cached snapshot — which is why there is **no `Last-Event-ID`, no resume and no
 deltas**: a reconnecting client is never behind. A bare `:` comment every 15s of
