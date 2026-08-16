@@ -1,4 +1,4 @@
-//! M1 acceptance: the shadow syncs to a byte-identical twin of the real tree,
+//! Acceptance: the shadow syncs to a byte-identical twin of the real tree,
 //! preserves build output, produces the baseline patch, and converges on re-run.
 //!
 //! Parallel-safe: each fixture resolves rote state against its own temp roots,
@@ -10,7 +10,7 @@ use common::{snapshot_tree, Fixture};
 use rote::config::Config;
 use rote::shadow;
 
-/// The fixture from BUILD_PLAN.md M1: committed files, a staged change, an
+/// The fixture every test here builds on: committed files, a staged change, an
 /// unstaged change, an untracked file, a gitignored `.env` on the copy
 /// allowlist, and a `target/` on the preserve list.
 fn build_fixture() -> (Fixture, Config) {

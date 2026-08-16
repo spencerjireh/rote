@@ -1,4 +1,4 @@
-//! M2 acceptance: real + shadow trees with a known set of edits produce an
+//! Acceptance: real + shadow trees with a known set of edits produce an
 //! exact hunk list — files, ops, line contents, and ordering — with stable IDs.
 
 mod common;

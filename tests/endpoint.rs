@@ -1,9 +1,8 @@
 //! `rote endpoint`: how a front end that is not the pane finds the daemon.
 //!
 //! This is the whole of what `cargo test` can prove about the nvim plugin. The
-//! plugin itself is Lua and is hand-verified against the checklist in
-//! BUILD_PLAN M12 — inventing a Lua harness for it in a Rust repo would be a
-//! test nobody runs.
+//! plugin itself is Lua and is verified by hand — inventing a Lua harness for
+//! it in a Rust repo would be a test nobody runs.
 
 mod common;
 

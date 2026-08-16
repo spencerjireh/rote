@@ -1,4 +1,4 @@
-//! M3 acceptance: the state machine and recompute against real trees.
+//! Acceptance: the state machine and recompute against real trees.
 //!
 //! The seven reconciliation rules are unit-tested directly in `src/session.rs`
 //! against `reconcile`. These tests cover what only a repository can show:

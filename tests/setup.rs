@@ -1,4 +1,4 @@
-//! M7 acceptance: `doctor`, `setup`, project-aware `init`, and the `start`
+//! Acceptance: `doctor`, `setup`, project-aware `init`, and the `start`
 //! preflight, driven through the built binary.
 
 mod common;

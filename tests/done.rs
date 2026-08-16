@@ -1,4 +1,4 @@
-//! M5 acceptance: the full lifecycle with a stubbed `claude` and a scripted
+//! Acceptance: the full lifecycle with a stubbed `claude` and a scripted
 //! editor — init → start → agent edits → next×N → done.
 
 mod common;

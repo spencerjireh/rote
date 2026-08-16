@@ -357,5 +357,4 @@ binaries but has no rustup shim, so `cargo clippy` does not resolve. `rote init`
 detects the same thing when writing a project's checks.
 
 Design documents, in reading order: `ARCHITECTURE.md` for the shape and the four
-non-negotiable principles, `DESIGN.md` for the contracts and edge cases,
-`BUILD_PLAN.md` for how it was sequenced.
+non-negotiable principles, `DESIGN.md` for the contracts and edge cases.
