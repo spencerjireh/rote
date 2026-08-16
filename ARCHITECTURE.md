@@ -28,6 +28,9 @@ Core idea: **the shadow workspace.** Claude Code runs inside a sandbox twin of t
 | Hashing | `sha2` — project identity, content-addressed hunk IDs, baseline digest |
 | Terminal color | `anstyle`/`owo-colors` or plain ANSI codes — keep it light |
 | Paths | `directories` crate for XDG dirs |
+| CI | GitHub Actions: `test` + `clippy -D warnings` + `fmt --check`, on Linux and macOS |
+
+The gate is one command — `just gate` — and three things point at it: CI runs it on both platforms for every push and pull request, `.rote.toml` makes it what `rote done` checks, and it is what you run by hand. A Homebrew Rust and a rustup Rust spell `clippy` and `fmt` differently and neither spelling works on both, so the justfile resolves it at run time; that is the only place in the repository that knows about the split.
 
 Rationale for Rust: the tool is subprocess orchestration + state bookkeeping; distribution as a single static binary matters for a daily-driver PATH tool; the strict compiler acts as a reviewer for agent-generated code.
 
@@ -74,7 +77,8 @@ After sync, shadow working tree ≡ real working tree, byte for byte, across all
 ┌─────────────────────────────────────────────────────────┐
 │ CLI layer (clap)                                        │
 │ init | start | status | watch | next | show | skip |    │
-│ resolve | talk | done | abort                           │
+│ resolve | report | talk | done | abort | endpoint |     │
+│ daemon | doctor | setup                                 │
 └───────┬───────────┬────────────┬────────────┬───────────┘
         │           │            │            │
 ┌───────▼──────┐ ┌──▼────────┐ ┌─▼─────────┐ ┌▼──────────┐
@@ -148,6 +152,9 @@ These are independent invocations; nothing links them.
 - Paste *prevention* (rote records how content arrived and says so at `done`; it never withholds text or refuses a paste — see DESIGN §6)
 - Windows support (Linux/macOS only)
 - Any Claude Code hooks, MCP servers, or SDK usage
+- `rote gc`, and telemetry of any kind
+- A TUI wizard for `setup`
+- Publishing the tap, prebuilt binaries, GitHub Releases, or release automation — the Homebrew formula builds from source precisely so there are no artifacts to maintain and no checksums to chase
 
 The repository now carries non-Rust artifacts — `lua/` for the nvim plugin, `src/web/index.html` for the browser page — and that does not weaken the single-static-binary goal above. The *binary* is still one file with no runtime assets: the page is `include_str!`'d into it, and the plugin is installed by a plugin manager rather than by `cargo install`, finding the daemon by shelling out to `rote endpoint` rather than reimplementing the project hashing.
 

@@ -518,6 +518,8 @@ src/
   hunks.rs         # splitting, IDs, Hunk model (serde)
   session.rs       # SessionEngine: manifest, state machine, recompute
   detect.rs        # environment + project detection (doctor/setup/init)
+  doctor.rs        # `rote doctor`: is this machine ready? (§1)
+  setup.rs         # `rote setup`: write the global config (§1)
   present.rs       # HunkPresenter: render, anchor, classify
   model.rs         # the one headless `claude -p` call (§8)
   review.rs        # done-pipeline: checks, reviewer payload + invocation
@@ -564,6 +566,14 @@ unrecognized project gets no commands at all — rote does not invent checks.
 
 `verbatim` globs follow the same ecosystem mapping, so a Rust project is not
 told to watch for `pnpm-lock.yaml`.
+
+Detection is right for the machine that ran `rote init`, and `.rote.toml` is
+usually committed — so a project with contributors on both kinds of Rust
+install will have one of them failing `rote done` on a spelling the other
+needed. rote's own `.rote.toml` hit exactly this and answers it by pointing
+`[checks]` at a `just` recipe that resolves the spelling at run time. That is a
+fix a repository chooses, not something `init` can write: it cannot assume a
+task runner is installed.
 
 ### The path-collision guard
 
@@ -641,6 +651,13 @@ to keep in agreement forever, and they would disagree.
   attached, so a client can re-read and re-issue without a round trip to
   discover it. This matters most for `resolve`: answering a question about a
   hunk that has since been reworked must not land.
+- `Cause` — why a `rejected` outcome was rejected, as a variant beside the human
+  `reason`. Not redundant with it: `rote resolve` treats one refusal as benign
+  (you answered a question that had already gone) and every other one as an
+  error, and it used to tell them apart with a substring match on prose composed
+  in `engine.rs`, with nothing pinning the two together. `reason` is for a human
+  and stays free to be reworded; `cause` is what a client may branch on. Optional
+  and additive under the rule below, so introducing it was not a bump.
 
 `WIRE_VERSION` bumps only when a change would break a client written against the
 old shape. New optional fields and new event variants are additive.
