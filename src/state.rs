@@ -263,6 +263,38 @@ pub struct Request {
     pub command: Command,
 }
 
+/// Why a command was refused, as a variant rather than as prose.
+///
+/// `reason` is for a human to read and is free to be reworded. This is what a
+/// client is allowed to branch on. The two are not redundant: `rote resolve`
+/// treats "no open question" as a benign no-op and everything else as an error,
+/// and it used to tell them apart with `reason.contains("no open question")` —
+/// a substring match against a string composed in `engine.rs`, with nothing
+/// pinning the two together. Rewording the message would have turned a no-op
+/// into a hard error, silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cause {
+    NoSuchHunk,
+    NoOpenQuestion,
+    WireVersion,
+}
+
+impl Cause {
+    /// The human string this cause renders as.
+    ///
+    /// Kept here so the wire text has one origin. `WireVersion` is the exception
+    /// — it names two numbers, so its message is composed at the point it is
+    /// raised and this is only the prefix.
+    pub fn message(self) -> &'static str {
+        match self {
+            Cause::NoSuchHunk => "no such hunk",
+            Cause::NoOpenQuestion => "no open question on that hunk",
+            Cause::WireVersion => "wire version",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Outcome {
@@ -274,7 +306,22 @@ pub enum Outcome {
     },
     Rejected {
         reason: String,
+        /// Additive, and optional for exactly the reason §12 gives: a client
+        /// written against the old shape still reads `reason` and is unaffected,
+        /// so this is not a `WIRE_VERSION` bump.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
     },
+}
+
+impl Outcome {
+    /// A refusal carrying both its prose and its variant.
+    pub fn rejected(cause: Cause) -> Self {
+        Outcome::Rejected {
+            reason: cause.message().to_string(),
+            cause: Some(cause),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +493,56 @@ mod tests {
             serde_json::to_value(&r).unwrap(),
             json!({"generation": 9, "outcome": "stale", "current": 11})
         );
+    }
+
+    #[test]
+    fn a_rejection_carries_both_its_prose_and_its_variant() {
+        let r = Response {
+            generation: 3,
+            outcome: Outcome::rejected(Cause::NoOpenQuestion),
+        };
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            json!({
+                "generation": 3,
+                "outcome": "rejected",
+                "reason": "no open question on that hunk",
+                "cause": "no_open_question",
+            })
+        );
+    }
+
+    /// The field is additive, so a payload written before it existed — or by a
+    /// client that omits it — must still deserialize. This is what makes adding
+    /// it not a `WIRE_VERSION` bump (§12).
+    #[test]
+    fn a_rejection_without_a_cause_still_parses() {
+        let r: Response = serde_json::from_value(json!({
+            "generation": 3,
+            "outcome": "rejected",
+            "reason": "no such hunk",
+        }))
+        .unwrap();
+        assert_eq!(
+            r.outcome,
+            Outcome::Rejected {
+                reason: "no such hunk".into(),
+                cause: None,
+            }
+        );
+    }
+
+    /// `rote resolve` treats this one cause as a benign no-op and everything
+    /// else as an error. It used to tell them apart with a substring match on
+    /// prose composed in `engine.rs`; this pins the pair the CLI relies on, so
+    /// rewording the message can no longer silently turn a no-op into a failure.
+    #[test]
+    fn the_benign_refusal_keeps_its_wire_text() {
+        assert_eq!(
+            Cause::NoOpenQuestion.message(),
+            "no open question on that hunk"
+        );
+        assert!(Cause::NoOpenQuestion.message().contains("no open question"));
     }
 
     #[test]

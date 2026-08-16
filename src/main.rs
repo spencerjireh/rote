@@ -1124,12 +1124,15 @@ fn cmd_resolve(project: &ProjectPaths, hunk_id: &str, choice: Resolution) -> Res
             )?;
             match response.outcome {
                 rote::state::Outcome::Applied => Some(hunk_id.to_string()),
-                rote::state::Outcome::Rejected { reason }
-                    if reason.contains("no open question") =>
-                {
-                    None
-                }
-                rote::state::Outcome::Rejected { reason } => bail!("{reason} ({hunk_id})"),
+                // The one refusal that is not an error: the user answered a
+                // question that was already gone. Matched by variant — this
+                // used to be `reason.contains("no open question")`, which the
+                // engine could have invalidated by rewording a string.
+                rote::state::Outcome::Rejected {
+                    cause: Some(rote::state::Cause::NoOpenQuestion),
+                    ..
+                } => None,
+                rote::state::Outcome::Rejected { reason, .. } => bail!("{reason} ({hunk_id})"),
                 rote::state::Outcome::Stale { current } => {
                     bail!("the queue moved underneath that (now at generation {current})")
                 }
@@ -1298,7 +1301,7 @@ fn cmd_report(project: &ProjectPaths, hunk_id: &str, input: Arrival) -> Result<(
             )?;
             match response.outcome {
                 rote::state::Outcome::Applied => {}
-                rote::state::Outcome::Rejected { reason } => bail!("{reason} ({hunk_id})"),
+                rote::state::Outcome::Rejected { reason, .. } => bail!("{reason} ({hunk_id})"),
                 rote::state::Outcome::Stale { current } => {
                     bail!("the queue moved underneath that (now at generation {current})")
                 }
@@ -1368,7 +1371,7 @@ fn cmd_skip(project: &ProjectPaths, cfg: &Config, hunk_id: Option<&str>) -> Resu
             )?;
             match response.outcome {
                 rote::state::Outcome::Applied => {}
-                rote::state::Outcome::Rejected { reason } => bail!("{reason} ({id})"),
+                rote::state::Outcome::Rejected { reason, .. } => bail!("{reason} ({id})"),
                 rote::state::Outcome::Stale { current } => {
                     bail!("the queue moved underneath that (now at generation {current})")
                 }

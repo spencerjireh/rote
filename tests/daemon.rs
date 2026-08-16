@@ -360,8 +360,14 @@ fn a_command_that_cannot_be_carried_out_is_rejected_rather_than_applied() {
         )
         .json()
         .unwrap();
+    // Both halves asserted deliberately: `cause` is what a client branches on,
+    // and `reason` is the human text, which older clients read and which must
+    // not have moved when the variant was introduced.
     match body.outcome {
-        state::Outcome::Rejected { reason } => assert!(reason.contains("no open question")),
+        state::Outcome::Rejected { reason, cause } => {
+            assert!(reason.contains("no open question"));
+            assert_eq!(cause, Some(state::Cause::NoOpenQuestion));
+        }
         other => panic!("expected a rejection, got {other:?}"),
     }
 
@@ -374,7 +380,10 @@ fn a_command_that_cannot_be_carried_out_is_rejected_rather_than_applied() {
         .json()
         .unwrap();
     match body.outcome {
-        state::Outcome::Rejected { reason } => assert!(reason.contains("wire version")),
+        state::Outcome::Rejected { reason, cause } => {
+            assert!(reason.contains("wire version"));
+            assert_eq!(cause, Some(state::Cause::WireVersion));
+        }
         other => panic!("expected a rejection, got {other:?}"),
     }
 }

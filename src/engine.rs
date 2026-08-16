@@ -156,7 +156,10 @@ pub fn observe(
 /// What a mutation closure decided.
 enum Decision<T> {
     Apply(T),
-    Reject(String),
+    /// Refused, by variant. The human string comes from the variant rather than
+    /// being written here, so a client can branch on the cause without matching
+    /// on prose (§12).
+    Reject(state::Cause),
     /// Nothing to write. Reported as applied — the caller asked for a state the
     /// manifest is already in — but no write, so no generation bump and no
     /// snapshot invalidated for every subscriber.
@@ -729,12 +732,16 @@ impl Engine {
         notices: &mut Vec<Notice>,
     ) -> Result<state::Outcome> {
         if req.wire_version != state::WIRE_VERSION {
+            // Composed rather than taken from the variant: this one names two
+            // numbers, and a client that cannot speak our version needs to see
+            // both of them.
             return Ok(state::Outcome::Rejected {
                 reason: format!(
                     "this daemon speaks wire version {}, not {}",
                     state::WIRE_VERSION,
                     req.wire_version
                 ),
+                cause: Some(state::Cause::WireVersion),
             });
         }
         let want = req.generation;
@@ -743,7 +750,7 @@ impl Engine {
             state::Command::Skip { hunk_id } => {
                 let (file, generation) = self.mutate(want, |m| {
                     let Some(h) = m.find_mut(hunk_id) else {
-                        return Ok(Decision::Reject("no such hunk".into()));
+                        return Ok(Decision::Reject(state::Cause::NoSuchHunk));
                     };
                     h.status = Status::Skipped;
                     let file = h.file.clone();
@@ -767,10 +774,10 @@ impl Engine {
                 let choice = *choice;
                 let (file, _) = self.mutate(want, |m| {
                     let Some(h) = m.find_mut(hunk_id) else {
-                        return Ok(Decision::Reject("no such hunk".into()));
+                        return Ok(Decision::Reject(state::Cause::NoSuchHunk));
                     };
                     let Some(d) = h.pending_divergence.take() else {
-                        return Ok(Decision::Reject("no open question on that hunk".into()));
+                        return Ok(Decision::Reject(state::Cause::NoOpenQuestion));
                     };
                     match choice {
                         state::Resolution::Keep => {
@@ -804,7 +811,7 @@ impl Engine {
                 };
                 let (out, _) = self.mutate(want, |m| {
                     if m.find(&id).is_none() {
-                        return Ok(Decision::Reject("no such hunk".into()));
+                        return Ok(Decision::Reject(state::Cause::NoSuchHunk));
                     }
                     m.last_presented = Some(id.clone());
                     Ok(Decision::Apply(()))
@@ -818,7 +825,7 @@ impl Engine {
                 let value = crate::hunks::Input::from(*input);
                 let (out, _) = self.mutate(want, |m| {
                     let Some(h) = m.find_mut(hunk_id) else {
-                        return Ok(Decision::Reject("no such hunk".into()));
+                        return Ok(Decision::Reject(state::Cause::NoSuchHunk));
                     };
                     // `input` and nothing else. Not status, not the question,
                     // not `last_presented` — a front end reports how content
@@ -866,8 +873,8 @@ impl Engine {
             }
             match f(m)? {
                 Decision::Apply(v) => Ok(Some(v)),
-                Decision::Reject(reason) => {
-                    refusal = Some(state::Outcome::Rejected { reason });
+                Decision::Reject(cause) => {
+                    refusal = Some(state::Outcome::rejected(cause));
                     Ok(None)
                 }
                 // `refusal` stays unset, which the tail below already maps to
