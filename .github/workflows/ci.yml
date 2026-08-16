@@ -1,0 +1,65 @@
+# The gate, on every push to main and every pull request.
+#
+# This is `just gate` (test + lint + fmt-check) run on both platforms rote
+# supports. It is spelled out here rather than shelling out to `just` so that
+# a failure names which of the three failed without a layer in between.
+#
+# Note the unhyphenated `cargo clippy` / `cargo fmt`: these runners have rustup,
+# so the shim resolves. The justfile and .rote.toml use `just gate` precisely
+# because a Homebrew Rust does not, and one spelling cannot serve both.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing is a fact worth having about the other.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # git is a hard runtime dependency, not just a build one: the shadow is a
+      # clone and every diff is shelled out. Both runner images ship it.
+      #
+      # Deliberately no `git config --global` step. tests/common/mod.rs pins
+      # GIT_CONFIG_GLOBAL=/dev/null and an explicit identity on every fixture
+      # invocation, precisely so a machine with no identity configured produces
+      # the same results. Setting one here would hide a regression in that.
+      - name: Show versions
+        run: |
+          cargo --version
+          git --version
+
+      - name: Test
+        run: cargo test
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format
+        run: cargo fmt --check
