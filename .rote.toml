@@ -36,12 +36,18 @@ verbatim = [
 
 [checks]
 # Run in the REAL tree at `rote done`, in order, stopping on the first failure.
-# Detected a Rust project. These were verified to run on this machine.
-commands = [
-    "cargo test",
-    "cargo-clippy --all-targets -- -D warnings",
-    "cargo-fmt --check",
-]
+#
+# `just gate` rather than the three cargo commands `rote init` detected here.
+# Detection is per-machine and this file is committed: it had the hyphenated
+# `cargo-clippy` / `cargo-fmt` spelling, which a Homebrew Rust needs and a
+# rustup one does not have, so `rote done` failed both checks for anyone who
+# cloned rote. The justfile is the one place that knows which spelling works;
+# routing through it is what makes this line true on both.
+#
+# Costs a `just` on PATH. That is a fair ask of someone hacking on rote, and
+# it is only this repository's own config — `rote init` still writes plain
+# cargo commands for a project that has no justfile.
+commands = ["just gate"]
 
 [review]
 # Headless reviewer pass over the session diff at `rote done`.

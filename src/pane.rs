@@ -50,6 +50,11 @@ pub enum Key {
 }
 
 /// Single keypresses, because every action here is one.
+///
+/// This table exists three times, once per front end, because they are three
+/// languages: here, in `src/web/index.html`, and in `lua/rote/ui.lua`. The wire
+/// protocol underneath is version-pinned and cannot drift; these bindings can,
+/// so change all three together. Same for the counts line further down.
 pub fn decode(b: u8) -> Key {
     match b {
         b's' => Key::Skip,

@@ -344,17 +344,16 @@ never withhold text or refuse a paste.
 just gate      # test + lint + fmt-check
 ```
 
-Or individually:
+That is the bar. CI runs the same three on Linux and macOS for every push and
+pull request, and `.rote.toml` points its `[checks]` at it, so `rote done`
+gates on exactly what CI does.
 
-```
-cargo test
-cargo-clippy --all-targets -- -D warnings
-cargo-fmt --check
-```
-
-Note the hyphens: a Homebrew Rust ships `cargo-clippy` and `cargo-fmt` as
-binaries but has no rustup shim, so `cargo clippy` does not resolve. `rote init`
-detects the same thing when writing a project's checks.
+Hacking on rote needs `just` on PATH, for a reason worth knowing: a Homebrew
+Rust ships `cargo-clippy` and `cargo-fmt` as binaries but has no rustup shim,
+so `cargo clippy` does not resolve there, while on a rustup machine only the
+unhyphenated form exists. No single command is correct on both. The justfile is
+where that knowledge lives — `rote init` does the same detection when it writes
+a project's checks.
 
 Design documents, in reading order: `ARCHITECTURE.md` for the shape and the four
 non-negotiable principles, `DESIGN.md` for the contracts and edge cases.

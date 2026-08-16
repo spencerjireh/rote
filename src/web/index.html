@@ -207,6 +207,11 @@ async function verb(command) {
 
 const activeId = () => (snapshot && snapshot.active ? snapshot.active.hunk.id : null);
 
+// The s/k/r/g bindings below (and the keydown table near the bottom) exist
+// three times, once per front end, because they are three languages: here,
+// in src/pane.rs, and in lua/rote/ui.lua. The wire protocol underneath is
+// version-pinned and cannot drift; these bindings can, so change all three
+// together. Same for the counts line.
 const act = {
   skip: () => { const id = activeId(); if (id) verb({ verb: "skip", hunk_id: id }); },
   keep: () => { const id = activeId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "keep" }); },

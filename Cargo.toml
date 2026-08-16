@@ -19,5 +19,5 @@ time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
 tiny_http = "0.12"
 toml = "1.1.4"
 
-[dev-dependencies]
-tempfile = "3.27.0"
+# No [dev-dependencies]: tempfile was listed in both, and a regular dependency
+# is already available to test targets.

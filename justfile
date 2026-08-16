@@ -1,8 +1,11 @@
 # rote development tasks.
 #
-# Note the hyphenated `cargo-clippy` / `cargo-fmt`: a Homebrew Rust ships those
-# binaries directly but has no rustup shim, so `cargo clippy` does not resolve.
-# `rote init` detects the same thing when it writes a project's [checks].
+# Two spellings of the same tools, and no single one that works everywhere: a
+# Homebrew Rust ships `cargo-clippy` and `cargo-fmt` as binaries with no rustup
+# shim, so `cargo clippy` does not resolve there; a rustup machine has only the
+# subcommand and no hyphenated binary. `lint` and `fmt-check` below pick at run
+# time, which is what lets .rote.toml and CI both point here and be right.
+# `rote init` does the same detection when it writes a project's [checks].
 
 owner := "spencerjireh"
 repo  := "rote"
@@ -22,13 +25,31 @@ test:
     cargo test
 
 lint:
-    cargo-clippy --all-targets -- -D warnings
+    @just _cargo clippy --all-targets -- -D warnings
 
 fmt-check:
-    cargo-fmt --check
+    @just _cargo fmt --check
 
 fmt:
-    cargo-fmt
+    @just _cargo fmt
+
+# Run a cargo subcommand by whichever spelling this machine has.
+#
+# Resolved rather than attempted: running `cargo clippy` and falling back on
+# failure would treat a genuine lint failure as a missing shim and then run the
+# whole thing twice.
+_cargo subcommand *args:
+    #!/usr/bin/env sh
+    set -eu
+    if cargo "{{subcommand}}" --version > /dev/null 2>&1; then
+        exec cargo "{{subcommand}}" {{args}}
+    elif command -v "cargo-{{subcommand}}" > /dev/null 2>&1; then
+        exec "cargo-{{subcommand}}" {{args}}
+    else
+        echo "neither \`cargo {{subcommand}}\` nor \`cargo-{{subcommand}}\` is available." >&2
+        echo "install it: rustup component add {{subcommand}}" >&2
+        exit 1
+    fi
 
 # Compute the sha256 for the tagged release tarball, for Formula/rote.rb.
 #

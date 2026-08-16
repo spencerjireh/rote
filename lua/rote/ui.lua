@@ -37,6 +37,10 @@ end
 
 --- Buffer-local keys, mirroring the terminal pane exactly so muscle memory
 --- transfers between the two.
+-- The s/k/r/g bindings below exist three times, once per front end, because
+-- they are three languages: here, in src/pane.rs, and in src/web/index.html.
+-- The wire protocol underneath is version-pinned and cannot drift; these
+-- bindings can, so change all three together. Same for the counts line.
 function M._map(buf)
   local verbs = require("rote.verbs")
   local map = function(lhs, fn)
