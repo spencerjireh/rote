@@ -375,6 +375,45 @@ pub fn send_command(ep: &Endpoint, request: &state::Request) -> Result<state::Re
     reply.json()
 }
 
+/// What a daemon did with a verb, for a caller that only has one to send.
+pub enum Applied {
+    Yes,
+    /// Refused. `cause` is the variant to branch on; `reason` is for the human.
+    Rejected {
+        cause: Option<state::Cause>,
+        reason: String,
+    },
+}
+
+/// Send one verb and triage the answer.
+///
+/// Three CLI commands each built the same `Request` and matched the same three
+/// outcomes, which meant the staleness message existed verbatim in three places
+/// and could have drifted in any of them. `Stale` is handled here rather than
+/// returned because no caller has ever had anything to do about it: the verb did
+/// not land and the queue has moved, so the only honest answer is to say so.
+///
+/// `generation: None` — a CLI invocation has not been looking at a snapshot, so
+/// it has no generation to be stale against. The pane, which has, still builds
+/// its own requests.
+pub fn apply(ep: &Endpoint, command: state::Command) -> Result<Applied> {
+    let response = send_command(
+        ep,
+        &state::Request {
+            wire_version: state::WIRE_VERSION,
+            generation: None,
+            command,
+        },
+    )?;
+    match response.outcome {
+        state::Outcome::Applied => Ok(Applied::Yes),
+        state::Outcome::Rejected { reason, cause } => Ok(Applied::Rejected { cause, reason }),
+        state::Outcome::Stale { current } => {
+            anyhow::bail!("the queue moved underneath that (now at generation {current})")
+        }
+    }
+}
+
 /// Ask the daemon what the world looks like.
 pub fn fetch_state(ep: &Endpoint) -> Result<state::Snapshot> {
     let reply = http::send(

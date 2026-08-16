@@ -1111,31 +1111,19 @@ fn cmd_resolve(project: &ProjectPaths, hunk_id: &str, choice: Resolution) -> Res
         // live engine also has to disarm its watchdog and retake its baseline —
         // otherwise it re-raises the identical question seconds later.
         daemon::Owner::Daemon(ep) => {
-            let response = daemon::send_command(
-                &ep,
-                &rote::state::Request {
-                    wire_version: rote::state::WIRE_VERSION,
-                    generation: None,
-                    command: rote::state::Command::Resolve {
-                        hunk_id: hunk_id.to_string(),
-                        choice: wire_choice,
-                    },
-                },
-            )?;
-            match response.outcome {
-                rote::state::Outcome::Applied => Some(hunk_id.to_string()),
+            let command = rote::state::Command::Resolve {
+                hunk_id: hunk_id.to_string(),
+                choice: wire_choice,
+            };
+            match daemon::apply(&ep, command)? {
+                daemon::Applied::Yes => Some(hunk_id.to_string()),
                 // The one refusal that is not an error: the user answered a
-                // question that was already gone. Matched by variant — this
-                // used to be `reason.contains("no open question")`, which the
-                // engine could have invalidated by rewording a string.
-                rote::state::Outcome::Rejected {
+                // question that was already gone.
+                daemon::Applied::Rejected {
                     cause: Some(rote::state::Cause::NoOpenQuestion),
                     ..
                 } => None,
-                rote::state::Outcome::Rejected { reason, .. } => bail!("{reason} ({hunk_id})"),
-                rote::state::Outcome::Stale { current } => {
-                    bail!("the queue moved underneath that (now at generation {current})")
-                }
+                daemon::Applied::Rejected { reason, .. } => bail!("{reason} ({hunk_id})"),
             }
         }
         daemon::Owner::Nobody(_guard) => {
@@ -1288,23 +1276,12 @@ fn cmd_report(project: &ProjectPaths, hunk_id: &str, input: Arrival) -> Result<(
         // An engine owns the queue: it must make the write, or its next
         // classification would publish a snapshot that disagrees with the file.
         daemon::Owner::Daemon(ep) => {
-            let response = daemon::send_command(
-                &ep,
-                &rote::state::Request {
-                    wire_version: rote::state::WIRE_VERSION,
-                    generation: None,
-                    command: rote::state::Command::Report {
-                        hunk_id: hunk_id.to_string(),
-                        input: reported,
-                    },
-                },
-            )?;
-            match response.outcome {
-                rote::state::Outcome::Applied => {}
-                rote::state::Outcome::Rejected { reason, .. } => bail!("{reason} ({hunk_id})"),
-                rote::state::Outcome::Stale { current } => {
-                    bail!("the queue moved underneath that (now at generation {current})")
-                }
+            let command = rote::state::Command::Report {
+                hunk_id: hunk_id.to_string(),
+                input: reported,
+            };
+            if let daemon::Applied::Rejected { reason, .. } = daemon::apply(&ep, command)? {
+                bail!("{reason} ({hunk_id})");
             }
         }
         daemon::Owner::Nobody(_guard) => {
@@ -1359,22 +1336,11 @@ fn cmd_skip(project: &ProjectPaths, cfg: &Config, hunk_id: Option<&str>) -> Resu
                     }
                 },
             };
-            let response = daemon::send_command(
-                &ep,
-                &rote::state::Request {
-                    wire_version: rote::state::WIRE_VERSION,
-                    generation: None,
-                    command: rote::state::Command::Skip {
-                        hunk_id: id.clone(),
-                    },
-                },
-            )?;
-            match response.outcome {
-                rote::state::Outcome::Applied => {}
-                rote::state::Outcome::Rejected { reason, .. } => bail!("{reason} ({id})"),
-                rote::state::Outcome::Stale { current } => {
-                    bail!("the queue moved underneath that (now at generation {current})")
-                }
+            let command = rote::state::Command::Skip {
+                hunk_id: id.clone(),
+            };
+            if let daemon::Applied::Rejected { reason, .. } = daemon::apply(&ep, command)? {
+                bail!("{reason} ({id})");
             }
             file
         }
