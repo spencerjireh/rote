@@ -424,143 +424,6 @@ fn read_key() -> Result<Option<Key>> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::hunks::{Divergence, Hunk, Op, Status};
-    use crate::present::AnchorVia;
-    use crate::session::State;
-    use crate::state::{Counts, Presented, QueueItem};
-
-    fn hunk() -> Hunk {
-        Hunk {
-            id: "h-one".into(),
-            key: "k-one".into(),
-            file: "src/posts.py".into(),
-            op: Op::Replace,
-            context_before: vec!["class Post:".into()],
-            old_lines: vec!["    tags = Manager()".into()],
-            new_lines: vec!["    tags = TagManager()".into()],
-            context_after: vec![],
-            anchor_hint: 48,
-            status: Status::Pending,
-            divergence: None,
-            note: None,
-            pending_divergence: None,
-            curator_note: None,
-            curator_rank: None,
-            input: Default::default(),
-        }
-    }
-
-    fn snap(active: Option<Hunk>) -> Snapshot {
-        let queue = active
-            .iter()
-            .map(|h| QueueItem {
-                id: h.id.clone(),
-                key: h.key.clone(),
-                file: h.file.clone(),
-                op: h.op,
-                anchor_hint: h.anchor_hint,
-                has_question: h.pending_divergence.is_some(),
-                curator_note: None,
-            })
-            .collect();
-        Snapshot {
-            wire_version: crate::state::WIRE_VERSION,
-            generation: 1,
-            state: State::Transcribing,
-            task: "add tagging".into(),
-            drift: false,
-            counts: Counts {
-                pending: active.iter().count(),
-                typed: 6,
-                diverged: 1,
-                skipped: 0,
-                total: 8,
-            },
-            active: active.map(|h| Presented {
-                hunk: h,
-                position: 3,
-                total: 11,
-                anchor_line: 48,
-                anchor_via: AnchorVia::ContextBefore,
-                real_path: "/repo/src/posts.py".into(),
-            }),
-            queue,
-            notices: vec![],
-        }
-    }
-
-    #[test]
-    fn a_frame_shows_the_hunk_and_a_jump_target() {
-        let f = render_frame(&snap(Some(hunk())), false);
-        assert!(f.contains("hunk 3/11"), "{f}");
-        assert!(f.contains("-     tags = Manager()"), "{f}");
-        assert!(f.contains("+     tags = TagManager()"), "{f}");
-        // The jump target is the whole interim answer to "how do I get there".
-        assert!(f.contains("src/posts.py:48"), "{f}");
-        assert!(f.contains("6 typed"), "{f}");
-    }
-
-    #[test]
-    fn an_empty_queue_says_so_rather_than_drawing_nothing() {
-        let f = render_frame(&snap(None), false);
-        assert!(f.contains("nothing to transcribe"), "{f}");
-        assert!(f.contains("rote done"), "{f}");
-    }
-
-    #[test]
-    fn keep_and_retry_are_offered_only_while_a_question_is_open() {
-        let quiet = render_frame(&snap(Some(hunk())), false);
-        assert!(!quiet.contains("[k]eep"), "no question, no answer: {quiet}");
-
-        let mut asked = hunk();
-        asked.pending_divergence = Some(Divergence {
-            proposed: vec!["    tags = TagManager()".into()],
-            actual: vec!["    tags = TaggableManager()".into()],
-        });
-        let f = render_frame(&snap(Some(asked)), false);
-        assert!(f.contains("[k]eep mine"), "{f}");
-        assert!(f.contains("[r]etry"), "{f}");
-        assert!(f.contains("your version differs"), "{f}");
-        assert!(f.contains("TaggableManager"), "{f}");
-    }
-
-    #[test]
-    fn a_frame_carries_no_escape_codes_without_color() {
-        let f = render_frame(&snap(Some(hunk())), false);
-        assert!(
-            !f.contains('\u{1b}'),
-            "escape codes leaked into a plain frame"
-        );
-    }
-
-    #[test]
-    fn ctrl_c_decodes_as_quit() {
-        // ISIG is cleared, so this arrives as a byte. If it were not handled the
-        // pane would ignore Ctrl-C entirely and the terminal would feel stuck.
-        assert_eq!(decode(0x03), Key::Quit);
-        assert_eq!(decode(b'q'), Key::Quit);
-        assert_eq!(decode(b's'), Key::Skip);
-        assert_eq!(decode(b'z'), Key::Ignored);
-    }
-
-    #[test]
-    fn answering_keys_do_nothing_when_there_is_nothing_to_answer() {
-        let s = snap(Some(hunk()));
-        assert_eq!(command_for(Key::Keep, Some(&s)), None);
-        assert_eq!(command_for(Key::Retry, Some(&s)), None);
-        assert!(matches!(
-            command_for(Key::Skip, Some(&s)),
-            Some(state::Command::Skip { .. })
-        ));
-        // And nothing at all is safe when the queue is empty.
-        let empty = snap(None);
-        assert_eq!(command_for(Key::Skip, Some(&empty)), None);
-    }
-}
-
 /// How long to wait before retrying a lost daemon, and the ceiling on backoff.
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
 const RECONNECT_MAX: Duration = Duration::from_secs(2);
@@ -749,4 +612,141 @@ fn subscribe(endpoint: &daemon::Endpoint) -> Option<std::sync::mpsc::Receiver<Cl
         let _ = tx.send(ClientEvent::Disconnected);
     });
     Some(rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hunks::{Divergence, Hunk, Op, Status};
+    use crate::present::AnchorVia;
+    use crate::session::State;
+    use crate::state::{Counts, Presented, QueueItem};
+
+    fn hunk() -> Hunk {
+        Hunk {
+            id: "h-one".into(),
+            key: "k-one".into(),
+            file: "src/posts.py".into(),
+            op: Op::Replace,
+            context_before: vec!["class Post:".into()],
+            old_lines: vec!["    tags = Manager()".into()],
+            new_lines: vec!["    tags = TagManager()".into()],
+            context_after: vec![],
+            anchor_hint: 48,
+            status: Status::Pending,
+            divergence: None,
+            note: None,
+            pending_divergence: None,
+            curator_note: None,
+            curator_rank: None,
+            input: Default::default(),
+        }
+    }
+
+    fn snap(active: Option<Hunk>) -> Snapshot {
+        let queue = active
+            .iter()
+            .map(|h| QueueItem {
+                id: h.id.clone(),
+                key: h.key.clone(),
+                file: h.file.clone(),
+                op: h.op,
+                anchor_hint: h.anchor_hint,
+                has_question: h.pending_divergence.is_some(),
+                curator_note: None,
+            })
+            .collect();
+        Snapshot {
+            wire_version: crate::state::WIRE_VERSION,
+            generation: 1,
+            state: State::Transcribing,
+            task: "add tagging".into(),
+            drift: false,
+            counts: Counts {
+                pending: active.iter().count(),
+                typed: 6,
+                diverged: 1,
+                skipped: 0,
+                total: 8,
+            },
+            active: active.map(|h| Presented {
+                hunk: h,
+                position: 3,
+                total: 11,
+                anchor_line: 48,
+                anchor_via: AnchorVia::ContextBefore,
+                real_path: "/repo/src/posts.py".into(),
+            }),
+            queue,
+            notices: vec![],
+        }
+    }
+
+    #[test]
+    fn a_frame_shows_the_hunk_and_a_jump_target() {
+        let f = render_frame(&snap(Some(hunk())), false);
+        assert!(f.contains("hunk 3/11"), "{f}");
+        assert!(f.contains("-     tags = Manager()"), "{f}");
+        assert!(f.contains("+     tags = TagManager()"), "{f}");
+        // The jump target is the whole interim answer to "how do I get there".
+        assert!(f.contains("src/posts.py:48"), "{f}");
+        assert!(f.contains("6 typed"), "{f}");
+    }
+
+    #[test]
+    fn an_empty_queue_says_so_rather_than_drawing_nothing() {
+        let f = render_frame(&snap(None), false);
+        assert!(f.contains("nothing to transcribe"), "{f}");
+        assert!(f.contains("rote done"), "{f}");
+    }
+
+    #[test]
+    fn keep_and_retry_are_offered_only_while_a_question_is_open() {
+        let quiet = render_frame(&snap(Some(hunk())), false);
+        assert!(!quiet.contains("[k]eep"), "no question, no answer: {quiet}");
+
+        let mut asked = hunk();
+        asked.pending_divergence = Some(Divergence {
+            proposed: vec!["    tags = TagManager()".into()],
+            actual: vec!["    tags = TaggableManager()".into()],
+        });
+        let f = render_frame(&snap(Some(asked)), false);
+        assert!(f.contains("[k]eep mine"), "{f}");
+        assert!(f.contains("[r]etry"), "{f}");
+        assert!(f.contains("your version differs"), "{f}");
+        assert!(f.contains("TaggableManager"), "{f}");
+    }
+
+    #[test]
+    fn a_frame_carries_no_escape_codes_without_color() {
+        let f = render_frame(&snap(Some(hunk())), false);
+        assert!(
+            !f.contains('\u{1b}'),
+            "escape codes leaked into a plain frame"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_decodes_as_quit() {
+        // ISIG is cleared, so this arrives as a byte. If it were not handled the
+        // pane would ignore Ctrl-C entirely and the terminal would feel stuck.
+        assert_eq!(decode(0x03), Key::Quit);
+        assert_eq!(decode(b'q'), Key::Quit);
+        assert_eq!(decode(b's'), Key::Skip);
+        assert_eq!(decode(b'z'), Key::Ignored);
+    }
+
+    #[test]
+    fn answering_keys_do_nothing_when_there_is_nothing_to_answer() {
+        let s = snap(Some(hunk()));
+        assert_eq!(command_for(Key::Keep, Some(&s)), None);
+        assert_eq!(command_for(Key::Retry, Some(&s)), None);
+        assert!(matches!(
+            command_for(Key::Skip, Some(&s)),
+            Some(state::Command::Skip { .. })
+        ));
+        // And nothing at all is safe when the queue is empty.
+        let empty = snap(None);
+        assert_eq!(command_for(Key::Skip, Some(&empty)), None);
+    }
 }

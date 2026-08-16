@@ -411,8 +411,10 @@ mod tests {
 
     #[test]
     fn probing_a_missing_claude_reports_not_found() {
-        let mut cfg = Config::default();
-        cfg.claude_cmd = vec!["definitely-not-a-real-binary-xyz".into()];
+        let cfg = Config {
+            claude_cmd: vec!["definitely-not-a-real-binary-xyz".into()],
+            ..Config::default()
+        };
         let report = probe_claude(&cfg);
         assert!(!report.found());
         assert_eq!(report.tool_flag_supported, None, "nothing to ask about");
@@ -435,8 +437,10 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&stub, perms).unwrap();
 
-        let mut cfg = Config::default();
-        cfg.claude_cmd = vec![stub.to_string_lossy().into_owned()];
+        let cfg = Config {
+            claude_cmd: vec![stub.to_string_lossy().into_owned()],
+            ..Config::default()
+        };
         let report = probe_claude(&cfg);
         assert!(report.found());
         assert_eq!(report.tool_flag_supported, Some(true));
@@ -451,15 +455,19 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&stub, perms).unwrap();
 
-        let mut cfg = Config::default();
-        cfg.claude_cmd = vec![stub.to_string_lossy().into_owned()];
+        let cfg = Config {
+            claude_cmd: vec![stub.to_string_lossy().into_owned()],
+            ..Config::default()
+        };
         assert_eq!(probe_claude(&cfg).tool_flag_supported, Some(false));
     }
 
     #[test]
     fn editor_probe_uses_the_configured_chain() {
-        let mut cfg = Config::default();
-        cfg.editor = "sh".into();
+        let cfg = Config {
+            editor: "sh".into(),
+            ..Config::default()
+        };
         let report = probe_editor(&cfg);
         assert!(report.found());
         assert_eq!(report.command, vec!["sh".to_string()]);

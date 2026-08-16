@@ -160,9 +160,11 @@ mod tests {
     use super::*;
 
     fn filter(root: &Path) -> Filter {
-        let mut cfg = Config::default();
-        cfg.shadow_preserve = vec!["target/".into()];
-        cfg.watch_ignore = vec!["*.log".into()];
+        let cfg = Config {
+            shadow_preserve: vec!["target/".into()],
+            watch_ignore: vec!["*.log".into()],
+            ..Config::default()
+        };
         Filter {
             repo_root: root.join("repo"),
             shadow_dir: root.join("shadow"),

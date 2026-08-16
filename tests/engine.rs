@@ -463,8 +463,10 @@ fn three_hunks_with_curator(reply: &str) -> (Fixture, Engine, PathBuf) {
     project.ensure_state_dir().unwrap();
 
     let (stub, calls) = curator_stub(fx.root.path(), "curator-stub", reply);
-    let mut cfg = Config::default();
-    cfg.claude_cmd = vec![stub.to_string_lossy().into_owned()];
+    let cfg = Config {
+        claude_cmd: vec![stub.to_string_lossy().into_owned()],
+        ..Config::default()
+    };
 
     let baseline = shadow::sync(&project, &cfg).unwrap();
     std::fs::write(project.shadow_dir.join("a.rs"), "fn a() {\n    one();\n}\n").unwrap();

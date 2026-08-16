@@ -36,9 +36,11 @@ fn build_fixture() -> (Fixture, Config) {
     // Ignored build output that must survive the shadow's clean.
     fx.write("target/debug/artifact", "prebuilt\n");
 
-    let mut cfg = Config::default();
-    cfg.shadow_copy = vec![".env".into()];
-    cfg.shadow_preserve = vec!["target/".into()];
+    let cfg = Config {
+        shadow_copy: vec![".env".into()],
+        shadow_preserve: vec!["target/".into()],
+        ..Config::default()
+    };
     (fx, cfg)
 }
 
