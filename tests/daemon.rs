@@ -424,6 +424,43 @@ fn a_post_must_be_json_and_must_not_be_enormous() {
 // ------------------------------------------------------------ GET /events
 
 #[test]
+fn the_stream_takes_its_token_either_way() {
+    // The nvim plugin writes its own request line over a raw socket, so it sends
+    // the header — a secret in a request line is what proxies and access logs
+    // record. The query spelling stays for the two clients that cannot set a
+    // header at all: an `EventSource` and a browser address bar (§13).
+    let cli = session();
+    let d = Daemon::start(&cli);
+
+    let status = |auth_line: &str, query: &str| -> u16 {
+        use std::io::{BufReader, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", d.port())).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let req = format!(
+            "GET /events{query} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{auth_line}\
+             Connection: close\r\n\r\n",
+            d.port()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut r = BufReader::new(s);
+        rote::http::read_head(&mut r).unwrap().0
+    };
+
+    // Exactly the request `lua/rote/stream.lua` builds.
+    assert_eq!(
+        status(&format!("Authorization: Bearer {}\r\n", d.token()), ""),
+        200,
+        "the header spelling, which the plugin uses"
+    );
+    assert_eq!(
+        status("", &format!("?token={}", d.token())),
+        200,
+        "the query spelling, which a browser needs"
+    );
+    assert_eq!(status("", ""), 401, "and neither is not enough");
+}
+
+#[test]
 fn a_small_event_reaches_the_client_immediately() {
     // The regression test for the chunked-buffer trap. tiny_http's chunked path
     // is Encoder::new + io::copy: the encoder buffers 8 KiB, io::copy never
