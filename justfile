@@ -24,6 +24,16 @@ gate: test lint fmt-check
 test:
     cargo test
 
+# Clippy, by whichever spelling this machine has.
+#
+# CI is the authority for this one, not your terminal. A Homebrew clippy and a
+# rustup clippy report the same version and enforce different lint sets: this
+# machine's 0.1.97 does not fire `field_reassign_with_default` or
+# `items_after_test_module`, and the 0.1.97 on a runner does. CI caught eight of
+# those on its first run, in code that had been "clippy clean" locally for
+# months. There is no fix short of installing rustup alongside the Homebrew
+# Rust, which is not worth it — so treat a local pass here as necessary and not
+# sufficient, and let CI settle it.
 lint:
     @just _cargo clippy --all-targets -- -D warnings
 

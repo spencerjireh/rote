@@ -348,6 +348,12 @@ That is the bar. CI runs the same three on Linux and macOS for every push and
 pull request, and `.rote.toml` points its `[checks]` at it, so `rote done`
 gates on exactly what CI does.
 
+One caveat worth knowing before you trust a green run: a Homebrew clippy and a
+rustup clippy report the same version and enforce different lint sets, so a
+local pass covers the tests and the formatting but is only *approximately* the
+lint. CI settles that one. The nvim plugin is linted in CI too, by `just
+lua-lint`'s tools — `stylua` and `luacheck`, neither of which `gate` requires.
+
 Hacking on rote needs `just` on PATH, for a reason worth knowing: a Homebrew
 Rust ships `cargo-clippy` and `cargo-fmt` as binaries but has no rustup shim,
 so `cargo clippy` does not resolve there, while on a rustup machine only the
