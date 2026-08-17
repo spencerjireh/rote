@@ -37,7 +37,6 @@ local function redraw()
 end
 
 local function on_event(ev)
-  local ui = require("rote.ui")
   local jump = require("rote.jump")
 
   if state.stream then
