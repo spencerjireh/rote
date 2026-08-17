@@ -193,27 +193,63 @@ fn command_works(repo_root: &Path, line: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Check commands for this project, verified to actually run on this machine.
+/// Check commands for this project, each naming a program that runs here.
 ///
 /// The Rust case is why this probes rather than hardcodes: a Homebrew Rust with
 /// no rustup has `cargo-clippy` and `cargo-fmt` on PATH but no `cargo clippy`
 /// subcommand, so the obvious defaults would be written into every `.rote.toml`
 /// and fail at the first `rote done`.
+///
+/// What gets verified is that the program a command names resolves and runs —
+/// never the check itself, because running `cargo test` to decide whether to
+/// write `cargo test` would make `rote init` cost a full test suite. Every
+/// spelling is probed on its own: clippy and fmt are separate rustup components
+/// and either can be missing while the other is present, so one cannot vouch for
+/// the other.
+///
+/// A recognized project on a machine with no toolchain therefore gets no
+/// commands, the same as an unrecognized one. An empty `[checks]` says plainly
+/// that rote found nothing to run; a command that was never going to work says
+/// the opposite until `rote done` contradicts it.
 pub fn checks_for(kind: ProjectKind, repo_root: &Path) -> Vec<String> {
+    // Only Node reads the manifest, so only Node pays for the read.
+    let scripts = if kind == ProjectKind::Node {
+        node_scripts(repo_root)
+    } else {
+        Vec::new()
+    };
+    checks_with(kind, &scripts, &|line| command_works(repo_root, line))
+}
+
+/// The command choice, with probing and the manifest read lifted out.
+///
+/// Split from `checks_for` so the choice can be tested without depending on which
+/// toolchains the machine running the tests happens to have. "No toolchain gets no
+/// commands" is otherwise the one branch that cannot be asserted on a developer
+/// machine, being the one where everything is installed.
+fn checks_with(kind: ProjectKind, scripts: &[String], works: &dyn Fn(&str) -> bool) -> Vec<String> {
     match kind {
         ProjectKind::Rust => {
-            let mut out = vec!["cargo test".to_string()];
-            if command_works(repo_root, "cargo clippy --version") {
+            let mut out = Vec::new();
+            if works("cargo --version") {
+                out.push("cargo test".to_string());
+            }
+            if works("cargo clippy --version") {
                 out.push("cargo clippy --all-targets -- -D warnings".into());
-                out.push("cargo fmt --check".into());
-            } else if command_works(repo_root, "cargo-clippy --version") {
+            } else if works("cargo-clippy --version") {
                 out.push("cargo-clippy --all-targets -- -D warnings".into());
+            }
+            if works("cargo fmt --version") {
+                out.push("cargo fmt --check".into());
+            } else if works("cargo-fmt --version") {
                 out.push("cargo-fmt --check".into());
             }
             out
         }
         ProjectKind::Node => {
-            let scripts = node_scripts(repo_root);
+            if !works("npm --version") {
+                return Vec::new();
+            }
             let mut out = Vec::new();
             for candidate in ["test", "lint", "typecheck"] {
                 if scripts.iter().any(|s| s == candidate) {
@@ -227,14 +263,19 @@ pub fn checks_for(kind: ProjectKind, repo_root: &Path) -> Vec<String> {
             out
         }
         ProjectKind::Python => {
-            if command_works(repo_root, "uv --version") {
+            if works("uv --version") {
                 vec!["uv run pytest".into()]
-            } else {
+            } else if works("pytest --version") {
                 vec!["pytest".into()]
+            } else {
+                Vec::new()
             }
         }
-        ProjectKind::Go => vec!["go test ./...".into(), "go vet ./...".into()],
-        ProjectKind::Unknown => Vec::new(),
+        // One probe for both: they are subcommands of the same binary.
+        ProjectKind::Go if works("go version") => {
+            vec!["go test ./...".into(), "go vet ./...".into()]
+        }
+        ProjectKind::Go | ProjectKind::Unknown => Vec::new(),
     }
 }
 
@@ -359,47 +400,140 @@ mod tests {
         );
     }
 
+    /// A prober that says yes to exactly the listed probes.
+    fn only<'a>(available: &'a [&'static str]) -> impl Fn(&str) -> bool + 'a {
+        move |line: &str| available.contains(&line)
+    }
+
     #[test]
-    fn rust_checks_pick_a_clippy_spelling_that_runs_here() {
+    fn every_written_check_names_a_program_that_runs_here() {
+        // Machine-dependent on purpose, and in the safe direction: it asserts
+        // nothing about *which* commands are written, only that whatever was
+        // written can be run. It is the property `rote done` depends on.
         let dir = repo_with(&[("Cargo.toml", "[package]\nname = \"x\"\n")]);
-        let checks = checks_for(ProjectKind::Rust, dir.path());
-        assert_eq!(checks[0], "cargo test");
-        // Whichever spelling this machine has, the written command must work.
-        for c in &checks[1..] {
-            let head = c.split_whitespace().next().unwrap();
-            let sub = c.split_whitespace().nth(1).unwrap();
-            let probe = if head == "cargo" {
-                format!("cargo {sub} --version")
-            } else {
-                format!("{head} --version")
-            };
+        for kind in [
+            ProjectKind::Rust,
+            ProjectKind::Node,
+            ProjectKind::Python,
+            ProjectKind::Go,
+        ] {
+            for c in checks_for(kind, dir.path()) {
+                let mut words = c.split_whitespace();
+                let head = words.next().unwrap();
+                let probe = match (head, words.next()) {
+                    // `go vet` is not a program; `go` is.
+                    ("go", _) => "go version".to_string(),
+                    // `test` is built into cargo, so cargo itself vouches for it.
+                    // clippy and fmt are separate components and do not.
+                    ("cargo", Some("test")) => "cargo --version".to_string(),
+                    ("cargo", Some(sub)) => format!("cargo {sub} --version"),
+                    ("uv", _) => "uv --version".to_string(),
+                    _ => format!("{head} --version"),
+                };
+                assert!(
+                    command_works(dir.path(), &probe),
+                    "{kind:?}: written but does not run: {c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_test_is_not_written_without_cargo() {
+        // It rode in unconditionally before, which made it the one Rust command
+        // that could be written on a machine with no Rust at all.
+        assert!(checks_with(ProjectKind::Rust, &[], &only(&[])).is_empty());
+        assert_eq!(
+            checks_with(ProjectKind::Rust, &[], &only(&["cargo --version"])),
+            vec!["cargo test"]
+        );
+    }
+
+    #[test]
+    fn fmt_is_probed_separately_from_clippy() {
+        // Separate rustup components: either can be absent while the other is
+        // present, so neither vouches for the other.
+        let checks = checks_with(
+            ProjectKind::Rust,
+            &[],
+            &only(&["cargo --version", "cargo clippy --version"]),
+        );
+        assert_eq!(
+            checks,
+            vec!["cargo test", "cargo clippy --all-targets -- -D warnings"],
+            "no fmt line without a fmt probe"
+        );
+
+        let hyphenated = checks_with(
+            ProjectKind::Rust,
+            &[],
+            &only(&["cargo --version", "cargo-fmt --version"]),
+        );
+        assert_eq!(hyphenated, vec!["cargo test", "cargo-fmt --check"]);
+    }
+
+    #[test]
+    fn a_recognized_project_with_no_toolchain_gets_no_commands() {
+        for kind in [
+            ProjectKind::Rust,
+            ProjectKind::Node,
+            ProjectKind::Python,
+            ProjectKind::Go,
+        ] {
             assert!(
-                command_works(dir.path(), &probe),
-                "written but does not run: {c}"
+                checks_with(kind, &["test".to_string()], &only(&[])).is_empty(),
+                "{kind:?} must not write a command that cannot run"
             );
         }
     }
 
     #[test]
     fn node_checks_follow_declared_scripts() {
-        let dir = repo_with(&[(
-            "package.json",
-            r#"{"scripts":{"test":"jest","lint":"eslint ."}}"#,
-        )]);
-        let checks = checks_for(ProjectKind::Node, dir.path());
-        assert_eq!(checks, vec!["npm run test", "npm run lint"]);
+        let scripts = ["test".to_string(), "lint".to_string()];
+        assert_eq!(
+            checks_with(ProjectKind::Node, &scripts, &only(&["npm --version"])),
+            vec!["npm run test", "npm run lint"]
+        );
     }
 
     #[test]
     fn node_without_scripts_falls_back_to_npm_test() {
-        let dir = repo_with(&[("package.json", "{}")]);
-        assert_eq!(checks_for(ProjectKind::Node, dir.path()), vec!["npm test"]);
+        assert_eq!(
+            checks_with(ProjectKind::Node, &[], &only(&["npm --version"])),
+            vec!["npm test"]
+        );
     }
 
     #[test]
     fn a_malformed_package_json_does_not_panic() {
         let dir = repo_with(&[("package.json", "{ not json")]);
-        assert_eq!(checks_for(ProjectKind::Node, dir.path()), vec!["npm test"]);
+        // Through the real entry point, because parsing is what is under test.
+        // Whether npm exists here decides between two shapes, and neither panics.
+        let checks = checks_for(ProjectKind::Node, dir.path());
+        assert!(
+            checks.is_empty() || checks == vec!["npm test"],
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn go_needs_only_one_probe_for_both_commands() {
+        assert_eq!(
+            checks_with(ProjectKind::Go, &[], &only(&["go version"])),
+            vec!["go test ./...", "go vet ./..."]
+        );
+    }
+
+    #[test]
+    fn pytest_is_probed_when_there_is_no_uv() {
+        assert_eq!(
+            checks_with(ProjectKind::Python, &[], &only(&["uv --version"])),
+            vec!["uv run pytest"]
+        );
+        assert_eq!(
+            checks_with(ProjectKind::Python, &[], &only(&["pytest --version"])),
+            vec!["pytest"]
+        );
     }
 
     #[test]

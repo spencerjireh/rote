@@ -562,7 +562,14 @@ Rust with no rustup has `cargo-clippy` and `cargo-fmt` on PATH but no
 `cargo clippy` subcommand, so the obvious defaults would be written into every
 `.rote.toml` and fail at the first `rote done`. The Node case reads the scripts
 actually declared in `package.json` before falling back to `npm test`. An
-unrecognized project gets no commands at all — rote does not invent checks.
+unrecognized project gets no commands at all — rote does not invent checks — and
+neither does a recognized one whose toolchain is absent: verification failing is
+what "verified before being written" *means*, so the command is simply not
+written. What gets probed is the program a command names, never the check itself;
+running `cargo test` to decide whether to write `cargo test` would cost `rote
+init` a full test suite. Each spelling is probed on its own, because clippy and
+fmt are separate rustup components and either can be missing while the other is
+present.
 
 `verbatim` globs follow the same ecosystem mapping, so a Rust project is not
 told to watch for `pnpm-lock.yaml`.
