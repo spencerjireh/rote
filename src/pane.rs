@@ -345,22 +345,29 @@ pub fn run_local(project: &ProjectPaths, cfg: &Config, opts: Options) -> Result<
                 match key {
                     Key::Quit => return Ok(()),
                     Key::Open => {
-                        if let Some(p) = snapshot.as_ref().and_then(|s| s.active.as_ref()) {
+                        // Copied out first, so the borrow of `snapshot` is over
+                        // before the failure path needs to write into it.
+                        let target = snapshot
+                            .as_ref()
+                            .and_then(|s| s.active.as_ref())
+                            .map(|p| (std::path::PathBuf::from(&p.real_path), p.anchor_line));
+                        if let Some((path, line)) = target {
                             let editor = present::editor_command(&cfg.editor);
-                            let path = std::path::PathBuf::from(&p.real_path);
-                            let line = p.anchor_line;
-                            let is_new = p.hunk.op == crate::hunks::Op::CreateFile;
                             // Events queue up while the editor has the terminal,
                             // so the user comes back to a hunk that has already
                             // been classified.
                             let r = screen.suspended(|| {
-                                raw.suspended(|| {
-                                    present::launch_editor(&editor, &path, line, is_new)
-                                })
+                                raw.suspended(|| present::launch_editor(&editor, &path, line))
                             });
-                            // The exit status is meaningless now: rote is not
-                            // waiting on the editor to decide anything.
-                            r?;
+                            // An editor that will not launch is a notice, not the
+                            // end of the pane: a machine with no editor is fully
+                            // usable (DESIGN.md §6), and the message already says
+                            // which two settings fix it.
+                            if let Err(e) = r {
+                                if let Some(s) = &mut snapshot {
+                                    s.notices = vec![state::Notice::warn(format!("{e:#}"))];
+                                }
+                            }
                             last_frame.clear(); // force a repaint
                         }
                     }
@@ -539,17 +546,24 @@ pub fn run_client(
                 match key {
                     Key::Quit => return Ok(()),
                     Key::Open => {
-                        if let Some(p) = snapshot.as_ref().and_then(|s| s.active.as_ref()) {
+                        // Same as `run_local`: copied out before the editor runs,
+                        // and a launch failure is a notice rather than an exit. A
+                        // pane that survives this on one path and dies on the
+                        // other would be worse than either.
+                        let target = snapshot
+                            .as_ref()
+                            .and_then(|s| s.active.as_ref())
+                            .map(|p| (std::path::PathBuf::from(&p.real_path), p.anchor_line));
+                        if let Some((path, line)) = target {
                             let editor = present::editor_command(&cfg.editor);
-                            let path = std::path::PathBuf::from(&p.real_path);
-                            let line = p.anchor_line;
-                            let is_new = p.hunk.op == crate::hunks::Op::CreateFile;
                             let r = screen.suspended(|| {
-                                raw.suspended(|| {
-                                    present::launch_editor(&editor, &path, line, is_new)
-                                })
+                                raw.suspended(|| present::launch_editor(&editor, &path, line))
                             });
-                            r?;
+                            if let Err(e) = r {
+                                if let Some(s) = &mut snapshot {
+                                    s.notices = vec![state::Notice::warn(format!("{e:#}"))];
+                                }
+                            }
                             last_frame.clear();
                         }
                     }
