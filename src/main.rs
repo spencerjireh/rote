@@ -635,24 +635,70 @@ fn cmd_watch(project: &ProjectPaths, cfg: &Config, local: bool, opts: pane::Opti
     }
 }
 
-/// Recompute, then print the hunk at the head of the queue.
+/// Print the hunk at the head of the queue.
 ///
 /// A printer, not a step in the loop. `rote watch` is what advances the queue;
 /// this exists so a plain shell, a script, or a `--json` consumer can see what
 /// is outstanding without a pane. It classifies nothing and launches nothing.
+///
+/// Routed, because it writes: `last_presented` is what `rote show` with no id
+/// re-prints, and it used to recompute and save straight past a live engine
+/// (§13). Under a daemon it reads the engine's published view and asks the engine
+/// to record what it showed. It deliberately does *not* force a recompute — the
+/// engine does that on save, on any unknown-file change, and at least every floor
+/// sweep, and forcing one is the only part of this that would need the engine's
+/// permission. Asking what it currently thinks does not, and its answer is the
+/// authoritative one anyway: it carries `drift`, curator order, and an anchor
+/// resolved against the real file, all of which the CLI would otherwise re-derive
+/// and could disagree about.
 fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Result<()> {
-    let picked = session::with_session_recomputed(project, cfg, |m, report| {
-        for w in &report.warnings {
-            eprintln!("warning: {w}");
+    // §1: "Errors if state is idle." A precondition, read before anything else —
+    // but the routing decision still comes before any mutation.
+    Manifest::require(project)?;
+
+    let picked = match daemon::owner(project)? {
+        daemon::Owner::Daemon(ep) => {
+            let snapshot = daemon::fetch_state(&ep)?;
+            match snapshot.active {
+                None => None,
+                Some(p) => {
+                    // The same write the local arm makes, made by the engine so
+                    // its private view cannot end up disagreeing with the file.
+                    let command = rote::state::Command::Show {
+                        hunk_id: Some(p.hunk.id.clone()),
+                    };
+                    match daemon::apply(&ep, command)? {
+                        daemon::Applied::Yes => {}
+                        // It left the queue between the fetch and the show. The
+                        // hunk is still worth printing; nothing is worth failing.
+                        daemon::Applied::Rejected {
+                            cause: Some(rote::state::Cause::NoSuchHunk),
+                            ..
+                        } => {}
+                        daemon::Applied::Rejected { reason, .. } => {
+                            bail!("{reason} ({})", p.hunk.id)
+                        }
+                    }
+                    Some((p.hunk, p.position, p.total))
+                }
+            }
         }
-        let Some(hunk) = m.active().cloned() else {
-            return Ok(None);
-        };
-        let position = m.queue_position(&hunk.id).unwrap_or(1);
-        let total = m.pending().count();
-        m.last_presented = Some(hunk.id.clone());
-        Ok(Some((hunk, position, total)))
-    })?;
+        daemon::Owner::Nobody(_guard) => {
+            session::with_session_recomputed(project, cfg, |m, report| {
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
+                let Some(hunk) = m.active().cloned() else {
+                    return Ok(None);
+                };
+                let position = m.queue_position(&hunk.id).unwrap_or(1);
+                let total = m.pending().count();
+                m.last_presented = Some(hunk.id.clone());
+                Ok(Some((hunk, position, total)))
+            })?
+        }
+        daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
+    };
 
     let Some((hunk, position, total)) = picked else {
         println!("nothing to transcribe.");

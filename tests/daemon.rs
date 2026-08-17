@@ -940,6 +940,62 @@ fn a_verb_refuses_when_something_owns_the_queue_but_answers_nothing() {
     );
 }
 
+/// The on-disk generation, which a bypassing writer moves and the daemon does not
+/// learn about — nothing under the state directory reaches the watcher.
+fn disk_generation(cli: &Cli) -> u64 {
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    m["generation"].as_u64().unwrap()
+}
+
+#[test]
+fn next_routes_its_write_through_the_daemon() {
+    // It called `with_session_recomputed` directly: a second recompute racing the
+    // engine's, and a `last_presented` write behind its back (§13). `last_presented`
+    // is not on the wire, so what proves the routing is that the engine *published*
+    // the write — a direct writer moves the file and leaves `/state` behind.
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let engines_view: state::Snapshot = d.get("/state").json().unwrap();
+    let id = engines_view.active.expect("an active hunk").hunk.id;
+
+    let out = cli.run(&["next"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("+     work();"), "{}", stdout(&out));
+
+    let after: state::Snapshot = d.get("/state").json().unwrap();
+    assert_eq!(
+        after.generation,
+        disk_generation(&cli),
+        "the engine and the file must agree: a write it did not make leaves it behind"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    assert_eq!(manifest["last_presented"], id, "and the write did land");
+
+    // Which is also what makes `show` with no id work afterwards.
+    let shown = stdout(&cli.run(&["show"]));
+    assert!(shown.contains("+     work();"), "{shown}");
+}
+
+#[test]
+fn next_refuses_when_something_owns_the_queue_but_answers_nothing() {
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+    let _held = rote::lockfile::Lock::try_acquire(&project.watch_lock_path())
+        .unwrap()
+        .expect("the token should be free");
+
+    let out = cli.run(&["next"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("owns this project's queue") && err.contains("not answering"),
+        "{err}"
+    );
+}
+
 #[test]
 fn answering_retry_through_the_daemon_does_not_get_re_asked() {
     // The Stage-1 bug this step closes. Clearing pending_divergence is only

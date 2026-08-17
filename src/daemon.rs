@@ -450,20 +450,35 @@ pub fn apply(ep: &Endpoint, command: state::Command) -> Result<Applied> {
     }
 }
 
+/// How long to wait for a daemon that is listening but has not published yet.
+///
+/// `/state` answers 503 `warming_up` between binding the port and the engine's
+/// first snapshot. A CLI verb that has just called `ensure_running` lands in that
+/// window routinely, and failing there would mean "I started a daemon for you and
+/// then could not talk to it".
+const READY_WAIT: Duration = Duration::from_secs(2);
+
 /// Ask the daemon what the world looks like.
 pub fn fetch_state(ep: &Endpoint) -> Result<state::Snapshot> {
-    let reply = http::send(
-        ep.port,
-        &ep.token,
-        "GET",
-        "/state",
-        None,
-        http::CLIENT_TIMEOUT,
-    )?;
-    if !reply.is_ok() {
-        anyhow::bail!("the rote daemon is not ready (status {})", reply.status);
+    let start = Instant::now();
+    loop {
+        let reply = http::send(
+            ep.port,
+            &ep.token,
+            "GET",
+            "/state",
+            None,
+            http::CLIENT_TIMEOUT,
+        )?;
+        if reply.is_ok() {
+            return reply.json();
+        }
+        // 503 is "not yet", anything else is "no".
+        if reply.status != 503 || start.elapsed() >= READY_WAIT {
+            anyhow::bail!("the rote daemon is not ready (status {})", reply.status);
+        }
+        std::thread::sleep(SPAWN_POLL);
     }
-    reply.json()
 }
 
 /// The error for "something owns the queue but will not talk to us".

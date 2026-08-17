@@ -433,10 +433,21 @@ fn a_non_utf8_file_is_gated_on_bytes_and_does_not_stop_the_watcher() {
         "the engine kept classifying: {manifest:#}"
     );
 
-    // And copying the bytes across is what retires it.
+    // And copying the bytes across is what retires it. Polled, because the daemon
+    // `watch` left running is what answers `next` now, and it reports the view it
+    // has published rather than re-diffing on demand — so this arrives when its
+    // watcher gets to the write, not before.
     std::fs::write(cli.fx.repo.join("legacy.txt"), b"caf\xe9\n").unwrap();
-    let after = stdout(&cli.run(&["next"]));
-    assert!(!after.contains("not valid UTF-8"), "{after}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        last = stdout(&cli.run(&["next"]));
+        if !last.contains("not valid UTF-8") {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    panic!("the byte-gated hunk never retired: {last}");
 }
 
 #[test]
