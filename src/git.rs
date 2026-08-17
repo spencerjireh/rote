@@ -322,22 +322,29 @@ pub fn prune_worktrees(repo: &Path) -> Result<()> {
 /// archived residue patch exists to be recoverable, so the headers are rewritten
 /// to the ordinary `a/x.rs` / `b/x.rs` form. `/dev/null` sides are left alone —
 /// they are what marks an add or a delete.
+/// Only the three header lines are rewritten; every other line, content included,
+/// is copied byte for byte. That matters twice. A trailing `\r` on a content line
+/// belongs to the file, and dropping it here made a CRLF proposal that no CRLF
+/// file could match — this ran before `diffparse` ever saw the bytes, so fixing
+/// the parser alone changed nothing. It also has to keep the residue patch
+/// applicable, and a patch whose line endings were rewritten does not apply.
 pub fn relativize_no_index_diff(diff: &[u8], rel: &str) -> Vec<u8> {
-    let text = String::from_utf8_lossy(diff);
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        if line.starts_with("diff --git ") {
-            out.push_str(&format!("diff --git a/{rel} b/{rel}"));
-        } else if let Some(rest) = line.strip_prefix("--- ") {
-            out.push_str(&rewrite_side("---", rest, rel));
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
-            out.push_str(&rewrite_side("+++", rest, rel));
+    let mut out = Vec::with_capacity(diff.len());
+    for line in crate::diffparse::split_lines(diff) {
+        if line.starts_with(b"diff --git ") {
+            out.extend_from_slice(format!("diff --git a/{rel} b/{rel}").as_bytes());
+        } else if let Some(rest) = line.strip_prefix(b"--- ".as_slice()) {
+            let side = rewrite_side("---", &String::from_utf8_lossy(rest), rel);
+            out.extend_from_slice(side.as_bytes());
+        } else if let Some(rest) = line.strip_prefix(b"+++ ".as_slice()) {
+            let side = rewrite_side("+++", &String::from_utf8_lossy(rest), rel);
+            out.extend_from_slice(side.as_bytes());
         } else {
-            out.push_str(line);
+            out.extend_from_slice(line);
         }
-        out.push('\n');
+        out.push(b'\n');
     }
-    out.into_bytes()
+    out
 }
 
 fn rewrite_side(marker: &str, rest: &str, rel: &str) -> String {
@@ -444,6 +451,28 @@ mod tests {
         // Body is untouched.
         assert!(out.contains("+    work();"));
         assert!(out.contains("index f79c691..7527576"));
+    }
+
+    #[test]
+    fn relativize_leaves_content_bytes_alone() {
+        // It rewrote through `str::lines` and reassembled with `\n`, so every
+        // content line lost its `\r` — before `diffparse` was ever handed the
+        // bytes. That made a CRLF proposal nothing on disk could match, and an
+        // archived residue patch that would not apply.
+        let raw = b"diff --git a/tmp/repo/x.rs b/tmp/shadow/x.rs\n\
+                    --- a/tmp/repo/x.rs\n+++ b/tmp/shadow/x.rs\n\
+                    @@ -1,2 +1,3 @@\n fn main() {\r\n+    work();\r\n }\r\n";
+        let out = relativize_no_index_diff(raw, "x.rs");
+        assert!(
+            out.windows(15).any(|w| w == b"+    work();\r\n "),
+            "the CR must survive: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(
+            out.iter().filter(|b| **b == b'\r').count(),
+            3,
+            "all three of them"
+        );
     }
 
     #[test]

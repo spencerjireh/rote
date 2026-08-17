@@ -3,6 +3,9 @@
 //! Hand-rolled because the format rote consumes is small and fixed: the output
 //! of `git diff --no-index` over exactly two files. Pure functions over bytes —
 //! no I/O, so the fixtures below are the whole test surface.
+//!
+//! Over bytes literally, including the line split: `str::lines` strips a trailing
+//! `\r`, and the disk side does not. See `split_lines`.
 
 use anyhow::{bail, Result};
 
@@ -44,13 +47,39 @@ pub struct ParsedDiff {
     pub hunks: Vec<RawHunk>,
 }
 
+/// Split on `\n`, keeping every byte in between — a trailing `\r` included — and
+/// keeping a final line that has no terminator.
+///
+/// This must agree exactly with `present::split_lines`, which does the same job
+/// on the disk side, and `str::lines` does not: it strips a trailing `\r`. So a
+/// CRLF file's proposal never carried the `\r` that the file on disk did, and the
+/// two could only ever be compared under a whitespace tolerance. With
+/// `strict_whitespace = true` that tolerance is gone and such a hunk could never
+/// classify `Typed` at all — it diverged on a byte the parser had thrown away.
+pub(crate) fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    // One trailing newline is a terminator, not an empty final line.
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    if body.is_empty() {
+        return vec![body];
+    }
+    body.split(|b| *b == b'\n').collect()
+}
+
 /// Parse `git diff --no-index` output for a single file pair.
 pub fn parse(diff: &[u8]) -> Result<ParsedDiff> {
-    let text = String::from_utf8_lossy(diff);
     let mut out = ParsedDiff::default();
     let mut current: Option<RawHunk> = None;
 
-    for line in text.lines() {
+    for raw in split_lines(diff) {
+        // Decoded per line, after the split rather than before it, so the split
+        // sees bytes. Content lines are UTF-8 by the time they get here —
+        // `compute_hunks` gates a file that is not — so the lossy path only ever
+        // covers headers, and those are discarded. Making it fallible instead
+        // would let an oddly encoded pathname turn a working diff into an error.
+        let line: &str = &String::from_utf8_lossy(raw);
         // Headers. Checked before the body prefixes because "--- " and "+++ "
         // would otherwise look like removed/added content.
         if let Some(rest) = line.strip_prefix("--- ") {
@@ -256,5 +285,48 @@ mod tests {
             p.hunks[0].lines,
             vec![ctx("a"), ctx(""), rem("b"), add("B")]
         );
+    }
+
+    #[test]
+    fn crlf_content_keeps_its_carriage_return() {
+        // `str::lines` would strip these, leaving a proposal that no CRLF file
+        // could ever match byte for byte.
+        let d = b"--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n keep\r\n-old\r\n+new\r\n";
+        let p = parse(d).unwrap();
+        assert_eq!(
+            p.hunks[0].lines,
+            vec![ctx("keep\r"), rem("old\r"), add("new\r")]
+        );
+    }
+
+    #[test]
+    fn the_line_split_agrees_with_the_disk_side() {
+        // The two halves of every classification comparison. A disagreement here
+        // is a hunk that can never be typed.
+        for input in ["", "\n", "a", "a\n", "a\nb", "a\n\n", "a\r\n", "a\r\nb\r\n"] {
+            let ours: Vec<String> = split_lines(input.as_bytes())
+                .into_iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            assert_eq!(
+                ours,
+                crate::present::split_lines(input),
+                "disagreed on {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_final_line_without_a_newline_is_kept() {
+        let d = b"--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new";
+        let p = parse(d).unwrap();
+        assert_eq!(p.hunks[0].lines, vec![rem("old"), add("new")]);
+    }
+
+    #[test]
+    fn a_trailing_newline_does_not_add_an_empty_line() {
+        let d = b"--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let p = parse(d).unwrap();
+        assert_eq!(p.hunks[0].lines, vec![rem("old"), add("new")]);
     }
 }

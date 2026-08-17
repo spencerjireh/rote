@@ -352,6 +352,42 @@ fn a_generated_file_is_gated_on_bytes_not_typing() {
 }
 
 #[test]
+fn a_crlf_file_can_be_typed_under_strict_whitespace() {
+    // The parser used to drop every line's trailing `\r` while the disk side kept
+    // it, so the two sides of the comparison could only agree under the trailing
+    // whitespace tolerance. `strict_whitespace = true` removes that tolerance —
+    // and with it, any way for a CRLF file to ever be typed.
+    let fx = Fixture::new();
+    fx.write("crlf.rs", "fn a() {\r\n}\r\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    cli.write_project_config("strict_whitespace = true\n");
+    cli.run(&["start", "--no-launch", "edit a crlf file"]);
+    std::fs::write(
+        cli.shadow().join("crlf.rs"),
+        "fn a() {\r\n    work();\r\n}\r\n",
+    )
+    .unwrap();
+
+    let watcher = cli.spawn(&["watch", "--headless", "--timeout", "6000"]);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    cli.fx.write("crlf.rs", "fn a() {\r\n    work();\r\n}\r\n");
+    let _ = watcher.wait_with_output();
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    let h = &manifest["hunks"].as_array().unwrap()[0];
+    assert_eq!(
+        h["status"], "typed",
+        "typing the proposal exactly must classify: {manifest:#}"
+    );
+    assert!(
+        h["pending_divergence"].is_null(),
+        "and must not be a question: {manifest:#}"
+    );
+}
+
+#[test]
 fn a_non_utf8_file_is_gated_on_bytes_and_does_not_stop_the_watcher() {
     // Latin-1 in one file used to take the daemon down. `present::read_lines`
     // reads the real file with `read_to_string`, which errors on these bytes, and
