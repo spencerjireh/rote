@@ -365,16 +365,26 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Daemon {
-            foreground: _,
+            foreground,
             timeout,
         } => {
-            daemon::serve(
-                &project,
-                &cfg,
-                daemon::ServeOptions {
-                    timeout_ms: timeout,
-                },
-            )?;
+            let opts = daemon::ServeOptions {
+                timeout_ms: timeout,
+            };
+            if foreground {
+                daemon::serve(&project, &cfg, opts)?;
+            } else {
+                // What `rote start` does implicitly, available explicitly. The
+                // child is spawned with `--foreground`, so there is no recursion.
+                let ep = daemon::spawn_detached(&project, opts)?;
+                if !cli.quiet {
+                    println!(
+                        "rote daemon listening on {} (pid {})",
+                        ep.base_url(),
+                        ep.pid
+                    );
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Skip { hunk_id } => {

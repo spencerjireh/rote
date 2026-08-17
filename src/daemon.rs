@@ -192,7 +192,7 @@ pub fn discover(project: &ProjectPaths) -> Option<Endpoint> {
 /// that it shares claude's session, and the SIGHUP when that pty closes takes
 /// the daemon with it — which is precisely when the user is most likely to
 /// still be typing.
-pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
+pub fn spawn_detached(project: &ProjectPaths, opts: ServeOptions) -> Result<Endpoint> {
     use std::os::unix::process::CommandExt as _;
 
     project.ensure_state_dir()?;
@@ -212,6 +212,10 @@ pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
+    // Forwarded so `--timeout` means the same thing whichever mode asked for it.
+    if let Some(ms) = opts.timeout_ms {
+        cmd.arg("--timeout").arg(ms.to_string());
+    }
 
     // Safety: `setsid` is async-signal-safe and is on the POSIX list of calls
     // permitted between fork and exec.
@@ -261,7 +265,7 @@ pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
 pub fn ensure_running(project: &ProjectPaths) -> Result<Endpoint> {
     match discover(project) {
         Some(ep) => Ok(ep),
-        None => spawn_detached(project),
+        None => spawn_detached(project, ServeOptions::default()),
     }
 }
 

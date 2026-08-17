@@ -647,6 +647,31 @@ fn start_leaves_a_daemon_watching_in_the_background() {
 }
 
 #[test]
+fn daemon_without_foreground_detaches_and_returns() {
+    // `foreground` was destructured and thrown away, so `rote daemon` always
+    // served inline — while `spawn_detached` invokes `rote daemon --foreground`,
+    // which is the evidence the flag always meant this.
+    let cli = session();
+    let project = cli.fx.project();
+
+    let out = cli.run(&["daemon", "--timeout", "30000"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("rote daemon listening on http://127.0.0.1:"),
+        "{}",
+        stdout(&out)
+    );
+
+    let ep = wait_for("the detached daemon to answer", || {
+        rote::daemon::discover(&project)
+    });
+    assert_ne!(ep.pid, std::process::id(), "it is not this process");
+
+    // Cleaned up the way anything else would: through the session ending.
+    assert!(cli.run(&["abort", "--yes"]).status.success());
+}
+
+#[test]
 fn no_launch_does_not_spawn_a_daemon() {
     // Every existing test uses `--no-launch`. Spawning there would leak a
     // background process into the whole suite.
