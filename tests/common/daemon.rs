@@ -185,6 +185,14 @@ impl Daemon {
 }
 
 impl Stream {
+    /// The next frame of any kind, or `None` once the stream ends.
+    ///
+    /// For a test that has to see *everything* the engine published rather than
+    /// wait for one named frame — a high-water mark across a whole session, say.
+    pub fn next_any(&mut self) -> Option<http::Frame> {
+        self.frames.next().map(|f| f.expect("a readable frame"))
+    }
+
     /// The next frame with this event name, skipping anything else.
     pub fn next_named(&mut self, name: &str) -> http::Frame {
         for f in self.frames.by_ref() {

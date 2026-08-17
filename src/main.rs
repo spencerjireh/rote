@@ -439,35 +439,83 @@ fn cmd_done(
     // 1. Refuse mid-operation, before anything expensive runs.
     shadow::ensure_no_operation_in_progress(project)?;
 
-    // 2. Recompute under the lock; then release it before prompting. A
-    // confirmation waits on a human, and no lock is ever held across that.
-    let pending = session::with_session_recomputed(project, cfg, |m, report| {
-        for w in &report.warnings {
-            eprintln!("warning: {w}");
+    // 2. Ask whoever owns the queue what is still pending; then let go before
+    // prompting, because a confirmation waits on a human and no lock is ever held
+    // across that.
+    //
+    // Routed like every other mutation (§13). The daemon is alive right through
+    // here — `reap` is at step 6, below every early return, so that "left the
+    // session open" never takes it down — and recomputing here ourselves would be
+    // a second engine for as long as this runs.
+    //
+    // Under a daemon nothing forces a recompute, and that loses nothing: its
+    // classifier has already marked correctly typed hunks `Typed`, which is a
+    // better answer than a bare recompute merely dropping them under rule 5.
+    let pending: Vec<(String, String)> = match daemon::owner(project)? {
+        daemon::Owner::Daemon(ep) => daemon::fetch_state(&ep)?
+            .queue
+            .iter()
+            .map(|q| (q.id.clone(), format!("  {}:{}", q.file, q.anchor_hint)))
+            .collect(),
+        daemon::Owner::Nobody(_guard) => {
+            session::with_session_recomputed(project, cfg, |m, report| {
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
+                Ok(m.pending()
+                    .map(|h| (h.id.clone(), format!("  {}:{}", h.file, h.anchor_hint)))
+                    .collect::<Vec<_>>())
+            })?
         }
-        Ok(m.pending()
-            .map(|h| format!("  {}:{}", h.file, h.anchor_hint))
-            .collect::<Vec<String>>())
-    })?;
+        daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
+    };
 
     if !pending.is_empty() {
         println!("{} hunk(s) still pending:", pending.len());
-        for p in &pending {
-            println!("{p}");
+        for (_, line) in &pending {
+            println!("{line}");
         }
         if !force && !confirm("close anyway, marking them skipped? [y/N] ")? {
             println!("left the session open. `rote watch` continues.");
             return Ok(());
         }
-        session::with_session(project, |m| {
-            let ids: Vec<String> = m.pending().map(|h| h.id.clone()).collect();
-            for id in ids {
-                if let Some(h) = m.find_mut(&id) {
-                    h.status = Status::Skipped;
+        // One `skip` per hunk rather than a bulk verb. Each has to disarm the
+        // watchdog and retake the baseline too, which is engine-private state — a
+        // bulk variant would have to reimplement that inside the engine to be
+        // correct, and would buy nothing: there is no atomicity to protect with
+        // `reap` and `archive_and_clear` next, and the extra snapshots go to panes
+        // about to be told the session closed.
+        match daemon::owner(project)? {
+            daemon::Owner::Daemon(ep) => {
+                for (id, _) in &pending {
+                    let command = rote::state::Command::Skip {
+                        hunk_id: id.clone(),
+                    };
+                    match daemon::apply(&ep, command)? {
+                        daemon::Applied::Yes => {}
+                        // It left the queue between the listing and here — typed,
+                        // or reworked away. Nothing left to skip either way.
+                        daemon::Applied::Rejected {
+                            cause: Some(rote::state::Cause::NoSuchHunk),
+                            ..
+                        } => {}
+                        daemon::Applied::Rejected { reason, .. } => bail!("{reason} ({id})"),
+                    }
                 }
             }
-            Ok(())
-        })?;
+            daemon::Owner::Nobody(_guard) => {
+                session::with_session(project, |m| {
+                    let ids: Vec<String> = m.pending().map(|h| h.id.clone()).collect();
+                    for id in ids {
+                        if let Some(h) = m.find_mut(&id) {
+                            h.status = Status::Skipped;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
+        }
     }
 
     // Re-read once the mutations above have landed. Everything from here is

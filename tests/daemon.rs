@@ -979,6 +979,94 @@ fn next_routes_its_write_through_the_daemon() {
 }
 
 #[test]
+fn done_skips_pending_hunks_through_the_daemon() {
+    // The bulk skip wrote every pending hunk to `Skipped` with `with_session`,
+    // while the daemon was alive — `reap` is at step 6, below every early return.
+    // A subscriber seeing the skips is what proves they went through the engine.
+    let cli = session();
+    cli.fx.write("b.rs", "fn b() {\n}\n");
+    cli.fx.commit_all("second file");
+    std::fs::write(cli.shadow().join("b.rs"), "fn b() {\n    more();\n}\n").unwrap();
+
+    let d = Daemon::start(&cli);
+    let mut stream = d.events();
+    wait_until("both hunks to be queued", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .map(|s| s.counts.pending == 2)
+            .unwrap_or(false)
+    });
+
+    let out = cli.run_with_input(&["done", "--force", "--no-checks", "--no-review"], "y\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // Read to the end of the stream, tracking the most the engine ever published.
+    let mut high_water = 0;
+    while let Some(f) = stream.next_any() {
+        match f.event.as_deref() {
+            Some("snapshot") => {
+                let s: state::Snapshot = serde_json::from_str(&f.data).unwrap();
+                high_water = high_water.max(s.counts.skipped);
+            }
+            Some("closed") => {
+                let ev: state::Event = serde_json::from_str(&f.data).unwrap();
+                assert!(
+                    matches!(
+                        ev,
+                        state::Event::Closed {
+                            terminal: Some(rote::session::Terminal::Done)
+                        }
+                    ),
+                    "the reap must still happen, and still carry the reason: {ev:?}"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        high_water, 2,
+        "both skips must reach a subscriber, or they went around the engine"
+    );
+
+    // And the archive records them, which is what `done` is for.
+    let manifest = std::fs::read_dir(cli.fx.project().archive_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.extension().is_some_and(|x| x == "json") && !p.to_string_lossy().contains("curator")
+        })
+        .expect("an archived manifest");
+    let m: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+    let skipped = m["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|h| h["status"] == "skipped")
+        .count();
+    assert_eq!(skipped, 2, "{m:#}");
+}
+
+#[test]
+fn done_refuses_when_something_owns_the_queue_but_answers_nothing() {
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+    let _held = rote::lockfile::Lock::try_acquire(&project.watch_lock_path())
+        .unwrap()
+        .expect("the token should be free");
+
+    let out = cli.run_with_input(&["done", "--no-checks", "--no-review"], "y\ny\n");
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("owns this project's queue") && err.contains("not answering"),
+        "{err}"
+    );
+}
+
+#[test]
 fn next_refuses_when_something_owns_the_queue_but_answers_nothing() {
     let cli = session();
     let project = cli.fx.project();
