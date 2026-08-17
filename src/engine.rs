@@ -845,6 +845,14 @@ impl Engine {
             state::Command::Refresh => {
                 self.recompute = Pending::At(now);
                 self.last_recompute = None;
+                // Republish even if the recompute finds nothing. `refresh` is a
+                // client saying "I think I am out of sync" — answering it with a
+                // heartbeat because the queue happens to be unchanged tells it
+                // nothing, and the hub drops heartbeats rather than fanning them
+                // out. It is also the only way a subscriber that has gone away
+                // gets pruned on an otherwise idle session: pruning happens on a
+                // failed send, so it needs a frame to actually go out.
+                self.last_published = None;
                 Ok(state::Outcome::Applied)
             }
         }

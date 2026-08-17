@@ -293,6 +293,22 @@ pub fn with_session_maybe<T>(
 /// bug `with_session` exists to prevent. A few hundred milliseconds of lock is
 /// the price of correctness on the CLI path; the daemon avoids paying it by
 /// classifying against pending hunks without shelling out at all.
+/// Declines the write when nothing moved, for the reasons `with_session_maybe`
+/// gives above — and it matters more here, because this is what the engine calls
+/// on every debounced recompute *and* on the 30-second floor sweep. Bumping
+/// unconditionally meant an entirely idle session invalidated every subscriber's
+/// snapshot twice a minute, each costing a real-file read for the anchor.
+///
+/// Decided by comparing the manifest against what was loaded, rather than by giving
+/// the closure an `Option` seam. `Manifest::save` is a pure function of the value
+/// and stamps no timestamp, so the comparison is exactly "would the file change" —
+/// which `report.added > 0 || report.dropped > 0` is not. That would miss reconcile
+/// rule 3's status resets, the curator cache being applied, and `promote_state`,
+/// none of which appear in `RecomputeReport`. Keeping the signature also means every
+/// call site gets the right answer without being touched.
+///
+/// `warnings` and `drift` are observations about the trees, not writes: a repository
+/// that has drifted must not rewrite the session file on every sweep for saying so.
 pub fn with_session_recomputed<T>(
     project: &ProjectPaths,
     cfg: &Config,
@@ -302,8 +318,12 @@ pub fn with_session_recomputed<T>(
     let _lock = crate::lockfile::Lock::acquire(&project.lock_path())?;
 
     let mut manifest = Manifest::require(project)?;
+    let before = manifest.clone();
     let report = recompute(&mut manifest, project, cfg)?;
     let out = f(&mut manifest, &report)?;
+    if manifest == before {
+        return Ok(out);
+    }
     manifest.generation += 1;
     manifest.save(project)?;
     Ok(out)
