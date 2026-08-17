@@ -855,3 +855,87 @@ fn a_report_for_a_hunk_that_does_not_exist_is_refused() {
     assert!(matches!(outcome, state::Outcome::Rejected { .. }));
     assert_eq!(manifest(&fx).generation, before);
 }
+
+/// Send one command at a chosen generation and report the outcome.
+fn apply_at(
+    engine: &mut Engine,
+    generation: Option<u64>,
+    command: state::Command,
+) -> state::Outcome {
+    let mut notices = Vec::new();
+    engine
+        .apply(
+            &state::Request {
+                wire_version: state::WIRE_VERSION,
+                generation,
+                command,
+            },
+            Tick(50),
+            &mut notices,
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_show_with_a_stale_generation_is_refused() {
+    // It returned before reaching `mutate`, where the check lives, so a client
+    // that had fallen behind was told its verb landed. §12 says the generation is
+    // checked whenever it is present — writing nothing is not an exemption.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let current = manifest(&fx).generation;
+
+    let outcome = apply_at(
+        &mut engine,
+        Some(current.saturating_sub(1)),
+        state::Command::Show { hunk_id: None },
+    );
+
+    assert!(
+        matches!(outcome, state::Outcome::Stale { current: c } if c == current),
+        "got {outcome:?}"
+    );
+    assert_eq!(manifest(&fx).generation, current, "and nothing was written");
+}
+
+#[test]
+fn a_show_at_the_current_generation_is_applied_and_writes_nothing() {
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let current = manifest(&fx).generation;
+
+    let outcome = apply_at(
+        &mut engine,
+        Some(current),
+        state::Command::Show { hunk_id: None },
+    );
+
+    assert!(
+        matches!(outcome, state::Outcome::Applied),
+        "got {outcome:?}"
+    );
+    assert_eq!(
+        manifest(&fx).generation,
+        current,
+        "no id means no state to move"
+    );
+}
+
+#[test]
+fn a_refresh_is_applied_however_stale_the_client_is() {
+    // The deliberate exception, pinned so it cannot be "fixed" into a refusal.
+    // The pane attaches its generation to every command and `g` maps to refresh,
+    // so checking it would refuse the client that has fallen behind the one verb
+    // that recovers from that.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let current = manifest(&fx).generation;
+
+    let outcome = apply_at(&mut engine, Some(0), state::Command::Refresh);
+
+    assert!(
+        matches!(outcome, state::Outcome::Applied),
+        "got {outcome:?}"
+    );
+    assert_eq!(manifest(&fx).generation, current);
+}

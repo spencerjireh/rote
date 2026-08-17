@@ -247,7 +247,13 @@ pub enum Command {
         hunk_id: String,
         input: Reported,
     },
-    /// Force a full recompute.
+    /// Force a full recompute, and a republished snapshot even if it finds
+    /// nothing — the sender is saying it thinks it is out of sync.
+    ///
+    /// The one verb whose `generation` is *not* checked. It asserts nothing about
+    /// the queue's contents, so there is nothing to be stale against, and
+    /// refusing it would deny the client that has fallen behind the verb that
+    /// recovers from exactly that.
     Refresh,
 }
 
@@ -256,7 +262,8 @@ pub struct Request {
     pub wire_version: u32,
     /// The generation the client was looking at. Checked only when present: a
     /// client that does not care about races may omit it, but one answering a
-    /// question about a hunk that has since been reworked must not.
+    /// question about a hunk that has since been reworked must not. `refresh` is
+    /// the one verb that ignores it even when present — see `Command::Refresh`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     #[serde(flatten)]

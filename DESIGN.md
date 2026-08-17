@@ -756,7 +756,17 @@ confuse a race with a transport failure.
 read-modify-write cycle as the mutation. Checking it in the handler and then
 locking to write is a TOCTOU that would make the mechanism decorative. `stale`
 writes nothing and does not move the generation, which is what makes retrying
-exactly once safe.
+exactly once safe. It applies to every verb that writes nothing as well as to
+every verb that does — `show` with no id moves no state, but a client that sent a
+stale generation with it still needs to be told so rather than told `applied`.
+
+`refresh` is the one exception, and deliberately. It asserts nothing about the
+queue's contents, so there is nothing for a generation to be stale against; and
+since the pane attaches the generation it is looking at to every command, checking
+it would refuse the client that has fallen behind the one verb that recovers from
+that, at the moment it asks. It also republishes even when the recompute finds
+nothing, because a client sending it is saying it thinks it is out of sync, and a
+heartbeat does not answer that.
 
 `GET /state` is the engine's **last published view**, not a fresh read: `drift`
 is engine-only state, so a stateless handler would either omit it or shell out to

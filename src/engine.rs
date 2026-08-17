@@ -807,7 +807,16 @@ impl Engine {
             }
             state::Command::Show { hunk_id } => {
                 let Some(id) = hunk_id.clone() else {
-                    return Ok(state::Outcome::Applied);
+                    // Nothing to write, but §12 says the generation is checked
+                    // whenever it is present, and returning `Applied` here told a
+                    // client that had fallen behind that its verb had landed.
+                    // Through `mutate` with `Decision::Nothing`, which already
+                    // means exactly this: reported as applied, no write, no bump.
+                    let (out, _) = self.mutate(want, |_m| Ok(Decision::<()>::Nothing))?;
+                    return Ok(match out {
+                        Mutated::Applied(()) => state::Outcome::Applied,
+                        Mutated::Refused(o) => o,
+                    });
                 };
                 let (out, _) = self.mutate(want, |m| {
                     if m.find(&id).is_none() {
@@ -842,6 +851,12 @@ impl Engine {
                     Mutated::Refused(o) => o,
                 })
             }
+            // The one verb that ignores `want`, deliberately. It asserts nothing
+            // about the queue's contents, so there is nothing for a generation to
+            // be stale against — and the pane sends every command with the
+            // generation it is looking at while `g` maps to this, so checking it
+            // would refuse the client that has fallen behind the one verb that
+            // fixes that, exactly when it is pressed.
             state::Command::Refresh => {
                 self.recompute = Pending::At(now);
                 self.last_recompute = None;
