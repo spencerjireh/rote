@@ -63,3 +63,49 @@ jobs:
 
       - name: Format
         run: cargo fmt --check
+
+  # The nvim front end. Its own job, on one platform.
+  #
+  # Separate from `gate` so that a Lua failure reads as "lua red" rather than as
+  # the Rust job red for a Lua reason, and ubuntu-only because linting Lua is
+  # platform-independent — running it on both legs would duplicate it for no
+  # added signal.
+  #
+  # The tools are invoked directly rather than through `just lua-lint`. That
+  # recipe skips when a tool is missing, which is right on a contributor's
+  # machine and wrong here: a failed install would produce a green run. Same
+  # trap as the `git config --global` step deliberately absent from `gate`.
+  lua:
+    name: lua
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # A pinned release binary: no build step, nothing to compile, and no
+      # third-party action in the supply chain for a single download.
+      - name: Install stylua
+        env:
+          STYLUA_VERSION: v2.5.2
+        run: |
+          curl -fsSL -o stylua.zip \
+            "https://github.com/JohnnyMorganz/StyLua/releases/download/${STYLUA_VERSION}/stylua-linux-x86_64.zip"
+          unzip -q stylua.zip
+          sudo install -m 755 stylua /usr/local/bin/stylua
+          rm -f stylua.zip stylua
+          stylua --version
+
+      # luacheck is pure Lua but pulls luafilesystem, which is a C module, so
+      # the headers are not optional.
+      - name: Install luacheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.4 liblua5.4-dev luarocks
+          sudo luarocks install luacheck
+          luacheck --version
+
+      - name: Format
+        run: stylua --check lua plugin
+
+      - name: Lint
+        run: luacheck lua plugin
