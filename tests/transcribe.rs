@@ -140,6 +140,53 @@ fn skip_takes_a_hunk_id_and_skips_that_one() {
 }
 
 #[test]
+fn status_lists_each_file_once_however_the_queue_grew() {
+    // `dedup` alone only drops *adjacent* repeats, and `manifest.hunks` is
+    // storage order: reconcile appends a re-identified hunk to the tail, so a
+    // file with two hunks can end up on both sides of another file's.
+    let fx = Fixture::new();
+    let mut a = String::from("fn one() {\n}\n");
+    for i in 0..9 {
+        a.push_str(&format!("// {i}\n"));
+    }
+    a.push_str("fn two() {\n}\n");
+    fx.write("a.rs", &a);
+    fx.write("b.rs", "fn b() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    cli.run(&["start", "--no-launch", "two files"]);
+
+    // Two distant hunks in a.rs, one in b.rs.
+    let shadow_a = a
+        .replace("fn one() {\n}", "fn one() {\n    one_work();\n}")
+        .replace("fn two() {\n}", "fn two() {\n    two_work();\n}");
+    std::fs::write(cli.shadow().join("a.rs"), &shadow_a).unwrap();
+    std::fs::write(cli.shadow().join("b.rs"), "fn b() {\n    more();\n}\n").unwrap();
+    cli.run(&["next", "--json"]);
+
+    // Type something in a.rs's first region that matches neither side. Its id
+    // moves, so recompute drops it and rule 6 appends the replacement behind
+    // b.rs's hunk — which is the interleaving.
+    cli.fx.write(
+        "a.rs",
+        &a.replace("fn one() {\n}", "fn one() {\n    a_third_thing();\n}"),
+    );
+    cli.run(&["next", "--json"]);
+
+    let status = stdout(&cli.run(&["status"]));
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("files:"))
+        .unwrap_or_else(|| panic!("a files line: {status}"));
+    assert_eq!(
+        line.matches("a.rs").count(),
+        1,
+        "each file once, however the queue grew: {line}"
+    );
+    assert_eq!(line.matches("b.rs").count(), 1, "{line}");
+}
+
+#[test]
 fn a_kept_divergence_is_recorded_and_never_re_offered() {
     let cli = session_with_agent_edit();
     cli.run(&["next"]);

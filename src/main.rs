@@ -1169,12 +1169,17 @@ fn cmd_status(project: &ProjectPaths) -> Result<()> {
         manifest.hunks.len()
     );
 
+    // Sorted before deduping, because `dedup` only drops *adjacent* repeats and
+    // `manifest.hunks` is storage order: reconcile appends a re-identified hunk
+    // to the tail, so typing near one file's hunk moves it behind another's and
+    // the file is listed twice.
     let mut files: Vec<&str> = manifest
         .hunks
         .iter()
         .filter(|h| h.status == Status::Pending)
         .map(|h| h.file.as_str())
         .collect();
+    files.sort_unstable();
     files.dedup();
     if !files.is_empty() {
         println!("files:  {}", files.join(", "));
