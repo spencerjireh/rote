@@ -197,6 +197,42 @@ fn binary_files_become_untypeable_hunks() {
 }
 
 #[test]
+fn a_file_that_is_not_utf8_becomes_an_untypeable_hunk() {
+    // Latin-1: no NUL byte, so the binary sniff has nothing to say about it. It
+    // still cannot be typed — and `read_lines` cannot even read it back.
+    let (_fx, _cfg, hunks) = with_agent_edits(
+        |fx| fx.write("src.rs", "fn a() {}\n"),
+        |shadow| std::fs::write(shadow.join("legacy.txt"), b"caf\xe9\nna\xefve\n").unwrap(),
+    );
+
+    assert_eq!(hunks.len(), 1);
+    let h = &hunks[0];
+    assert_eq!(h.file, "legacy.txt");
+    assert!(h.is_untypeable(), "no line arrays to type");
+    assert_eq!(
+        h.note.as_deref(),
+        Some("not valid UTF-8 — copy it across yourself"),
+        "the note names the real reason, not \"binary\""
+    );
+    assert_eq!(h.op, Op::CreateFile);
+}
+
+#[test]
+fn a_lockfile_that_is_not_utf8_still_says_what_to_run() {
+    // Both gates match; the more actionable note wins.
+    let (_fx, _cfg, hunks) = with_agent_edits(
+        |fx| fx.write("src.rs", "fn a() {}\n"),
+        |shadow| std::fs::write(shadow.join("Cargo.lock"), b"caf\xe9\n").unwrap(),
+    );
+
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(
+        hunks[0].note.as_deref(),
+        Some("generated file — run the generating command instead")
+    );
+}
+
+#[test]
 fn lockfiles_become_untypeable_hunks() {
     let (_fx, _cfg, hunks) = with_agent_edits(
         |fx| {

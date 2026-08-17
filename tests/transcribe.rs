@@ -352,6 +352,58 @@ fn a_generated_file_is_gated_on_bytes_not_typing() {
 }
 
 #[test]
+fn a_non_utf8_file_is_gated_on_bytes_and_does_not_stop_the_watcher() {
+    // Latin-1 in one file used to take the daemon down. `present::read_lines`
+    // reads the real file with `read_to_string`, which errors on these bytes, and
+    // the error propagated out of the engine's classify loop — so the process
+    // watching you type died on a file it should merely have declined to offer.
+    let fx = Fixture::new();
+    fx.write("src.rs", "fn a() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    cli.run(&["start", "--no-launch", "touch a latin-1 file"]);
+    // The agent touched both: one file the user can type, one it cannot.
+    std::fs::write(cli.shadow().join("legacy.txt"), b"caf\xe9\n").unwrap();
+    std::fs::write(cli.shadow().join("src.rs"), "fn a() {\n    typed();\n}\n").unwrap();
+
+    let text = stdout(&cli.run(&["next"]));
+    assert!(text.contains("not valid UTF-8"), "{text}");
+    assert!(text.contains("still differs from the shadow"), "{text}");
+
+    // The watcher has to run its classify loop with the undecodable file in the
+    // queue and still do its job. Recording the typed hunk is the proof it did:
+    // only the engine writes that status, so it could not be there if the loop
+    // had died. The exit status says nothing — `--timeout` exits nonzero.
+    let watcher = cli.spawn(&["watch", "--headless", "--timeout", "6000"]);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    cli.fx.write("src.rs", "fn a() {\n    typed();\n}\n");
+    let out = watcher.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("valid UTF-8"),
+        "the watcher must not try to read an undecodable file back: {err}"
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    let src = manifest["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["file"] == "src.rs")
+        .expect("a hunk for src.rs");
+    assert_eq!(
+        src["status"], "typed",
+        "the engine kept classifying: {manifest:#}"
+    );
+
+    // And copying the bytes across is what retires it.
+    std::fs::write(cli.fx.repo.join("legacy.txt"), b"caf\xe9\n").unwrap();
+    let after = stdout(&cli.run(&["next"]));
+    assert!(!after.contains("not valid UTF-8"), "{after}");
+}
+
+#[test]
 fn report_records_how_a_hunk_arrived_without_touching_its_status() {
     // The manual half of the input signal, on the path where nobody owns the
     // queue. It is also the only way a user with no editor plugin can correct
