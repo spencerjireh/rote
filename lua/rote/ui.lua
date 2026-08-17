@@ -124,7 +124,8 @@ function M.render(snap, status)
 
   local active = snap.active
   if not active then
-    local msg = snap.counts and snap.counts.total > 0
+    local msg = snap.counts
+        and snap.counts.total > 0
         and "every hunk is accounted for — `rote done` closes the session"
       or "waiting for the agent's work to land"
     set_lines(buf, { "", "  " .. msg, "" })

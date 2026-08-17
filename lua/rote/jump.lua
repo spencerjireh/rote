@@ -134,10 +134,7 @@ function M.sign(presented)
   end
   local path = vim.fn.fnamemodify(presented.real_path, ":p")
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if
-      vim.api.nvim_buf_is_loaded(buf)
-      and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":p") == path
-    then
+    if vim.api.nvim_buf_is_loaded(buf) and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":p") == path then
       local line = math.min(presented.anchor_line or 1, vim.api.nvim_buf_line_count(buf))
       pcall(vim.api.nvim_buf_set_extmark, buf, NS, math.max(line - 1, 0), 0, {
         sign_text = "▸",

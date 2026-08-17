@@ -49,10 +49,11 @@ end
 --- Turn an error code into something worth reading.
 function M.explain(code, pid)
   if code == "no_session" then
-    return "no rote session here. `rote start \"what you're working on\"`"
+    return 'no rote session here. `rote start "what you\'re working on"`'
   elseif code == "opaque_owner" then
-    return ("something owns this queue but does not serve HTTP%s — a `rote watch --local` pane does that")
-      :format(pid and (" (pid " .. pid .. ")") or "")
+    return ("something owns this queue but does not serve HTTP%s — a `rote watch --local` pane does that"):format(
+      pid and (" (pid " .. pid .. ")") or ""
+    )
   elseif code == "no_daemon" then
     return "no rote daemon running"
   end
