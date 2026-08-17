@@ -38,12 +38,22 @@ Creates `.rote.toml` in the repo root (see §7). Idempotent; refuses to overwrit
 ### `rote status`
 Prints: state, task, session age, shadow path, and if `transcribing`/`working`: files changed, hunk counts by status (pending / typed / diverged / skipped). Exit code 0 always (informational).
 
-### `rote watch [--local]`
+### `rote watch [--local] [--web] [--headless]`
 The transcription loop, and the only command in it. By default it **attaches to
 the daemon** (§13), starting one if none is running; `--local` runs the engine in
 this process instead, for debugging and for a machine where a daemon cannot
 start. Two panes attached to one daemon are ordinary; two `--local` panes are
 refused, because each would run an engine. Watches the real tree and the shadow, reclassifies on save (§6), advances the queue, and redraws a full-screen pane. There is no command between a keystroke and the queue moving.
+
+Plain `rote watch` also **falls back to a local engine** when the daemon cannot be
+started, warning first rather than failing. That is not a second engine: the pane
+takes the same token the daemon would have held, so the invariant is upheld by the
+same flock either way. `--local` remains the way to ask for it deliberately.
+
+`--web` prints a URL for the browser front end instead of taking the terminal; the
+daemon keeps watching either way. `--headless` prints frames rather than taking the
+terminal, and is inferred when stdin is not a tty — a pane in a pipe should still
+say what it sees.
 
 Refuses while the repository is mid-merge or mid-rebase: every classification would be nonsense and the pane would report it confidently.
 
@@ -87,11 +97,19 @@ Pipeline, in order; abort at any failed/declined step leaves the session in `tra
 2. Recompute. If pending hunks remain, list them and require `--force` or interactive confirmation to proceed (proceeding marks them `skipped`).
 3. Run each command in `.rote.toml [checks] commands` sequentially **in the real tree**, streaming output. Any non-zero exit stops the pipeline (override: `--no-checks`).
 4. **Reviewer Claude** (skippable with `--no-review`, or if `[review] enabled = false`): build the review payload (§8), run `claude -p <REVIEW_PROMPT>` with the payload on stdin, print the response verbatim under a "Reviewer findings" header. This invocation gets a clean temp cwd and tool restriction (§8).
-5. Interactive confirmation: "Close session? [y/N]". If any hunks are `skipped` or `diverged`, say so in the prompt — step 6 discards the agent's version of that work.
+5. Interactive confirmation: "Close session? [y/N]". If any hunks are `skipped` or `diverged`, say so in the prompt — step 6 discards the agent's version of that work. Skipped by `--force`, like step 2's: the flag means "do not ask me anything", which is the only coherent reading of one that answered a prompt in the middle of the pipeline and not the one at the end.
 6. **Archive the residue**, then sync. In order: write the current shadow-vs-real diff (everything the agent produced that never made it into the real tree) to `archive/<iso-timestamp>.patch`; archive the manifest to `archive/<iso-timestamp>.json`; sync real → shadow (user's typed version becomes the new baseline); state → `idle`. The patch is written **before** the sync, which is what destroys the shadow's copy. Same basename as the manifest so the pair is obvious.
 
-### `rote abort`
-Confirms, then: write the residue patch to `archive/<iso-timestamp>.patch` (as in `done` step 6 — abort discards strictly more agent work, so the patch matters more here), archive the manifest with terminal label `aborted`, sync real → shadow (discarding the agent's shadow work), state → `idle`. The user's real tree is untouched by definition.
+### `rote abort [--yes]`
+Confirms, then: write the residue patch to `archive/<iso-timestamp>.patch` (as in `done` step 6 — abort discards strictly more agent work, so the patch matters more here), archive the manifest with terminal label `aborted`, sync real → shadow (discarding the agent's shadow work), state → `idle`. The user's real tree is untouched by definition. `--yes` skips the confirmation, for a script and for the test suite.
+
+### `rote daemon [--foreground] [--timeout MS]`
+Hidden, and mostly not something to run by hand — `rote start` spawns one for you
+and `rote watch` starts one if none is running (§13). Without `--foreground` it
+detaches, prints the address, and returns; with it, it serves in this process,
+which is what `spawn_detached` invokes and what the tests use. `--timeout` bounds
+the run either way, so a wedged daemon fails a suite rather than outliving the
+machine.
 
 ### Global flags
 `--project <path>` (override repo discovery), `-q/--quiet`, `--no-color`.
