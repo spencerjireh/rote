@@ -1,0 +1,16 @@
+# stylua configuration for the nvim front end.
+#
+# Written to match the code rather than the other way round. stylua's defaults
+# are tabs at width 4; every Lua file here is uniformly two-space indented, so
+# taking the defaults would reformat the whole tree to no purpose.
+#
+# column_width is stylua's own default, stated rather than inherited because it
+# is the setting most likely to cause churn later: the longest line in lua/ and
+# plugin/ today is 108, so nothing wraps at 120.
+#
+# quote_style is left at the default AutoPreferDouble, which is already what the
+# code does.
+
+column_width = 120
+indent_type = "Spaces"
+indent_width = 2
