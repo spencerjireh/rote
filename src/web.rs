@@ -86,6 +86,41 @@ mod tests {
     }
 
     #[test]
+    fn the_page_does_not_decide_terminality_from_ready_state() {
+        // `EventSource` retries on its own and stays in CONNECTING while it does,
+        // so a daemon that restarted on a new port never reaches CLOSED. Reading
+        // `readyState` to tell "gone" from "blip" therefore said "blip" forever,
+        // against a dead address — the failure DESIGN §9.20 exists to prevent.
+        assert!(
+            !INDEX_HTML.contains("EventSource.CLOSED"),
+            "terminality comes from asking the daemon, not from readyState"
+        );
+    }
+
+    #[test]
+    fn the_page_re_probes_health_before_reconnecting() {
+        // `handshake` checks the status and the wire version, which is what turns
+        // a new token into a 401 and a new port into a network failure — both
+        // terminal. Reconnecting without it is what makes the loop unbounded.
+        let handler = INDEX_HTML
+            .split("addEventListener(\"error\"")
+            .nth(1)
+            .expect("an error handler on the stream");
+        assert!(
+            handler.contains("handshake()"),
+            "the error path must re-probe /health: {handler:.400}"
+        );
+        assert!(
+            handler.contains("stream.close()"),
+            "and must close rather than let the browser retry: {handler:.400}"
+        );
+        assert!(
+            INDEX_HTML.contains("RECONNECT_LIMIT"),
+            "a daemon that answers /health but keeps dropping /events is bounded too"
+        );
+    }
+
+    #[test]
     fn the_page_pins_the_wire_version_the_daemon_speaks() {
         assert!(
             INDEX_HTML.contains(&format!(
