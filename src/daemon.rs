@@ -280,7 +280,7 @@ pub fn reap(project: &ProjectPaths, terminal: Option<Terminal>) {
     // Never signal a pid we cannot prove is ours. After a `kill -9` and a
     // reboot a stale file can name a pid that now belongs to something else
     // entirely, and a tool that kills strangers is a tool nobody trusts.
-    if !ep.matches(project) {
+    if !ep.matches(project) || !holds_the_engine(project, ep.pid) {
         Endpoint::remove(project);
         return;
     }
@@ -314,6 +314,29 @@ pub fn reap(project: &ProjectPaths, terminal: Option<Terminal>) {
     Endpoint::remove(project);
     // `watch.lock` is deliberately never unlinked, per the doctrine in paths.rs:
     // removing a lock file another process may hold open is the classic race.
+}
+
+/// Is `pid` the process currently holding this project's engine token?
+///
+/// The only proof rote has that a pid is its daemon, and the reason it is the flock
+/// rather than `/health`: a wedged daemon holds the token and answers nothing (the
+/// `Owner::Opaque` case), and it must still be stoppable — `done` is about to
+/// `git clean -fdx` the shadow underneath it. Requiring a reply would have left it
+/// running, which is worse than the bug this fixes.
+///
+/// An engine holds `watch.lock` unbroken for its whole life (§13) and stamps it
+/// with its pid *after* acquiring, and nothing else writes that file — so while the
+/// flock is held the stamp names the holder. The kernel drops an flock on any death,
+/// including `kill -9`, which is exactly the recycled-pid case: the file survives,
+/// the lock does not.
+fn holds_the_engine(project: &ProjectPaths, pid: u32) -> bool {
+    match Lock::try_acquire(&project.watch_lock_path()) {
+        // Nobody holds it, so whatever that pid is now, it is not our engine.
+        Ok(Some(_guard)) => false,
+        Ok(None) => crate::lockfile::read_lock_holder(&project.watch_lock_path()) == Some(pid),
+        // Cannot tell, so do not signal.
+        Err(_) => false,
+    }
 }
 
 fn wait_for_exit(pid: u32, ceiling: Duration) -> bool {

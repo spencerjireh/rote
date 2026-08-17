@@ -152,7 +152,9 @@ fn flock_nonblocking(file: &fs::File) -> std::io::Result<bool> {
     Err(err)
 }
 
-fn read_lock_holder(path: &Path) -> Option<u32> {
+/// Which pid stamped this lock file. Advisory, and only meaningful while the flock
+/// is actually held — a holder stamps after acquiring, and nothing else writes it.
+pub fn read_lock_holder(path: &Path) -> Option<u32> {
     let bytes = fs::read(path).ok()?;
     let info: LockInfo = serde_json::from_slice(&bytes).ok()?;
     Some(info.pid)

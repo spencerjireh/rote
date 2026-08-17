@@ -6,7 +6,7 @@
 mod common;
 
 use common::cli::{stderr, stdout, Cli};
-use common::daemon::{wait_until, Daemon};
+use common::daemon::{wait_for, wait_until, Daemon};
 use common::Fixture;
 use rote::daemon::Endpoint;
 use rote::http;
@@ -805,12 +805,83 @@ fn reap_refuses_to_signal_a_pid_belonging_to_another_project() {
 
     rote::daemon::reap(&project, Some(rote::session::Terminal::Done));
 
+    // Through `try_wait`, not `pid_is_live`. A signalled child of this process
+    // becomes a zombie until it is waited on, and a zombie still answers
+    // `kill(pid, 0)` — so `pid_is_live` cannot tell "survived" from "killed a
+    // moment ago", and this assertion held either way.
     assert!(
-        rote::lockfile::pid_is_live(pid),
+        victim.try_wait().unwrap().is_none(),
         "rote must not kill a process it cannot prove is its own"
     );
     let _ = victim.kill();
     let _ = victim.wait();
+    let _ = pid;
+}
+
+#[test]
+fn reap_does_not_signal_a_recycled_pid() {
+    // The hazard §13 names, and the case the project-hash check cannot reach: the
+    // file names *this* project, so it is entirely plausible. What makes it stale
+    // is that no engine holds the token — the endpoint file survives a `kill -9`
+    // and the flock does not, which is precisely what tells the two apart.
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = victim.id();
+
+    Endpoint::new(&project, pid, 1, "deadbeef".into())
+        .write(&project)
+        .unwrap();
+
+    rote::daemon::reap(&project, Some(rote::session::Terminal::Done));
+
+    assert!(
+        victim.try_wait().unwrap().is_none(),
+        "nothing held the engine token, so that pid is a stranger"
+    );
+    let _ = victim.kill();
+    let _ = victim.wait();
+    let _ = pid;
+}
+
+#[test]
+fn reap_still_stops_an_owner_that_answers_nothing() {
+    // Why the proof is the flock and not `/health`. An owner that holds the engine
+    // token but answers no HTTP is the `Owner::Opaque` case, and it has to stay
+    // stoppable: `done` is about to `git clean -fdx` the shadow underneath it.
+    // Requiring a reply would leave it running, which is worse than the bug the
+    // guard above fixes.
+    let cli = session();
+    let project = cli.fx.project();
+    let mut owner = cli.spawn(&["watch", "--local", "--headless", "--timeout", "30000"]);
+
+    let holder = wait_for("the pane to take the engine token", || {
+        rote::lockfile::read_lock_holder(&project.watch_lock_path())
+    });
+    // An endpoint naming that pid, on a port nothing is listening to.
+    Endpoint::new(&project, holder, 1, "deadbeef".into())
+        .write(&project)
+        .unwrap();
+
+    rote::daemon::reap(&project, Some(rote::session::Terminal::Done));
+
+    // `reap` waits for the exit itself, so this returns at once. Asserted through
+    // `wait` rather than `pid_is_live`, which cannot see the difference: a signalled
+    // child of this process is a zombie until it is reaped, and a zombie still
+    // answers `kill(pid, 0)`.
+    let status = owner
+        .try_wait()
+        .unwrap()
+        .expect("the token holder must be stopped even though it never answered");
+    assert!(
+        std::os::unix::process::ExitStatusExt::signal(&status).is_some(),
+        "and stopped by a signal, not by its own timeout: {status:?}"
+    );
 }
 
 // ------------------------------------------------------------ verb routing

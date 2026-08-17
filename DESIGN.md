@@ -715,7 +715,17 @@ over HTTP first, so the daemon can broadcast `closed` with the reason — the
 reaper is the only thing that knows it, and it knows it before the archive
 exists. It escalates to SIGTERM then SIGKILL, which is safe because every write
 is an atomic rename and the kernel releases the flock. It refuses to signal a
-pid whose endpoint does not name this project: pids are recycled.
+pid whose endpoint does not name this project, **and one that is not holding the
+engine token**: the endpoint file outlives its author, so after a `kill -9` and
+enough pid churn the pid in it belongs to a stranger, and the project hash cannot
+tell — it is true by construction. The flock can. An engine holds it unbroken for
+its whole life and stamps it with its pid after acquiring, and the kernel drops it
+on any death, so a held lock naming that pid is the only proof rote has.
+
+Deliberately the flock rather than a `/health` reply. A wedged daemon holds the
+token and answers nothing — the `Opaque` case above — and it must stay stoppable,
+because `done` is about to `git clean -fdx` the shadow underneath it. Requiring a
+reply would leave it running, which is a worse failure than the one being fixed.
 
 The daemon lives until the session closes. The queue advancing while you type
 with no pane open is most of what it is for.
