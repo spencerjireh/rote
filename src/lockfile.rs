@@ -120,8 +120,10 @@ impl Lock {
 
 fn open_lock_file(path: &Path) -> Result<fs::File> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
+        // Owner-only: taking `watch.lock` is the routing check every mutating
+        // verb makes, so this is routinely the call that creates a project's
+        // state directory — the one a bearer token then lands in.
+        crate::paths::create_dir_all_owner_only(parent)?;
     }
     // Never `truncate` on open: another process may hold this open and have
     // stamped it. Truncation happens after we own the lock, in `stamp`.
@@ -179,6 +181,21 @@ pub fn pid_is_live(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn taking_a_lock_creates_an_owner_only_parent() {
+        // Taking `watch.lock` is the routing check every mutating verb makes, so
+        // this is often what creates a project's state directory — before
+        // anything has called `ensure_state_dir` to secure it.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let _held = Lock::acquire(&state.join("watch.lock")).unwrap();
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     #[test]
     fn lock_is_exclusive_while_held() {
