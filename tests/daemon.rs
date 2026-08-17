@@ -759,6 +759,33 @@ fn a_stale_endpoint_from_a_dead_daemon_is_not_believed() {
 }
 
 #[test]
+fn discover_ignores_a_port_answering_for_another_project() {
+    // The gate the hash in the *file* cannot provide, since that one is true by
+    // construction. A daemon that died frees its port and anything may take it,
+    // so only the hash in the reply proves the listener is ours.
+    let mine = session();
+    let theirs = session();
+    let project = mine.fx.project();
+    project.ensure_state_dir().unwrap();
+    let other = Daemon::start(&theirs);
+
+    // My address book, pointing at their live daemon.
+    Endpoint::new(
+        &project,
+        other.endpoint.pid,
+        other.port(),
+        other.token().into(),
+    )
+    .write(&project)
+    .unwrap();
+
+    assert!(
+        rote::daemon::discover(&project).is_none(),
+        "something answered, but not for this project"
+    );
+}
+
+#[test]
 fn reap_refuses_to_signal_a_pid_belonging_to_another_project() {
     // After a kill -9 and a reboot, a stale file can name a pid that now
     // belongs to something else entirely.

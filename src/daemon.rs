@@ -150,6 +150,28 @@ pub const REAP_WAIT: Duration = Duration::from_secs(3);
 /// caller should stop waiting on.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Ask an endpoint who it is.
+///
+/// `None` when nothing answers promptly, or when what answers is not a rote
+/// daemon. `GET /health` is answerable without touching the engine, so this
+/// cannot be blocked by a classification in flight.
+fn health_of(ep: &Endpoint) -> Option<state::Health> {
+    http::send(ep.port, &ep.token, "GET", "/health", None, PROBE_TIMEOUT)
+        .ok()
+        .filter(|r| r.is_ok())?
+        .json()
+        .ok()
+}
+
+/// Is something on this port a daemon serving *this* project?
+///
+/// The port is the weak link. A daemon that died frees it, and anything at all may
+/// take it before we look — so the hash in the reply is what closes the gap, and
+/// the hash in the *file* cannot: that one is true by construction.
+fn serves(ep: &Endpoint, project: &ProjectPaths) -> bool {
+    health_of(ep).is_some_and(|h| h.project_hash == project.hash)
+}
+
 /// Find a live daemon for this project, if there is one.
 ///
 /// Both halves matter. The endpoint file can outlive its author — a `kill -9`
@@ -161,17 +183,7 @@ pub fn discover(project: &ProjectPaths) -> Option<Endpoint> {
     if !ep.matches(project) {
         return None;
     }
-    let health: state::Health =
-        http::send(ep.port, &ep.token, "GET", "/health", None, PROBE_TIMEOUT)
-            .ok()
-            .filter(|r| r.is_ok())?
-            .json()
-            .ok()?;
-    if health.project_hash != project.hash {
-        // Something else is listening on a port we remembered.
-        return None;
-    }
-    Some(ep)
+    serves(&ep, project).then_some(ep)
 }
 
 /// Start a daemon in the background and wait until it answers.
@@ -223,10 +235,11 @@ pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
     let start = Instant::now();
     loop {
         if let Some(ep) = Endpoint::read(project).filter(|e| e.pid == pid && e.matches(project)) {
-            if http::send(ep.port, &ep.token, "GET", "/health", None, PROBE_TIMEOUT)
-                .map(|r| r.is_ok())
-                .unwrap_or(false)
-            {
+            // The same strictness `discover` uses, which is free here — the
+            // endpoint is already filtered by pid and hash — and closes the case
+            // where our child died inside the spawn window and something else
+            // took its port.
+            if serves(&ep, project) {
                 return Ok(ep);
             }
         }
