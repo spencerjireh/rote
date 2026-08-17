@@ -207,6 +207,11 @@ async function verb(command) {
 
 const activeId = () => (snapshot && snapshot.active ? snapshot.active.hunk.id : null);
 
+// The hunk waiting on a keep-or-retry answer. Not the active one: the queue
+// advances past a question rather than blocking on it (DESIGN §6), so the two are
+// usually different hunks and the daemon puts this on the wire separately.
+const questionId = () => (snapshot && snapshot.question ? snapshot.question.hunk.id : null);
+
 // The s/k/r/g bindings below (and the keydown table near the bottom) exist
 // three times, once per front end, because they are three languages: here,
 // in src/pane.rs, and in lua/rote/ui.lua. The wire protocol underneath is
@@ -214,8 +219,8 @@ const activeId = () => (snapshot && snapshot.active ? snapshot.active.hunk.id : 
 // together. Same for the counts line.
 const act = {
   skip: () => { const id = activeId(); if (id) verb({ verb: "skip", hunk_id: id }); },
-  keep: () => { const id = activeId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "keep" }); },
-  retry: () => { const id = activeId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "retry" }); },
+  keep: () => { const id = questionId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "keep" }); },
+  retry: () => { const id = questionId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "retry" }); },
   refresh: () => verb({ verb: "refresh" }),
   show: (id) => verb({ verb: "show", hunk_id: id }),
   pasted: () => { const id = activeId(); if (id) verb({ verb: "report", hunk_id: id, input: "pasted" }); },
@@ -283,23 +288,28 @@ function drawActive(p) {
   card.appendChild(pre);
   el.active.appendChild(card);
 
-  if (h.pending_divergence) {
-    const d = h.pending_divergence;
-    const q = node("div", "question");
-    q.appendChild(node("h2", null, "this differs from the proposal"));
-    const pre2 = node("pre", "body");
-    (d.actual || []).forEach((l) => pre2.appendChild(node("span", "row del", "yours: " + l)));
-    (d.proposed || []).forEach((l) => pre2.appendChild(node("span", "row add", "  its: " + l)));
-    q.appendChild(pre2);
-    const keep = node("button", "act", "keep yours (k)");
-    keep.addEventListener("click", act.keep);
-    const retry = node("button", "act", "keep typing (r)");
-    retry.addEventListener("click", act.retry);
-    q.appendChild(keep);
-    q.appendChild(document.createTextNode(" "));
-    q.appendChild(retry);
-    el.active.appendChild(q);
-  }
+}
+
+// Drawn from `snapshot.question` and after the active hunk, not from it: the queue
+// advances past a question rather than blocking on it (DESIGN §6), so this is
+// usually about a different hunk and has to name which one.
+function drawQuestion(p) {
+  if (!p || !p.hunk.pending_divergence) return;
+  const d = p.hunk.pending_divergence;
+  const q = node("div", "question");
+  q.appendChild(node("h2", null, "a question about " + p.hunk.file + ":" + p.anchor_line));
+  const pre = node("pre", "body");
+  (d.actual || []).forEach((l) => pre.appendChild(node("span", "row del", "yours: " + l)));
+  (d.proposed || []).forEach((l) => pre.appendChild(node("span", "row add", "  its: " + l)));
+  q.appendChild(pre);
+  const keep = node("button", "act", "keep yours (k)");
+  keep.addEventListener("click", act.keep);
+  const retry = node("button", "act", "keep typing (r)");
+  retry.addEventListener("click", act.retry);
+  q.appendChild(keep);
+  q.appendChild(document.createTextNode(" "));
+  q.appendChild(retry);
+  el.active.appendChild(q);
 }
 
 function drawQueue(items, active) {
@@ -326,6 +336,7 @@ function draw() {
     c.pending + " pending · " + c.typed + " typed · " + c.diverged + " diverged · " + c.skipped + " skipped";
 
   drawActive(snapshot.active);
+  drawQuestion(snapshot.question);
   drawQueue(snapshot.queue, activeId());
 
   clear(el.notices);

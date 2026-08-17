@@ -208,16 +208,29 @@ impl Manifest {
     /// the session runs; and its positional invariants are what the reconcile
     /// tests assert against. Sorting here leaves all of that untouched.
     ///
-    /// Curator rank first where it exists, then a deterministic fallback: file
+    /// An open question sorts last, ahead of everything else in the key, because
+    /// §6 says the queue "advances past it rather than blocking". It is not
+    /// terminal and it is not answered, so leaving it at the head would stop the
+    /// session on a hunk whose next move belongs to the user's judgement rather
+    /// than their typing — and there is always something else to type meanwhile.
+    /// This is also what makes `resolve` require an id: once the queue has moved
+    /// on, the hunk carrying a question is usually *not* the active one (§1).
+    ///
+    /// Then curator rank where it exists, then a deterministic fallback: file
     /// path, then position within the file. The fallback is the entire ordering
     /// when no curator has run, and the tie-break when one has. `id` last so the
     /// sort is total — two hunks can share a file and an anchor.
     pub fn queue_view(&self) -> Vec<&Hunk> {
         let mut q: Vec<&Hunk> = self.pending().collect();
         q.sort_by(|a, b| {
-            a.curator_rank
-                .unwrap_or(u32::MAX)
-                .cmp(&b.curator_rank.unwrap_or(u32::MAX))
+            a.pending_divergence
+                .is_some()
+                .cmp(&b.pending_divergence.is_some())
+                .then_with(|| {
+                    a.curator_rank
+                        .unwrap_or(u32::MAX)
+                        .cmp(&b.curator_rank.unwrap_or(u32::MAX))
+                })
                 .then_with(|| a.file.cmp(&b.file))
                 .then_with(|| a.anchor_hint.cmp(&b.anchor_hint))
                 .then_with(|| a.id.cmp(&b.id))
@@ -228,6 +241,17 @@ impl Manifest {
     /// The hunk to work on next.
     pub fn active(&self) -> Option<&Hunk> {
         self.queue_view().into_iter().next()
+    }
+
+    /// The hunk waiting on a keep-or-retry answer, if any.
+    ///
+    /// Its own accessor because it is no longer the head of the queue: the queue
+    /// moved on past it, which is the point. Queue order among several, so the
+    /// oldest-ranked question is the one offered first.
+    pub fn questioned(&self) -> Option<&Hunk> {
+        self.queue_view()
+            .into_iter()
+            .find(|h| h.pending_divergence.is_some())
     }
 }
 

@@ -1024,11 +1024,13 @@ impl Engine {
     /// which returns true for an empty region ("the state before the first
     /// keystroke") and so cannot tell started from not-started. `observe`
     /// compares the region against the baseline first and answers `Untouched`.
+    /// No `pending_divergence` clause: a hunk carrying a question is not the head
+    /// any more — `queue_view` sorts it last so the queue can move on — so pinning
+    /// on it would have frozen a hunk the user is deliberately not looking at.
     fn pinned_key(&self, m: &Manifest) -> Option<String> {
         let head = m.head_of_queue()?;
-        let engaged = m.hunks.iter().any(|h| h.status != Status::Pending)
-            || head.pending_divergence.is_some()
-            || self.head_is_touched(head);
+        let engaged =
+            m.hunks.iter().any(|h| h.status != Status::Pending) || self.head_is_touched(head);
         engaged.then(|| head.key.clone())
     }
 
@@ -1053,15 +1055,18 @@ impl Engine {
         }
         self.last_published = Some(manifest.generation);
 
-        let anchor = manifest.active().map(|h| {
+        // One resolver rather than one resolved anchor: the snapshot carries both
+        // the active hunk and the hunk with an open question, and they are usually
+        // not the same one.
+        let locate = |h: &Hunk| {
             let l = present::locate(&self.project.repo_root, h);
             (
                 l.anchor.line,
                 l.anchor.via,
                 l.real_path.to_string_lossy().into_owned(),
             )
-        });
-        let snap = state::Snapshot::build(&manifest, anchor, self.drift, notices);
+        };
+        let snap = state::Snapshot::build(&manifest, locate, self.drift, notices);
         Ok(vec![state::Event::Snapshot(Box::new(snap))])
     }
 

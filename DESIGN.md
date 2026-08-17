@@ -304,7 +304,11 @@ Re-locate the region via context matching as above, extract the lines between th
 - **A line-wise prefix of the proposal, last line allowed to be a character prefix → in progress.** No question is ever raised for it, however long the pause. A prefix cannot be a disagreement; it can only be an unfinished agreement. This is the contract that makes a watcher usable at all: without it, every keystroke-flush mid-hunk reads as a divergence.
 - Anything else → a **question**, but only after the file has been still for `watch.divergence_grace_ms` (default 2000). Any further save to that file restarts the window: it measures stillness, not time since the first mistake. The two layers are both needed — the prefix rule handles typing top to bottom, which is most transcription, and the timer handles pasting the middle or typing bottom-up, where no prefix relationship ever holds.
 
-A raised question sets `pending_divergence` and leaves the hunk `pending`; **the queue advances past it** rather than blocking. It is answered by `rote resolve` or by `k`/`r` in the pane. `keep` → status `diverged`, both versions stored in `divergence`. `retry` → withdraw the question and keep watching. Typing the proposal correctly while a question is open withdraws it too — the question is moot.
+A raised question sets `pending_divergence` and leaves the hunk `pending`; **the queue advances past it** rather than blocking. Mechanically: an open question is the first term of `queue_view`'s sort, so such a hunk sorts *last* among the pending ones — still in the queue, still answerable, no longer the head. The curator's "freeze current" pin therefore does not fire on it either; a hunk the user has deliberately been moved past is not the hunk they are looking at.
+
+It is answered by `rote resolve` or by `k`/`r` in a front end, and those keys address the questioned hunk rather than the active one — which is why `Snapshot` carries it as `question`, separately from `active`. `QueueItem.has_question` marks it in a list; answering it honestly needs the proposed and actual lines, so the whole `Presented` goes on the wire. A front end draws it alongside the hunk being typed, naming the file, because it is about something else.
+
+`keep` → status `diverged`, both versions stored in `divergence`. `retry` → withdraw the question and keep watching. Typing the proposal correctly while a question is open withdraws it too — the question is moot.
 
 ---
 

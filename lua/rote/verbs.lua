@@ -30,6 +30,16 @@ local function active_id()
   return snap and snap.active and snap.active.hunk.id or nil
 end
 
+--- The hunk waiting on a keep-or-retry answer.
+---
+--- Not `active`: the queue advances past a question rather than blocking on it
+--- (DESIGN §6), so by the time you answer one it is usually not the hunk you are
+--- typing. The daemon puts it on the wire separately for exactly this.
+local function question_id()
+  local snap = require("rote").snapshot()
+  return snap and snap.question and snap.question.hunk.id or nil
+end
+
 function M.skip(id)
   id = id or active_id()
   if not id then
@@ -39,7 +49,7 @@ function M.skip(id)
 end
 
 function M.resolve(choice, id)
-  id = id or active_id()
+  id = id or question_id()
   if not id then
     return vim.notify("rote: nothing to resolve", vim.log.levels.INFO)
   end
