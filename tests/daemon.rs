@@ -722,6 +722,46 @@ fn done_reaps_the_daemon_and_tells_it_why_before_the_shadow_is_reset() {
 }
 
 #[test]
+fn a_subscriber_that_is_behind_is_still_told_the_session_closed() {
+    // "Tell everyone before going, so a pane can say 'session closed' rather than
+    // 'the daemon vanished'" was best-effort in two ways: the terminal frame went
+    // out through the same `try_send` that drops a subscriber for being behind,
+    // and the writer threads were detached, so the process could exit with the
+    // frame still sitting in a channel.
+    //
+    // This subscribes, then reads nothing at all while the session is closed
+    // underneath it — a pane whose terminal is scrolled, or simply descheduled.
+    let cli = session();
+    cli.fx.write("b.rs", "fn b() {\n}\n");
+    cli.fx.commit_all("second file");
+    std::fs::write(cli.shadow().join("b.rs"), "fn b() {\n    more();\n}\n").unwrap();
+
+    let d = Daemon::start(&cli);
+    let mut stream = d.events();
+    wait_until("both hunks to be queued", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .map(|s| s.counts.pending == 2)
+            .unwrap_or(false)
+    });
+
+    // Not read until after `done` has been and gone.
+    let out = cli.run_with_input(&["done", "--force", "--no-checks", "--no-review"], "y\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let ev: state::Event = serde_json::from_str(&stream.next_named("closed").data).unwrap();
+    assert!(
+        matches!(
+            ev,
+            state::Event::Closed {
+                terminal: Some(rote::session::Terminal::Done)
+            }
+        ),
+        "got {ev:?}"
+    );
+}
+
+#[test]
 fn abort_reaps_with_the_reason_it_was_aborted() {
     let cli = session();
     let d = Daemon::start(&cli);
