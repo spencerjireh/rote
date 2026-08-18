@@ -140,6 +140,53 @@ fn skip_takes_a_hunk_id_and_skips_that_one() {
 }
 
 #[test]
+fn status_lists_each_file_once_however_the_queue_grew() {
+    // `dedup` alone only drops *adjacent* repeats, and `manifest.hunks` is
+    // storage order: reconcile appends a re-identified hunk to the tail, so a
+    // file with two hunks can end up on both sides of another file's.
+    let fx = Fixture::new();
+    let mut a = String::from("fn one() {\n}\n");
+    for i in 0..9 {
+        a.push_str(&format!("// {i}\n"));
+    }
+    a.push_str("fn two() {\n}\n");
+    fx.write("a.rs", &a);
+    fx.write("b.rs", "fn b() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    cli.run(&["start", "--no-launch", "two files"]);
+
+    // Two distant hunks in a.rs, one in b.rs.
+    let shadow_a = a
+        .replace("fn one() {\n}", "fn one() {\n    one_work();\n}")
+        .replace("fn two() {\n}", "fn two() {\n    two_work();\n}");
+    std::fs::write(cli.shadow().join("a.rs"), &shadow_a).unwrap();
+    std::fs::write(cli.shadow().join("b.rs"), "fn b() {\n    more();\n}\n").unwrap();
+    cli.run(&["next", "--json"]);
+
+    // Type something in a.rs's first region that matches neither side. Its id
+    // moves, so recompute drops it and rule 6 appends the replacement behind
+    // b.rs's hunk — which is the interleaving.
+    cli.fx.write(
+        "a.rs",
+        &a.replace("fn one() {\n}", "fn one() {\n    a_third_thing();\n}"),
+    );
+    cli.run(&["next", "--json"]);
+
+    let status = stdout(&cli.run(&["status"]));
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("files:"))
+        .unwrap_or_else(|| panic!("a files line: {status}"));
+    assert_eq!(
+        line.matches("a.rs").count(),
+        1,
+        "each file once, however the queue grew: {line}"
+    );
+    assert_eq!(line.matches("b.rs").count(), 1, "{line}");
+}
+
+#[test]
 fn a_kept_divergence_is_recorded_and_never_re_offered() {
     let cli = session_with_agent_edit();
     cli.run(&["next"]);
@@ -302,6 +349,105 @@ fn a_generated_file_is_gated_on_bytes_not_typing() {
     );
     let after = stdout(&cli.run(&["next"]));
     assert!(after.contains("nothing to transcribe"), "{after}");
+}
+
+#[test]
+fn a_crlf_file_can_be_typed_under_strict_whitespace() {
+    // The parser used to drop every line's trailing `\r` while the disk side kept
+    // it, so the two sides of the comparison could only agree under the trailing
+    // whitespace tolerance. `strict_whitespace = true` removes that tolerance —
+    // and with it, any way for a CRLF file to ever be typed.
+    let fx = Fixture::new();
+    fx.write("crlf.rs", "fn a() {\r\n}\r\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    cli.write_project_config("strict_whitespace = true\n");
+    cli.run(&["start", "--no-launch", "edit a crlf file"]);
+    std::fs::write(
+        cli.shadow().join("crlf.rs"),
+        "fn a() {\r\n    work();\r\n}\r\n",
+    )
+    .unwrap();
+
+    let watcher = cli.spawn(&["watch", "--headless", "--timeout", "6000"]);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    cli.fx.write("crlf.rs", "fn a() {\r\n    work();\r\n}\r\n");
+    let _ = watcher.wait_with_output();
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    let h = &manifest["hunks"].as_array().unwrap()[0];
+    assert_eq!(
+        h["status"], "typed",
+        "typing the proposal exactly must classify: {manifest:#}"
+    );
+    assert!(
+        h["pending_divergence"].is_null(),
+        "and must not be a question: {manifest:#}"
+    );
+}
+
+#[test]
+fn a_non_utf8_file_is_gated_on_bytes_and_does_not_stop_the_watcher() {
+    // Latin-1 in one file used to take the daemon down. `present::read_lines`
+    // reads the real file with `read_to_string`, which errors on these bytes, and
+    // the error propagated out of the engine's classify loop — so the process
+    // watching you type died on a file it should merely have declined to offer.
+    let fx = Fixture::new();
+    fx.write("src.rs", "fn a() {\n}\n");
+    fx.commit_all("initial");
+    let cli = Cli::with_fixture(fx);
+    cli.run(&["start", "--no-launch", "touch a latin-1 file"]);
+    // The agent touched both: one file the user can type, one it cannot.
+    std::fs::write(cli.shadow().join("legacy.txt"), b"caf\xe9\n").unwrap();
+    std::fs::write(cli.shadow().join("src.rs"), "fn a() {\n    typed();\n}\n").unwrap();
+
+    let text = stdout(&cli.run(&["next"]));
+    assert!(text.contains("not valid UTF-8"), "{text}");
+    assert!(text.contains("still differs from the shadow"), "{text}");
+
+    // The watcher has to run its classify loop with the undecodable file in the
+    // queue and still do its job. Recording the typed hunk is the proof it did:
+    // only the engine writes that status, so it could not be there if the loop
+    // had died. The exit status says nothing — `--timeout` exits nonzero.
+    let watcher = cli.spawn(&["watch", "--headless", "--timeout", "6000"]);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    cli.fx.write("src.rs", "fn a() {\n    typed();\n}\n");
+    let out = watcher.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("valid UTF-8"),
+        "the watcher must not try to read an undecodable file back: {err}"
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    let src = manifest["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["file"] == "src.rs")
+        .expect("a hunk for src.rs");
+    assert_eq!(
+        src["status"], "typed",
+        "the engine kept classifying: {manifest:#}"
+    );
+
+    // And copying the bytes across is what retires it. Polled, because the daemon
+    // `watch` left running is what answers `next` now, and it reports the view it
+    // has published rather than re-diffing on demand — so this arrives when its
+    // watcher gets to the write, not before.
+    std::fs::write(cli.fx.repo.join("legacy.txt"), b"caf\xe9\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        last = stdout(&cli.run(&["next"]));
+        if !last.contains("not valid UTF-8") {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    panic!("the byte-gated hunk never retired: {last}");
 }
 
 #[test]

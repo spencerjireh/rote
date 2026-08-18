@@ -281,6 +281,30 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     write_atomic_mode(path, contents, 0o644)
 }
 
+/// `create_dir_all`, owner-only.
+///
+/// Every directory rote makes for itself is one of its own — a project's state
+/// directory, its `archive/`, or `~/.config/rote` — and the first of those holds
+/// a bearer token. `ensure_state_dir` sets 0700 on the state directory, but only
+/// when it is what runs first, and it is not: `Lock::try_acquire` on `watch.lock`
+/// is the routing check every mutating verb makes (DESIGN.md §13), and a manifest
+/// write can equally get there first. A guarantee that depends on which caller
+/// arrives first is not one, so it is made here, where the directories are
+/// actually created.
+///
+/// `DirBuilder::mode` is masked *down* by umask and never up, so this can only
+/// ever be tighter than what the bare call produced. Nothing rote writes through
+/// these helpers lands in the real tree — `.rote.toml` is written directly, and
+/// `assert_not_in_real_tree` guards the rest.
+pub(crate) fn create_dir_all_owner_only(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))
+}
+
 /// `write_atomic`, with the permissions set before the file has any content.
 ///
 /// The mode is applied at creation rather than afterwards, so the contents are
@@ -294,7 +318,7 @@ pub fn write_atomic_mode(path: &Path, contents: &[u8], mode: u32) -> Result<()> 
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
+    create_dir_all_owner_only(parent)?;
     let tmp = parent.join(format!(
         ".{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy()
@@ -459,6 +483,27 @@ mod tests {
             fs::metadata(&q).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+
+    #[test]
+    fn a_written_file_gets_an_owner_only_parent_at_every_level() {
+        // The mode must not depend on whether `ensure_state_dir` happened to run
+        // first. A 0644 manifest is enough to create the directory a 0600 token
+        // lands in later, so the directory is what has to be right here.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("state/archive");
+
+        write_atomic(&deep.join("1970.json"), b"{}").unwrap();
+
+        for level in [dir.path().join("state"), deep] {
+            assert_eq!(
+                fs::metadata(&level).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} must be owner-only",
+                level.display()
+            );
+        }
     }
 
     #[test]

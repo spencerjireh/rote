@@ -176,9 +176,18 @@ function M.render(snap, status)
     virt(buf, 0, { { { hunk.curator_note, "Comment" } } })
   end
 
-  if hunk.pending_divergence then
-    local d = hunk.pending_divergence
-    local block = { { { "", "Normal" } }, { { "you typed:", "WarningMsg" } } }
+  -- From `snap.question`, not from the hunk on screen. The queue advances past a
+  -- question rather than blocking on it (DESIGN §6), so what `k` and `r` answer is
+  -- usually a different hunk from the one being typed — and a block that did not
+  -- say which would be asking about the wrong thing.
+  local q = snap.question
+  if q and q.hunk and q.hunk.pending_divergence then
+    local d = q.hunk.pending_divergence
+    local block = {
+      { { "", "Normal" } },
+      { { ("a question about %s:%d"):format(q.hunk.file, q.anchor_line or 1), "WarningMsg" } },
+      { { "you typed:", "WarningMsg" } },
+    }
     for _, l in ipairs(d.actual or {}) do
       table.insert(block, { { "  " .. l, "DiffDelete" } })
     end

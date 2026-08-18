@@ -150,6 +150,28 @@ pub const REAP_WAIT: Duration = Duration::from_secs(3);
 /// caller should stop waiting on.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Ask an endpoint who it is.
+///
+/// `None` when nothing answers promptly, or when what answers is not a rote
+/// daemon. `GET /health` is answerable without touching the engine, so this
+/// cannot be blocked by a classification in flight.
+fn health_of(ep: &Endpoint) -> Option<state::Health> {
+    http::send(ep.port, &ep.token, "GET", "/health", None, PROBE_TIMEOUT)
+        .ok()
+        .filter(|r| r.is_ok())?
+        .json()
+        .ok()
+}
+
+/// Is something on this port a daemon serving *this* project?
+///
+/// The port is the weak link. A daemon that died frees it, and anything at all may
+/// take it before we look — so the hash in the reply is what closes the gap, and
+/// the hash in the *file* cannot: that one is true by construction.
+fn serves(ep: &Endpoint, project: &ProjectPaths) -> bool {
+    health_of(ep).is_some_and(|h| h.project_hash == project.hash)
+}
+
 /// Find a live daemon for this project, if there is one.
 ///
 /// Both halves matter. The endpoint file can outlive its author — a `kill -9`
@@ -161,17 +183,7 @@ pub fn discover(project: &ProjectPaths) -> Option<Endpoint> {
     if !ep.matches(project) {
         return None;
     }
-    let health: state::Health =
-        http::send(ep.port, &ep.token, "GET", "/health", None, PROBE_TIMEOUT)
-            .ok()
-            .filter(|r| r.is_ok())?
-            .json()
-            .ok()?;
-    if health.project_hash != project.hash {
-        // Something else is listening on a port we remembered.
-        return None;
-    }
-    Some(ep)
+    serves(&ep, project).then_some(ep)
 }
 
 /// Start a daemon in the background and wait until it answers.
@@ -180,7 +192,7 @@ pub fn discover(project: &ProjectPaths) -> Option<Endpoint> {
 /// that it shares claude's session, and the SIGHUP when that pty closes takes
 /// the daemon with it — which is precisely when the user is most likely to
 /// still be typing.
-pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
+pub fn spawn_detached(project: &ProjectPaths, opts: ServeOptions) -> Result<Endpoint> {
     use std::os::unix::process::CommandExt as _;
 
     project.ensure_state_dir()?;
@@ -200,6 +212,10 @@ pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
+    // Forwarded so `--timeout` means the same thing whichever mode asked for it.
+    if let Some(ms) = opts.timeout_ms {
+        cmd.arg("--timeout").arg(ms.to_string());
+    }
 
     // Safety: `setsid` is async-signal-safe and is on the POSIX list of calls
     // permitted between fork and exec.
@@ -223,10 +239,11 @@ pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
     let start = Instant::now();
     loop {
         if let Some(ep) = Endpoint::read(project).filter(|e| e.pid == pid && e.matches(project)) {
-            if http::send(ep.port, &ep.token, "GET", "/health", None, PROBE_TIMEOUT)
-                .map(|r| r.is_ok())
-                .unwrap_or(false)
-            {
+            // The same strictness `discover` uses, which is free here — the
+            // endpoint is already filtered by pid and hash — and closes the case
+            // where our child died inside the spawn window and something else
+            // took its port.
+            if serves(&ep, project) {
                 return Ok(ep);
             }
         }
@@ -248,7 +265,7 @@ pub fn spawn_detached(project: &ProjectPaths) -> Result<Endpoint> {
 pub fn ensure_running(project: &ProjectPaths) -> Result<Endpoint> {
     match discover(project) {
         Some(ep) => Ok(ep),
-        None => spawn_detached(project),
+        None => spawn_detached(project, ServeOptions::default()),
     }
 }
 
@@ -267,7 +284,7 @@ pub fn reap(project: &ProjectPaths, terminal: Option<Terminal>) {
     // Never signal a pid we cannot prove is ours. After a `kill -9` and a
     // reboot a stale file can name a pid that now belongs to something else
     // entirely, and a tool that kills strangers is a tool nobody trusts.
-    if !ep.matches(project) {
+    if !ep.matches(project) || !holds_the_engine(project, ep.pid) {
         Endpoint::remove(project);
         return;
     }
@@ -301,6 +318,29 @@ pub fn reap(project: &ProjectPaths, terminal: Option<Terminal>) {
     Endpoint::remove(project);
     // `watch.lock` is deliberately never unlinked, per the doctrine in paths.rs:
     // removing a lock file another process may hold open is the classic race.
+}
+
+/// Is `pid` the process currently holding this project's engine token?
+///
+/// The only proof rote has that a pid is its daemon, and the reason it is the flock
+/// rather than `/health`: a wedged daemon holds the token and answers nothing (the
+/// `Owner::Opaque` case), and it must still be stoppable — `done` is about to
+/// `git clean -fdx` the shadow underneath it. Requiring a reply would have left it
+/// running, which is worse than the bug this fixes.
+///
+/// An engine holds `watch.lock` unbroken for its whole life (§13) and stamps it
+/// with its pid *after* acquiring, and nothing else writes that file — so while the
+/// flock is held the stamp names the holder. The kernel drops an flock on any death,
+/// including `kill -9`, which is exactly the recycled-pid case: the file survives,
+/// the lock does not.
+fn holds_the_engine(project: &ProjectPaths, pid: u32) -> bool {
+    match Lock::try_acquire(&project.watch_lock_path()) {
+        // Nobody holds it, so whatever that pid is now, it is not our engine.
+        Ok(Some(_guard)) => false,
+        Ok(None) => crate::lockfile::read_lock_holder(&project.watch_lock_path()) == Some(pid),
+        // Cannot tell, so do not signal.
+        Err(_) => false,
+    }
 }
 
 fn wait_for_exit(pid: u32, ceiling: Duration) -> bool {
@@ -414,20 +454,35 @@ pub fn apply(ep: &Endpoint, command: state::Command) -> Result<Applied> {
     }
 }
 
+/// How long to wait for a daemon that is listening but has not published yet.
+///
+/// `/state` answers 503 `warming_up` between binding the port and the engine's
+/// first snapshot. A CLI verb that has just called `ensure_running` lands in that
+/// window routinely, and failing there would mean "I started a daemon for you and
+/// then could not talk to it".
+const READY_WAIT: Duration = Duration::from_secs(2);
+
 /// Ask the daemon what the world looks like.
 pub fn fetch_state(ep: &Endpoint) -> Result<state::Snapshot> {
-    let reply = http::send(
-        ep.port,
-        &ep.token,
-        "GET",
-        "/state",
-        None,
-        http::CLIENT_TIMEOUT,
-    )?;
-    if !reply.is_ok() {
-        anyhow::bail!("the rote daemon is not ready (status {})", reply.status);
+    let start = Instant::now();
+    loop {
+        let reply = http::send(
+            ep.port,
+            &ep.token,
+            "GET",
+            "/state",
+            None,
+            http::CLIENT_TIMEOUT,
+        )?;
+        if reply.is_ok() {
+            return reply.json();
+        }
+        // 503 is "not yet", anything else is "no".
+        if reply.status != 503 || start.elapsed() >= READY_WAIT {
+            anyhow::bail!("the rote daemon is not ready (status {})", reply.status);
+        }
+        std::thread::sleep(SPAWN_POLL);
     }
-    reply.json()
 }
 
 /// The error for "something owns the queue but will not talk to us".

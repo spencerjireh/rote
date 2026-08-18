@@ -6,7 +6,7 @@
 mod common;
 
 use common::cli::{stderr, stdout, Cli};
-use common::daemon::{wait_until, Daemon};
+use common::daemon::{wait_for, wait_until, Daemon};
 use common::Fixture;
 use rote::daemon::Endpoint;
 use rote::http;
@@ -424,6 +424,43 @@ fn a_post_must_be_json_and_must_not_be_enormous() {
 // ------------------------------------------------------------ GET /events
 
 #[test]
+fn the_stream_takes_its_token_either_way() {
+    // The nvim plugin writes its own request line over a raw socket, so it sends
+    // the header — a secret in a request line is what proxies and access logs
+    // record. The query spelling stays for the two clients that cannot set a
+    // header at all: an `EventSource` and a browser address bar (§13).
+    let cli = session();
+    let d = Daemon::start(&cli);
+
+    let status = |auth_line: &str, query: &str| -> u16 {
+        use std::io::{BufReader, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", d.port())).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let req = format!(
+            "GET /events{query} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{auth_line}\
+             Connection: close\r\n\r\n",
+            d.port()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut r = BufReader::new(s);
+        rote::http::read_head(&mut r).unwrap().0
+    };
+
+    // Exactly the request `lua/rote/stream.lua` builds.
+    assert_eq!(
+        status(&format!("Authorization: Bearer {}\r\n", d.token()), ""),
+        200,
+        "the header spelling, which the plugin uses"
+    );
+    assert_eq!(
+        status("", &format!("?token={}", d.token())),
+        200,
+        "the query spelling, which a browser needs"
+    );
+    assert_eq!(status("", ""), 401, "and neither is not enough");
+}
+
+#[test]
 fn a_small_event_reaches_the_client_immediately() {
     // The regression test for the chunked-buffer trap. tiny_http's chunked path
     // is Encoder::new + io::copy: the encoder buffers 8 KiB, io::copy never
@@ -610,6 +647,31 @@ fn start_leaves_a_daemon_watching_in_the_background() {
 }
 
 #[test]
+fn daemon_without_foreground_detaches_and_returns() {
+    // `foreground` was destructured and thrown away, so `rote daemon` always
+    // served inline — while `spawn_detached` invokes `rote daemon --foreground`,
+    // which is the evidence the flag always meant this.
+    let cli = session();
+    let project = cli.fx.project();
+
+    let out = cli.run(&["daemon", "--timeout", "30000"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("rote daemon listening on http://127.0.0.1:"),
+        "{}",
+        stdout(&out)
+    );
+
+    let ep = wait_for("the detached daemon to answer", || {
+        rote::daemon::discover(&project)
+    });
+    assert_ne!(ep.pid, std::process::id(), "it is not this process");
+
+    // Cleaned up the way anything else would: through the session ending.
+    assert!(cli.run(&["abort", "--yes"]).status.success());
+}
+
+#[test]
 fn no_launch_does_not_spawn_a_daemon() {
     // Every existing test uses `--no-launch`. Spawning there would leak a
     // background process into the whole suite.
@@ -722,6 +784,33 @@ fn a_stale_endpoint_from_a_dead_daemon_is_not_believed() {
 }
 
 #[test]
+fn discover_ignores_a_port_answering_for_another_project() {
+    // The gate the hash in the *file* cannot provide, since that one is true by
+    // construction. A daemon that died frees its port and anything may take it,
+    // so only the hash in the reply proves the listener is ours.
+    let mine = session();
+    let theirs = session();
+    let project = mine.fx.project();
+    project.ensure_state_dir().unwrap();
+    let other = Daemon::start(&theirs);
+
+    // My address book, pointing at their live daemon.
+    Endpoint::new(
+        &project,
+        other.endpoint.pid,
+        other.port(),
+        other.token().into(),
+    )
+    .write(&project)
+    .unwrap();
+
+    assert!(
+        rote::daemon::discover(&project).is_none(),
+        "something answered, but not for this project"
+    );
+}
+
+#[test]
 fn reap_refuses_to_signal_a_pid_belonging_to_another_project() {
     // After a kill -9 and a reboot, a stale file can name a pid that now
     // belongs to something else entirely.
@@ -741,12 +830,83 @@ fn reap_refuses_to_signal_a_pid_belonging_to_another_project() {
 
     rote::daemon::reap(&project, Some(rote::session::Terminal::Done));
 
+    // Through `try_wait`, not `pid_is_live`. A signalled child of this process
+    // becomes a zombie until it is waited on, and a zombie still answers
+    // `kill(pid, 0)` — so `pid_is_live` cannot tell "survived" from "killed a
+    // moment ago", and this assertion held either way.
     assert!(
-        rote::lockfile::pid_is_live(pid),
+        victim.try_wait().unwrap().is_none(),
         "rote must not kill a process it cannot prove is its own"
     );
     let _ = victim.kill();
     let _ = victim.wait();
+    let _ = pid;
+}
+
+#[test]
+fn reap_does_not_signal_a_recycled_pid() {
+    // The hazard §13 names, and the case the project-hash check cannot reach: the
+    // file names *this* project, so it is entirely plausible. What makes it stale
+    // is that no engine holds the token — the endpoint file survives a `kill -9`
+    // and the flock does not, which is precisely what tells the two apart.
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = victim.id();
+
+    Endpoint::new(&project, pid, 1, "deadbeef".into())
+        .write(&project)
+        .unwrap();
+
+    rote::daemon::reap(&project, Some(rote::session::Terminal::Done));
+
+    assert!(
+        victim.try_wait().unwrap().is_none(),
+        "nothing held the engine token, so that pid is a stranger"
+    );
+    let _ = victim.kill();
+    let _ = victim.wait();
+    let _ = pid;
+}
+
+#[test]
+fn reap_still_stops_an_owner_that_answers_nothing() {
+    // Why the proof is the flock and not `/health`. An owner that holds the engine
+    // token but answers no HTTP is the `Owner::Opaque` case, and it has to stay
+    // stoppable: `done` is about to `git clean -fdx` the shadow underneath it.
+    // Requiring a reply would leave it running, which is worse than the bug the
+    // guard above fixes.
+    let cli = session();
+    let project = cli.fx.project();
+    let mut owner = cli.spawn(&["watch", "--local", "--headless", "--timeout", "30000"]);
+
+    let holder = wait_for("the pane to take the engine token", || {
+        rote::lockfile::read_lock_holder(&project.watch_lock_path())
+    });
+    // An endpoint naming that pid, on a port nothing is listening to.
+    Endpoint::new(&project, holder, 1, "deadbeef".into())
+        .write(&project)
+        .unwrap();
+
+    rote::daemon::reap(&project, Some(rote::session::Terminal::Done));
+
+    // `reap` waits for the exit itself, so this returns at once. Asserted through
+    // `wait` rather than `pid_is_live`, which cannot see the difference: a signalled
+    // child of this process is a zombie until it is reaped, and a zombie still
+    // answers `kill(pid, 0)`.
+    let status = owner
+        .try_wait()
+        .unwrap()
+        .expect("the token holder must be stopped even though it never answered");
+    assert!(
+        std::os::unix::process::ExitStatusExt::signal(&status).is_some(),
+        "and stopped by a signal, not by its own timeout: {status:?}"
+    );
 }
 
 // ------------------------------------------------------------ verb routing
@@ -797,6 +957,150 @@ fn a_verb_refuses_when_something_owns_the_queue_but_answers_nothing() {
         .expect("the token should be free");
 
     let out = cli.run(&["skip"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("owns this project's queue") && err.contains("not answering"),
+        "{err}"
+    );
+}
+
+/// The on-disk generation, which a bypassing writer moves and the daemon does not
+/// learn about — nothing under the state directory reaches the watcher.
+fn disk_generation(cli: &Cli) -> u64 {
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    m["generation"].as_u64().unwrap()
+}
+
+#[test]
+fn next_routes_its_write_through_the_daemon() {
+    // It called `with_session_recomputed` directly: a second recompute racing the
+    // engine's, and a `last_presented` write behind its back (§13). `last_presented`
+    // is not on the wire, so what proves the routing is that the engine *published*
+    // the write — a direct writer moves the file and leaves `/state` behind.
+    let cli = session();
+    let d = Daemon::start(&cli);
+    let engines_view: state::Snapshot = d.get("/state").json().unwrap();
+    let id = engines_view.active.expect("an active hunk").hunk.id;
+
+    let out = cli.run(&["next"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("+     work();"), "{}", stdout(&out));
+
+    let after: state::Snapshot = d.get("/state").json().unwrap();
+    assert_eq!(
+        after.generation,
+        disk_generation(&cli),
+        "the engine and the file must agree: a write it did not make leaves it behind"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cli.fx.project().session_json()).unwrap()).unwrap();
+    assert_eq!(manifest["last_presented"], id, "and the write did land");
+
+    // Which is also what makes `show` with no id work afterwards.
+    let shown = stdout(&cli.run(&["show"]));
+    assert!(shown.contains("+     work();"), "{shown}");
+}
+
+#[test]
+fn done_skips_pending_hunks_through_the_daemon() {
+    // The bulk skip wrote every pending hunk to `Skipped` with `with_session`,
+    // while the daemon was alive — `reap` is at step 6, below every early return.
+    // A subscriber seeing the skips is what proves they went through the engine.
+    let cli = session();
+    cli.fx.write("b.rs", "fn b() {\n}\n");
+    cli.fx.commit_all("second file");
+    std::fs::write(cli.shadow().join("b.rs"), "fn b() {\n    more();\n}\n").unwrap();
+
+    let d = Daemon::start(&cli);
+    let mut stream = d.events();
+    wait_until("both hunks to be queued", || {
+        d.get("/state")
+            .json::<state::Snapshot>()
+            .map(|s| s.counts.pending == 2)
+            .unwrap_or(false)
+    });
+
+    let out = cli.run_with_input(&["done", "--force", "--no-checks", "--no-review"], "y\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // Read to the end of the stream, tracking the most the engine ever published.
+    let mut high_water = 0;
+    while let Some(f) = stream.next_any() {
+        match f.event.as_deref() {
+            Some("snapshot") => {
+                let s: state::Snapshot = serde_json::from_str(&f.data).unwrap();
+                high_water = high_water.max(s.counts.skipped);
+            }
+            Some("closed") => {
+                let ev: state::Event = serde_json::from_str(&f.data).unwrap();
+                assert!(
+                    matches!(
+                        ev,
+                        state::Event::Closed {
+                            terminal: Some(rote::session::Terminal::Done)
+                        }
+                    ),
+                    "the reap must still happen, and still carry the reason: {ev:?}"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        high_water, 2,
+        "both skips must reach a subscriber, or they went around the engine"
+    );
+
+    // And the archive records them, which is what `done` is for.
+    let manifest = std::fs::read_dir(cli.fx.project().archive_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.extension().is_some_and(|x| x == "json") && !p.to_string_lossy().contains("curator")
+        })
+        .expect("an archived manifest");
+    let m: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+    let skipped = m["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|h| h["status"] == "skipped")
+        .count();
+    assert_eq!(skipped, 2, "{m:#}");
+}
+
+#[test]
+fn done_refuses_when_something_owns_the_queue_but_answers_nothing() {
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+    let _held = rote::lockfile::Lock::try_acquire(&project.watch_lock_path())
+        .unwrap()
+        .expect("the token should be free");
+
+    let out = cli.run_with_input(&["done", "--no-checks", "--no-review"], "y\ny\n");
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("owns this project's queue") && err.contains("not answering"),
+        "{err}"
+    );
+}
+
+#[test]
+fn next_refuses_when_something_owns_the_queue_but_answers_nothing() {
+    let cli = session();
+    let project = cli.fx.project();
+    project.ensure_state_dir().unwrap();
+    let _held = rote::lockfile::Lock::try_acquire(&project.watch_lock_path())
+        .unwrap()
+        .expect("the token should be free");
+
+    let out = cli.run(&["next"]);
     assert!(!out.status.success());
     let err = stderr(&out);
     assert!(

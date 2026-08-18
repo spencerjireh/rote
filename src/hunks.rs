@@ -560,6 +560,14 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0)
 }
 
+/// Whether the whole file decodes as UTF-8.
+///
+/// Every byte, not a sniff like `looks_binary`: what rests on this is
+/// `read_to_string` succeeding on the real file, and that reads all of it.
+fn is_utf8(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok()
+}
+
 /// An untypeable hunk: shown as a path and a note, gated on byte equality.
 fn untypeable_hunk(file: &str, real_exists: bool, shadow_exists: bool, note: &str) -> Hunk {
     let op = match (real_exists, shadow_exists) {
@@ -603,6 +611,14 @@ pub fn compute_hunks(project: &ProjectPaths, cfg: &Config) -> Result<Vec<Hunk>> 
         let shadow_exists = c.right_exists();
         let is_binary = c.left.as_deref().map(looks_binary).unwrap_or(false)
             || c.right.as_deref().map(looks_binary).unwrap_or(false);
+        // Text that is not UTF-8 is untypeable for the same reason binary is —
+        // there is no line-wise proposal a human could type — and for a harder
+        // one. `present::read_lines` reads the real file with `read_to_string`,
+        // which *errors* on these bytes rather than mangling them, and that error
+        // propagates out of the engine's classify loop and takes the daemon with
+        // it. One Latin-1 file was enough to stop the thing watching you type.
+        let is_text = c.left.as_deref().map(is_utf8).unwrap_or(true)
+            && c.right.as_deref().map(is_utf8).unwrap_or(true);
 
         if is_binary {
             out.push(untypeable_hunk(
@@ -619,6 +635,19 @@ pub fn compute_hunks(project: &ProjectPaths, cfg: &Config) -> Result<Vec<Hunk>> 
                 real_exists,
                 shadow_exists,
                 "generated file — run the generating command instead",
+            ));
+            continue;
+        }
+        // After `verbatim`, so a lockfile that also fails to decode still gets the
+        // note that tells you what to run. Before the diff, which is the point:
+        // `diffparse` would turn these bytes into U+FFFD and hash the result into
+        // the hunk's id.
+        if !is_text {
+            out.push(untypeable_hunk(
+                &rel_str,
+                real_exists,
+                shadow_exists,
+                "not valid UTF-8 — copy it across yourself",
             ));
             continue;
         }
@@ -1122,6 +1151,22 @@ mod tests {
     fn binary_sniffing_uses_nul_bytes() {
         assert!(looks_binary(b"abc\0def"));
         assert!(!looks_binary(b"plain text\nwith newlines\n"));
+    }
+
+    #[test]
+    fn utf8_is_checked_over_the_whole_file() {
+        assert!(
+            is_utf8("caf\u{e9}\n".as_bytes()),
+            "the same text encoded well"
+        );
+        // Latin-1: no NUL, so `looks_binary` says nothing, and this is the gate
+        // that has to catch it.
+        assert!(!is_utf8(b"caf\xe9\n"));
+        assert!(!looks_binary(b"caf\xe9\n"));
+        // Past the sniff window, where a prefix check would have given up.
+        let mut late = vec![b'a'; BINARY_SNIFF_BYTES + 16];
+        late.push(0xff);
+        assert!(!is_utf8(&late));
     }
 
     // ------------------------------------------------------------ how it came

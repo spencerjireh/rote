@@ -365,16 +365,26 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Daemon {
-            foreground: _,
+            foreground,
             timeout,
         } => {
-            daemon::serve(
-                &project,
-                &cfg,
-                daemon::ServeOptions {
-                    timeout_ms: timeout,
-                },
-            )?;
+            let opts = daemon::ServeOptions {
+                timeout_ms: timeout,
+            };
+            if foreground {
+                daemon::serve(&project, &cfg, opts)?;
+            } else {
+                // What `rote start` does implicitly, available explicitly. The
+                // child is spawned with `--foreground`, so there is no recursion.
+                let ep = daemon::spawn_detached(&project, opts)?;
+                if !cli.quiet {
+                    println!(
+                        "rote daemon listening on {} (pid {})",
+                        ep.base_url(),
+                        ep.pid
+                    );
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Skip { hunk_id } => {
@@ -439,35 +449,83 @@ fn cmd_done(
     // 1. Refuse mid-operation, before anything expensive runs.
     shadow::ensure_no_operation_in_progress(project)?;
 
-    // 2. Recompute under the lock; then release it before prompting. A
-    // confirmation waits on a human, and no lock is ever held across that.
-    let pending = session::with_session_recomputed(project, cfg, |m, report| {
-        for w in &report.warnings {
-            eprintln!("warning: {w}");
+    // 2. Ask whoever owns the queue what is still pending; then let go before
+    // prompting, because a confirmation waits on a human and no lock is ever held
+    // across that.
+    //
+    // Routed like every other mutation (§13). The daemon is alive right through
+    // here — `reap` is at step 6, below every early return, so that "left the
+    // session open" never takes it down — and recomputing here ourselves would be
+    // a second engine for as long as this runs.
+    //
+    // Under a daemon nothing forces a recompute, and that loses nothing: its
+    // classifier has already marked correctly typed hunks `Typed`, which is a
+    // better answer than a bare recompute merely dropping them under rule 5.
+    let pending: Vec<(String, String)> = match daemon::owner(project)? {
+        daemon::Owner::Daemon(ep) => daemon::fetch_state(&ep)?
+            .queue
+            .iter()
+            .map(|q| (q.id.clone(), format!("  {}:{}", q.file, q.anchor_hint)))
+            .collect(),
+        daemon::Owner::Nobody(_guard) => {
+            session::with_session_recomputed(project, cfg, |m, report| {
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
+                Ok(m.pending()
+                    .map(|h| (h.id.clone(), format!("  {}:{}", h.file, h.anchor_hint)))
+                    .collect::<Vec<_>>())
+            })?
         }
-        Ok(m.pending()
-            .map(|h| format!("  {}:{}", h.file, h.anchor_hint))
-            .collect::<Vec<String>>())
-    })?;
+        daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
+    };
 
     if !pending.is_empty() {
         println!("{} hunk(s) still pending:", pending.len());
-        for p in &pending {
-            println!("{p}");
+        for (_, line) in &pending {
+            println!("{line}");
         }
         if !force && !confirm("close anyway, marking them skipped? [y/N] ")? {
             println!("left the session open. `rote watch` continues.");
             return Ok(());
         }
-        session::with_session(project, |m| {
-            let ids: Vec<String> = m.pending().map(|h| h.id.clone()).collect();
-            for id in ids {
-                if let Some(h) = m.find_mut(&id) {
-                    h.status = Status::Skipped;
+        // One `skip` per hunk rather than a bulk verb. Each has to disarm the
+        // watchdog and retake the baseline too, which is engine-private state — a
+        // bulk variant would have to reimplement that inside the engine to be
+        // correct, and would buy nothing: there is no atomicity to protect with
+        // `reap` and `archive_and_clear` next, and the extra snapshots go to panes
+        // about to be told the session closed.
+        match daemon::owner(project)? {
+            daemon::Owner::Daemon(ep) => {
+                for (id, _) in &pending {
+                    let command = rote::state::Command::Skip {
+                        hunk_id: id.clone(),
+                    };
+                    match daemon::apply(&ep, command)? {
+                        daemon::Applied::Yes => {}
+                        // It left the queue between the listing and here — typed,
+                        // or reworked away. Nothing left to skip either way.
+                        daemon::Applied::Rejected {
+                            cause: Some(rote::state::Cause::NoSuchHunk),
+                            ..
+                        } => {}
+                        daemon::Applied::Rejected { reason, .. } => bail!("{reason} ({id})"),
+                    }
                 }
             }
-            Ok(())
-        })?;
+            daemon::Owner::Nobody(_guard) => {
+                session::with_session(project, |m| {
+                    let ids: Vec<String> = m.pending().map(|h| h.id.clone()).collect();
+                    for id in ids {
+                        if let Some(h) = m.find_mut(&id) {
+                            h.status = Status::Skipped;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
+        }
     }
 
     // Re-read once the mutations above have landed. Everything from here is
@@ -635,24 +693,70 @@ fn cmd_watch(project: &ProjectPaths, cfg: &Config, local: bool, opts: pane::Opti
     }
 }
 
-/// Recompute, then print the hunk at the head of the queue.
+/// Print the hunk at the head of the queue.
 ///
 /// A printer, not a step in the loop. `rote watch` is what advances the queue;
 /// this exists so a plain shell, a script, or a `--json` consumer can see what
 /// is outstanding without a pane. It classifies nothing and launches nothing.
+///
+/// Routed, because it writes: `last_presented` is what `rote show` with no id
+/// re-prints, and it used to recompute and save straight past a live engine
+/// (§13). Under a daemon it reads the engine's published view and asks the engine
+/// to record what it showed. It deliberately does *not* force a recompute — the
+/// engine does that on save, on any unknown-file change, and at least every floor
+/// sweep, and forcing one is the only part of this that would need the engine's
+/// permission. Asking what it currently thinks does not, and its answer is the
+/// authoritative one anyway: it carries `drift`, curator order, and an anchor
+/// resolved against the real file, all of which the CLI would otherwise re-derive
+/// and could disagree about.
 fn cmd_next(project: &ProjectPaths, cfg: &Config, json: bool, color: bool) -> Result<()> {
-    let picked = session::with_session_recomputed(project, cfg, |m, report| {
-        for w in &report.warnings {
-            eprintln!("warning: {w}");
+    // §1: "Errors if state is idle." A precondition, read before anything else —
+    // but the routing decision still comes before any mutation.
+    Manifest::require(project)?;
+
+    let picked = match daemon::owner(project)? {
+        daemon::Owner::Daemon(ep) => {
+            let snapshot = daemon::fetch_state(&ep)?;
+            match snapshot.active {
+                None => None,
+                Some(p) => {
+                    // The same write the local arm makes, made by the engine so
+                    // its private view cannot end up disagreeing with the file.
+                    let command = rote::state::Command::Show {
+                        hunk_id: Some(p.hunk.id.clone()),
+                    };
+                    match daemon::apply(&ep, command)? {
+                        daemon::Applied::Yes => {}
+                        // It left the queue between the fetch and the show. The
+                        // hunk is still worth printing; nothing is worth failing.
+                        daemon::Applied::Rejected {
+                            cause: Some(rote::state::Cause::NoSuchHunk),
+                            ..
+                        } => {}
+                        daemon::Applied::Rejected { reason, .. } => {
+                            bail!("{reason} ({})", p.hunk.id)
+                        }
+                    }
+                    Some((p.hunk, p.position, p.total))
+                }
+            }
         }
-        let Some(hunk) = m.active().cloned() else {
-            return Ok(None);
-        };
-        let position = m.queue_position(&hunk.id).unwrap_or(1);
-        let total = m.pending().count();
-        m.last_presented = Some(hunk.id.clone());
-        Ok(Some((hunk, position, total)))
-    })?;
+        daemon::Owner::Nobody(_guard) => {
+            session::with_session_recomputed(project, cfg, |m, report| {
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
+                let Some(hunk) = m.active().cloned() else {
+                    return Ok(None);
+                };
+                let position = m.queue_position(&hunk.id).unwrap_or(1);
+                let total = m.pending().count();
+                m.last_presented = Some(hunk.id.clone());
+                Ok(Some((hunk, position, total)))
+            })?
+        }
+        daemon::Owner::Opaque { pid } => return Err(daemon::opaque_owner_error(project, pid)),
+    };
 
     let Some((hunk, position, total)) = picked else {
         println!("nothing to transcribe.");
@@ -1169,12 +1273,17 @@ fn cmd_status(project: &ProjectPaths) -> Result<()> {
         manifest.hunks.len()
     );
 
+    // Sorted before deduping, because `dedup` only drops *adjacent* repeats and
+    // `manifest.hunks` is storage order: reconcile appends a re-identified hunk
+    // to the tail, so typing near one file's hunk moves it behind another's and
+    // the file is listed twice.
     let mut files: Vec<&str> = manifest
         .hunks
         .iter()
         .filter(|h| h.status == Status::Pending)
         .map(|h| h.file.as_str())
         .collect();
+    files.sort_unstable();
     files.dedup();
     if !files.is_empty() {
         println!("files:  {}", files.join(", "));

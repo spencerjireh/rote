@@ -807,7 +807,16 @@ impl Engine {
             }
             state::Command::Show { hunk_id } => {
                 let Some(id) = hunk_id.clone() else {
-                    return Ok(state::Outcome::Applied);
+                    // Nothing to write, but §12 says the generation is checked
+                    // whenever it is present, and returning `Applied` here told a
+                    // client that had fallen behind that its verb had landed.
+                    // Through `mutate` with `Decision::Nothing`, which already
+                    // means exactly this: reported as applied, no write, no bump.
+                    let (out, _) = self.mutate(want, |_m| Ok(Decision::<()>::Nothing))?;
+                    return Ok(match out {
+                        Mutated::Applied(()) => state::Outcome::Applied,
+                        Mutated::Refused(o) => o,
+                    });
                 };
                 let (out, _) = self.mutate(want, |m| {
                     if m.find(&id).is_none() {
@@ -842,9 +851,23 @@ impl Engine {
                     Mutated::Refused(o) => o,
                 })
             }
+            // The one verb that ignores `want`, deliberately. It asserts nothing
+            // about the queue's contents, so there is nothing for a generation to
+            // be stale against — and the pane sends every command with the
+            // generation it is looking at while `g` maps to this, so checking it
+            // would refuse the client that has fallen behind the one verb that
+            // fixes that, exactly when it is pressed.
             state::Command::Refresh => {
                 self.recompute = Pending::At(now);
                 self.last_recompute = None;
+                // Republish even if the recompute finds nothing. `refresh` is a
+                // client saying "I think I am out of sync" — answering it with a
+                // heartbeat because the queue happens to be unchanged tells it
+                // nothing, and the hub drops heartbeats rather than fanning them
+                // out. It is also the only way a subscriber that has gone away
+                // gets pruned on an otherwise idle session: pruning happens on a
+                // failed send, so it needs a frame to actually go out.
+                self.last_published = None;
                 Ok(state::Outcome::Applied)
             }
         }
@@ -1001,11 +1024,13 @@ impl Engine {
     /// which returns true for an empty region ("the state before the first
     /// keystroke") and so cannot tell started from not-started. `observe`
     /// compares the region against the baseline first and answers `Untouched`.
+    /// No `pending_divergence` clause: a hunk carrying a question is not the head
+    /// any more — `queue_view` sorts it last so the queue can move on — so pinning
+    /// on it would have frozen a hunk the user is deliberately not looking at.
     fn pinned_key(&self, m: &Manifest) -> Option<String> {
         let head = m.head_of_queue()?;
-        let engaged = m.hunks.iter().any(|h| h.status != Status::Pending)
-            || head.pending_divergence.is_some()
-            || self.head_is_touched(head);
+        let engaged =
+            m.hunks.iter().any(|h| h.status != Status::Pending) || self.head_is_touched(head);
         engaged.then(|| head.key.clone())
     }
 
@@ -1030,15 +1055,18 @@ impl Engine {
         }
         self.last_published = Some(manifest.generation);
 
-        let anchor = manifest.active().map(|h| {
+        // One resolver rather than one resolved anchor: the snapshot carries both
+        // the active hunk and the hunk with an open question, and they are usually
+        // not the same one.
+        let locate = |h: &Hunk| {
             let l = present::locate(&self.project.repo_root, h);
             (
                 l.anchor.line,
                 l.anchor.via,
                 l.real_path.to_string_lossy().into_owned(),
             )
-        });
-        let snap = state::Snapshot::build(&manifest, anchor, self.drift, notices);
+        };
+        let snap = state::Snapshot::build(&manifest, locate, self.drift, notices);
         Ok(vec![state::Event::Snapshot(Box::new(snap))])
     }
 

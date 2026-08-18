@@ -415,31 +415,33 @@ pub fn editor_command(cfg_editor: &str) -> Vec<String> {
     spec.split_whitespace().map(String::from).collect()
 }
 
-/// Open the editor on a hunk and wait. Returns false if it exited nonzero,
-/// which is treated as "untouched" (DESIGN.md §9.6).
-pub fn launch_editor(
-    editor: &[String],
-    file: &Path,
-    line: usize,
-    is_new_file: bool,
-) -> Result<bool> {
+/// Open the editor on a hunk and wait.
+///
+/// `<editor> +<line> <path>`, exactly as DESIGN.md §6 specifies, and the exit
+/// status is ignored — rote is not waiting on the editor to decide anything, so
+/// there is nothing to return. The `Err` is the editor failing to launch at all,
+/// which the pane reports without going down: a machine with no editor is fully
+/// usable.
+///
+/// `+LINE` goes on unconditionally, including for `create_file`, whose
+/// `anchor_hint` is fixed at 1 for exactly this. Suppressing it there was aimed
+/// at not conjuring the file into existence, but it is the path argument that
+/// would do that, and an editor opening a missing path makes a buffer rather than
+/// a file.
+pub fn launch_editor(editor: &[String], file: &Path, line: usize) -> Result<()> {
     let (program, base_args) = editor.split_first().context("editor command is empty")?;
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(base_args);
-    // A create_file hunk must not have the file conjured up by the invocation;
-    // the user creates it as they type.
-    if !is_new_file {
-        cmd.arg(format!("+{line}"));
-    }
-    cmd.arg(file);
-
-    let status = cmd.status().with_context(|| {
-        format!(
-            "cannot launch editor `{}`.\nSet ROTE_EDITOR or `editor` in ~/.config/rote/config.toml.",
-            editor.join(" ")
-        )
-    })?;
-    Ok(status.success())
+    std::process::Command::new(program)
+        .args(base_args)
+        .arg(format!("+{line}"))
+        .arg(file)
+        .status()
+        .with_context(|| {
+            format!(
+                "cannot launch editor `{}`.\nSet ROTE_EDITOR or `editor` in ~/.config/rote/config.toml.",
+                editor.join(" ")
+            )
+        })?;
+    Ok(())
 }
 
 /// Split file contents into lines, dropping a single trailing newline's empty
@@ -794,6 +796,53 @@ mod tests {
         assert_eq!(editor_command("nvim"), vec!["my-editor", "--wait"]);
         std::env::remove_var("ROTE_EDITOR");
         assert_eq!(editor_command("hx"), vec!["hx"]);
+    }
+
+    #[test]
+    fn the_editor_is_opened_at_the_line_even_for_a_new_file() {
+        // `+LINE` was suppressed for `create_file`, to avoid conjuring the file
+        // into existence — but the path argument is what would do that, and
+        // `anchor_hint` is fixed at 1 for exactly this case (DESIGN.md §4).
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let stub = dir.path().join("fake-editor");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let editor = vec![stub.to_string_lossy().into_owned()];
+        let target = dir.path().join("does-not-exist-yet.rs");
+        launch_editor(&editor, &target, 1).unwrap();
+
+        let argv: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(argv, vec!["+1".to_string(), target.display().to_string()]);
+        assert!(
+            !target.exists(),
+            "and the file is still the user's to create"
+        );
+    }
+
+    #[test]
+    fn a_missing_editor_is_an_error_that_names_the_way_out() {
+        // The pane turns this into a notice rather than exiting; what it needs
+        // from here is a message that says what to set.
+        let err = launch_editor(
+            &["rote-no-such-editor-anywhere".to_string()],
+            std::path::Path::new("/tmp/x"),
+            1,
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("ROTE_EDITOR"), "{text}");
+        assert!(text.contains("config.toml"), "{text}");
     }
 
     #[test]

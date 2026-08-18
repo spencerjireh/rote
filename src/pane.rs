@@ -218,10 +218,21 @@ pub fn render_frame(snap: &Snapshot, color: bool) -> String {
             // The jump target, on its own line and in the conventional form, so
             // a terminal that linkifies `file:line` can act on it.
             out.push_str(&format!("{}:{}\n", p.hunk.file, p.anchor_line));
-            if let Some(d) = &p.hunk.pending_divergence {
-                out.push('\n');
-                out.push_str(&present::render_divergence(&d.proposed, &d.actual, color));
-            }
+        }
+    }
+
+    // The open question, drawn after the hunk you are typing rather than instead
+    // of it: the queue has moved on past it (§6), so it is a second thing on
+    // screen and it has to name itself — `k` and `r` answer *this*, not what is
+    // above it.
+    if let Some(q) = &snap.question {
+        if let Some(d) = &q.hunk.pending_divergence {
+            out.push('\n');
+            out.push_str(&format!(
+                "a question about {}:{} ({})\n",
+                q.hunk.file, q.anchor_line, q.hunk.id
+            ));
+            out.push_str(&present::render_divergence(&d.proposed, &d.actual, color));
         }
     }
 
@@ -240,12 +251,7 @@ pub fn render_frame(snap: &Snapshot, color: bool) -> String {
 }
 
 fn footer(snap: &Snapshot) -> String {
-    let asking = snap
-        .active
-        .as_ref()
-        .map(|p| p.hunk.pending_divergence.is_some())
-        .unwrap_or(false);
-    if asking {
+    if snap.question.is_some() {
         // Keep and retry are offered only when there is something to answer;
         // a footer that always lists them teaches the wrong model of the tool.
         "[k]eep mine  [r]etry  [s]kip  [o]pen  [q]uit\n".to_string()
@@ -345,22 +351,29 @@ pub fn run_local(project: &ProjectPaths, cfg: &Config, opts: Options) -> Result<
                 match key {
                     Key::Quit => return Ok(()),
                     Key::Open => {
-                        if let Some(p) = snapshot.as_ref().and_then(|s| s.active.as_ref()) {
+                        // Copied out first, so the borrow of `snapshot` is over
+                        // before the failure path needs to write into it.
+                        let target = snapshot
+                            .as_ref()
+                            .and_then(|s| s.active.as_ref())
+                            .map(|p| (std::path::PathBuf::from(&p.real_path), p.anchor_line));
+                        if let Some((path, line)) = target {
                             let editor = present::editor_command(&cfg.editor);
-                            let path = std::path::PathBuf::from(&p.real_path);
-                            let line = p.anchor_line;
-                            let is_new = p.hunk.op == crate::hunks::Op::CreateFile;
                             // Events queue up while the editor has the terminal,
                             // so the user comes back to a hunk that has already
                             // been classified.
                             let r = screen.suspended(|| {
-                                raw.suspended(|| {
-                                    present::launch_editor(&editor, &path, line, is_new)
-                                })
+                                raw.suspended(|| present::launch_editor(&editor, &path, line))
                             });
-                            // The exit status is meaningless now: rote is not
-                            // waiting on the editor to decide anything.
-                            r?;
+                            // An editor that will not launch is a notice, not the
+                            // end of the pane: a machine with no editor is fully
+                            // usable (DESIGN.md §6), and the message already says
+                            // which two settings fix it.
+                            if let Err(e) = r {
+                                if let Some(s) = &mut snapshot {
+                                    s.notices = vec![state::Notice::warn(format!("{e:#}"))];
+                                }
+                            }
                             last_frame.clear(); // force a repaint
                         }
                     }
@@ -392,21 +405,25 @@ pub fn run_local(project: &ProjectPaths, cfg: &Config, opts: Options) -> Result<
 }
 
 /// Which verb a key means, given what is on screen.
+///
+/// `s` addresses the active hunk; `k` and `r` address the one carrying an open
+/// question, which since §6 has the queue advance past a question is usually not
+/// the same hunk. Answering with no question open is a stray press, and doing
+/// nothing is the right response to one.
 fn command_for(key: Key, snap: Option<&Snapshot>) -> Option<state::Command> {
-    let active = snap?.active.as_ref()?;
-    let id = active.hunk.id.clone();
+    let snap = snap?;
+    let resolve = |choice| {
+        Some(state::Command::Resolve {
+            hunk_id: snap.question.as_ref()?.hunk.id.clone(),
+            choice,
+        })
+    };
     match key {
-        Key::Skip => Some(state::Command::Skip { hunk_id: id }),
-        // Answering is only meaningful while a question is open; otherwise the
-        // key is a stray press and doing nothing is the correct response.
-        Key::Keep if active.hunk.pending_divergence.is_some() => Some(state::Command::Resolve {
-            hunk_id: id,
-            choice: state::Resolution::Keep,
+        Key::Skip => Some(state::Command::Skip {
+            hunk_id: snap.active.as_ref()?.hunk.id.clone(),
         }),
-        Key::Retry if active.hunk.pending_divergence.is_some() => Some(state::Command::Resolve {
-            hunk_id: id,
-            choice: state::Resolution::Retry,
-        }),
+        Key::Keep => resolve(state::Resolution::Keep),
+        Key::Retry => resolve(state::Resolution::Retry),
         Key::Refresh => Some(state::Command::Refresh),
         _ => None,
     }
@@ -539,17 +556,24 @@ pub fn run_client(
                 match key {
                     Key::Quit => return Ok(()),
                     Key::Open => {
-                        if let Some(p) = snapshot.as_ref().and_then(|s| s.active.as_ref()) {
+                        // Same as `run_local`: copied out before the editor runs,
+                        // and a launch failure is a notice rather than an exit. A
+                        // pane that survives this on one path and dies on the
+                        // other would be worse than either.
+                        let target = snapshot
+                            .as_ref()
+                            .and_then(|s| s.active.as_ref())
+                            .map(|p| (std::path::PathBuf::from(&p.real_path), p.anchor_line));
+                        if let Some((path, line)) = target {
                             let editor = present::editor_command(&cfg.editor);
-                            let path = std::path::PathBuf::from(&p.real_path);
-                            let line = p.anchor_line;
-                            let is_new = p.hunk.op == crate::hunks::Op::CreateFile;
                             let r = screen.suspended(|| {
-                                raw.suspended(|| {
-                                    present::launch_editor(&editor, &path, line, is_new)
-                                })
+                                raw.suspended(|| present::launch_editor(&editor, &path, line))
                             });
-                            r?;
+                            if let Err(e) = r {
+                                if let Some(s) = &mut snapshot {
+                                    s.notices = vec![state::Notice::warn(format!("{e:#}"))];
+                                }
+                            }
                             last_frame.clear();
                         }
                     }
@@ -678,8 +702,35 @@ mod tests {
                 real_path: "/repo/src/posts.py".into(),
             }),
             queue,
+            question: None,
             notices: vec![],
         }
+    }
+
+    /// A snapshot whose open question is on a *different* hunk from the active
+    /// one, which is the ordinary case once the queue advances past it (§6).
+    fn snap_asking(active: Hunk, asked: Hunk) -> Snapshot {
+        let mut s = snap(Some(active));
+        s.question = Some(Presented {
+            hunk: asked,
+            position: 7,
+            total: 11,
+            anchor_line: 12,
+            anchor_via: AnchorVia::ContextBefore,
+            real_path: "/repo/src/other.py".into(),
+        });
+        s
+    }
+
+    fn asked_hunk() -> Hunk {
+        let mut h = hunk();
+        h.id = "h-asked".into();
+        h.file = "src/other.py".into();
+        h.pending_divergence = Some(Divergence {
+            proposed: vec!["    tags = TagManager()".into()],
+            actual: vec!["    tags = TaggableManager()".into()],
+        });
+        h
     }
 
     #[test]
@@ -705,16 +756,40 @@ mod tests {
         let quiet = render_frame(&snap(Some(hunk())), false);
         assert!(!quiet.contains("[k]eep"), "no question, no answer: {quiet}");
 
-        let mut asked = hunk();
-        asked.pending_divergence = Some(Divergence {
-            proposed: vec!["    tags = TagManager()".into()],
-            actual: vec!["    tags = TaggableManager()".into()],
-        });
-        let f = render_frame(&snap(Some(asked)), false);
+        let f = render_frame(&snap_asking(hunk(), asked_hunk()), false);
         assert!(f.contains("[k]eep mine"), "{f}");
         assert!(f.contains("[r]etry"), "{f}");
         assert!(f.contains("your version differs"), "{f}");
         assert!(f.contains("TaggableManager"), "{f}");
+    }
+
+    #[test]
+    fn a_question_names_the_hunk_it_is_about() {
+        // The queue has moved on past it, so the block is about something other
+        // than what is being typed above it, and has to say which.
+        let f = render_frame(&snap_asking(hunk(), asked_hunk()), false);
+        assert!(f.contains("a question about src/other.py:12"), "{f}");
+        // The hunk on screen is still the one to type, and still drawn.
+        assert!(f.contains("hunk 3/11"), "{f}");
+        assert!(f.contains("src/posts.py:48"), "{f}");
+    }
+
+    #[test]
+    fn answering_addresses_the_question_not_the_active_hunk() {
+        let s = snap_asking(hunk(), asked_hunk());
+        for key in [Key::Keep, Key::Retry] {
+            match command_for(key, Some(&s)) {
+                Some(state::Command::Resolve { hunk_id, .. }) => {
+                    assert_eq!(hunk_id, "h-asked", "{key:?} must answer the question")
+                }
+                other => panic!("{key:?} gave {other:?}"),
+            }
+        }
+        // While skip still addresses what you are looking at.
+        match command_for(Key::Skip, Some(&s)) {
+            Some(state::Command::Skip { hunk_id }) => assert_eq!(hunk_id, "h-one"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -12,10 +12,11 @@
 //! and already cross the `--json` seam. A second set of view types would be two
 //! schemas to keep in agreement forever, and they would disagree.
 //!
-//! Nothing here does I/O. `Snapshot::build` takes the anchor rather than
-//! resolving it, because resolving one means reading the real file — and the
-//! whole point of putting `anchor_line` on the wire is that a client never has
-//! to.
+//! Nothing here does I/O. `Snapshot::build` is handed the means of resolving an
+//! anchor rather than resolving one itself, because resolving means reading the
+//! real file — and the whole point of putting `anchor_line` on the wire is that a
+//! client never has to. It needs more than one now: the active hunk and the hunk
+//! carrying an open question are usually different (§6), and both go on the wire.
 
 use crate::hunks::{Hunk, Op, Status};
 use crate::present::AnchorVia;
@@ -40,6 +41,18 @@ pub struct Snapshot {
     pub active: Option<Presented>,
     /// Pending hunks in queue order. Summaries only — see `QueueItem`.
     pub queue: Vec<QueueItem>,
+    /// The hunk waiting on a keep-or-retry answer, if any.
+    ///
+    /// Separate from `active` because §6 has the queue advance past a question
+    /// rather than block on it, so the two are usually different hunks — and a
+    /// front end has to render this one to ask the question honestly. `QueueItem`
+    /// carries only `has_question`, which is enough to mark it in a list and not
+    /// enough to show what was proposed against what was typed.
+    ///
+    /// Optional and omitted when unset, so this is additive: `WIRE_VERSION` is
+    /// unchanged, and a client written against the old shape still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<Presented>,
     pub notices: Vec<Notice>,
 }
 
@@ -247,7 +260,13 @@ pub enum Command {
         hunk_id: String,
         input: Reported,
     },
-    /// Force a full recompute.
+    /// Force a full recompute, and a republished snapshot even if it finds
+    /// nothing — the sender is saying it thinks it is out of sync.
+    ///
+    /// The one verb whose `generation` is *not* checked. It asserts nothing about
+    /// the queue's contents, so there is nothing to be stale against, and
+    /// refusing it would deny the client that has fallen behind the verb that
+    /// recovers from exactly that.
     Refresh,
 }
 
@@ -256,7 +275,8 @@ pub struct Request {
     pub wire_version: u32,
     /// The generation the client was looking at. Checked only when present: a
     /// client that does not care about races may omit it, but one answering a
-    /// question about a hunk that has since been reworked must not.
+    /// question about a hunk that has since been reworked must not. `refresh` is
+    /// the one verb that ignores it even when present — see `Command::Refresh`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     #[serde(flatten)]
@@ -338,7 +358,7 @@ impl Snapshot {
     /// file, and this function is pure so that it can be tested without one.
     pub fn build(
         manifest: &Manifest,
-        anchor: Option<(usize, AnchorVia, String)>,
+        locate: impl Fn(&Hunk) -> (usize, AnchorVia, String),
         drift: bool,
         notices: Vec<Notice>,
     ) -> Self {
@@ -357,17 +377,21 @@ impl Snapshot {
             .collect();
 
         let total = queue.len();
-        let active = manifest.active().and_then(|h| {
-            let (anchor_line, anchor_via, real_path) = anchor?;
-            Some(Presented {
+        let present = |h: &Hunk| {
+            let (anchor_line, anchor_via, real_path) = locate(h);
+            Presented {
                 position: manifest.queue_position(&h.id).unwrap_or(1),
                 total,
                 hunk: h.clone(),
                 anchor_line,
                 anchor_via,
                 real_path,
-            })
-        });
+            }
+        };
+        let active = manifest.active().map(&present);
+        // Usually a different hunk from `active`, and often the whole reason a
+        // front end has anything to ask about.
+        let question = manifest.questioned().map(&present);
 
         Self {
             wire_version: WIRE_VERSION,
@@ -384,6 +408,7 @@ impl Snapshot {
             },
             active,
             queue,
+            question,
             notices,
         }
     }
@@ -574,10 +599,15 @@ mod tests {
             },
             active: None,
             queue: vec![],
+            question: None,
             notices: vec![Notice::info("hello")],
         };
         let text = serde_json::to_string(&snap).unwrap();
         assert_eq!(serde_json::from_str::<Snapshot>(&text).unwrap(), snap);
+        assert!(
+            !text.contains("question"),
+            "optional and omitted when unset, so this stays additive: {text}"
+        );
 
         let ev = Event::Snapshot(Box::new(snap));
         let text = serde_json::to_string(&ev).unwrap();

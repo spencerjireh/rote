@@ -7,9 +7,12 @@
 -- no assumption about what is on PATH.
 --
 -- Nothing here writes. Every mutation shells out to `rote` (see verbs.lua),
--- which already routes correctly through the engine-token check — so the plugin
--- never has to hold a token, construct a JSON body, or reason about the
--- staleness generation.
+-- which already routes to whoever holds the engine lock — so the plugin never
+-- has to construct a JSON body or reason about the staleness generation.
+--
+-- It does hold the bearer token, from `rote endpoint --json`: reading the stream
+-- needs one, and there is no way to attach without it. So it is sent the way
+-- every other authorized client sends it, as a header.
 
 local endpoint = require("rote.endpoint")
 
@@ -114,11 +117,15 @@ function Stream:_open(ep)
         self:_retry()
       end)
     end
-    -- The query token, because that is the path a browser has to use and
-    -- there is no reason for two spellings.
+    -- The header, not `?token=`. §13 admits the query spelling on `/events` and
+    -- `/` for the two clients that have no choice — an `EventSource` and a
+    -- browser address bar cannot set a header. This is a raw socket writing its
+    -- own request line, so it can, and a secret in a request line is the one
+    -- place worth avoiding: it is what proxies and access logs record.
     local req = table.concat({
-      "GET /events?token=" .. ep.token .. " HTTP/1.1\r\n",
+      "GET /events HTTP/1.1\r\n",
       "Host: 127.0.0.1:" .. ep.port .. "\r\n",
+      "Authorization: Bearer " .. ep.token .. "\r\n",
       "Connection: close\r\n\r\n",
     })
     sock:write(req)

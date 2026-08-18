@@ -406,6 +406,87 @@ fn a_declined_cycle_does_not_rewrite_the_session_file() {
 }
 
 #[test]
+fn a_recompute_that_finds_nothing_does_not_rewrite_the_session_file() {
+    // The engine calls this on every debounced recompute *and* on the 30-second
+    // floor sweep, and it used to bump and save unconditionally — so a session
+    // where nothing at all was happening invalidated every subscriber's snapshot
+    // twice a minute.
+    let (fx, cfg, mut manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+    // Settle first: the queue is built, so a second pass has nothing to find.
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+    manifest.save(&project).unwrap();
+
+    let path = project.session_json();
+    let before_bytes = std::fs::read(&path).unwrap();
+    let before_gen = Manifest::load(&project).unwrap().unwrap().generation;
+
+    let seen = session::with_session_recomputed(&project, &cfg, |m, report| {
+        Ok((m.pending().count(), report.added, report.dropped))
+    })
+    .unwrap();
+
+    assert_eq!(seen, (1, 0, 0), "it looked, and found the queue unchanged");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before_bytes,
+        "byte-identical: a read must not rewrite the file"
+    );
+    assert_eq!(
+        Manifest::load(&project).unwrap().unwrap().generation,
+        before_gen
+    );
+}
+
+#[test]
+fn a_recompute_that_finds_work_still_bumps_exactly_once() {
+    let (fx, cfg, manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+    manifest.save(&project).unwrap();
+    let before = Manifest::load(&project).unwrap().unwrap().generation;
+
+    // The first pass discovers the agent's hunk, so it writes.
+    let added = session::with_session_recomputed(&project, &cfg, |_m, r| Ok(r.added)).unwrap();
+    assert_eq!(added, 1);
+    assert_eq!(
+        Manifest::load(&project).unwrap().unwrap().generation,
+        before + 1,
+        "once, not twice"
+    );
+}
+
+#[test]
+fn a_recompute_that_only_warns_about_drift_writes_nothing() {
+    // `drift` and `warnings` are observations about the trees, not writes. This is
+    // the case an `added > 0 || dropped > 0` test would have got right by accident
+    // and a `report.is_empty()` test would have got wrong: the report is non-empty
+    // and the manifest still did not move.
+    let (fx, cfg, mut manifest) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+    session::recompute(&mut manifest, &project, &cfg).unwrap();
+    manifest.save(&project).unwrap();
+
+    // Move HEAD under the session.
+    fx.write("unrelated.txt", "x\n");
+    fx.commit_all("the repository moves on");
+
+    let path = project.session_json();
+    let before_bytes = std::fs::read(&path).unwrap();
+
+    let drift = session::with_session_recomputed(&project, &cfg, |_m, r| Ok(r.drift)).unwrap();
+
+    assert!(drift, "the drift is real and reported");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before_bytes,
+        "and saying so is not a reason to rewrite the file"
+    );
+}
+
+#[test]
 fn a_failed_commit_does_not_invalidate_a_clients_generation() {
     // The reason this matters in practice. The engine's compare-and-swap misses
     // whenever the agent reworked a region between classification and commit;

@@ -38,12 +38,22 @@ Creates `.rote.toml` in the repo root (see §7). Idempotent; refuses to overwrit
 ### `rote status`
 Prints: state, task, session age, shadow path, and if `transcribing`/`working`: files changed, hunk counts by status (pending / typed / diverged / skipped). Exit code 0 always (informational).
 
-### `rote watch [--local]`
+### `rote watch [--local] [--web] [--headless]`
 The transcription loop, and the only command in it. By default it **attaches to
 the daemon** (§13), starting one if none is running; `--local` runs the engine in
 this process instead, for debugging and for a machine where a daemon cannot
 start. Two panes attached to one daemon are ordinary; two `--local` panes are
 refused, because each would run an engine. Watches the real tree and the shadow, reclassifies on save (§6), advances the queue, and redraws a full-screen pane. There is no command between a keystroke and the queue moving.
+
+Plain `rote watch` also **falls back to a local engine** when the daemon cannot be
+started, warning first rather than failing. That is not a second engine: the pane
+takes the same token the daemon would have held, so the invariant is upheld by the
+same flock either way. `--local` remains the way to ask for it deliberately.
+
+`--web` prints a URL for the browser front end instead of taking the terminal; the
+daemon keeps watching either way. `--headless` prints frames rather than taking the
+terminal, and is inferred when stdin is not a tty — a pane in a pipe should still
+say what it sees.
 
 Refuses while the repository is mid-merge or mid-rebase: every classification would be nonsense and the pane would report it confidently.
 
@@ -87,11 +97,19 @@ Pipeline, in order; abort at any failed/declined step leaves the session in `tra
 2. Recompute. If pending hunks remain, list them and require `--force` or interactive confirmation to proceed (proceeding marks them `skipped`).
 3. Run each command in `.rote.toml [checks] commands` sequentially **in the real tree**, streaming output. Any non-zero exit stops the pipeline (override: `--no-checks`).
 4. **Reviewer Claude** (skippable with `--no-review`, or if `[review] enabled = false`): build the review payload (§8), run `claude -p <REVIEW_PROMPT>` with the payload on stdin, print the response verbatim under a "Reviewer findings" header. This invocation gets a clean temp cwd and tool restriction (§8).
-5. Interactive confirmation: "Close session? [y/N]". If any hunks are `skipped` or `diverged`, say so in the prompt — step 6 discards the agent's version of that work.
+5. Interactive confirmation: "Close session? [y/N]". If any hunks are `skipped` or `diverged`, say so in the prompt — step 6 discards the agent's version of that work. Skipped by `--force`, like step 2's: the flag means "do not ask me anything", which is the only coherent reading of one that answered a prompt in the middle of the pipeline and not the one at the end.
 6. **Archive the residue**, then sync. In order: write the current shadow-vs-real diff (everything the agent produced that never made it into the real tree) to `archive/<iso-timestamp>.patch`; archive the manifest to `archive/<iso-timestamp>.json`; sync real → shadow (user's typed version becomes the new baseline); state → `idle`. The patch is written **before** the sync, which is what destroys the shadow's copy. Same basename as the manifest so the pair is obvious.
 
-### `rote abort`
-Confirms, then: write the residue patch to `archive/<iso-timestamp>.patch` (as in `done` step 6 — abort discards strictly more agent work, so the patch matters more here), archive the manifest with terminal label `aborted`, sync real → shadow (discarding the agent's shadow work), state → `idle`. The user's real tree is untouched by definition.
+### `rote abort [--yes]`
+Confirms, then: write the residue patch to `archive/<iso-timestamp>.patch` (as in `done` step 6 — abort discards strictly more agent work, so the patch matters more here), archive the manifest with terminal label `aborted`, sync real → shadow (discarding the agent's shadow work), state → `idle`. The user's real tree is untouched by definition. `--yes` skips the confirmation, for a script and for the test suite.
+
+### `rote daemon [--foreground] [--timeout MS]`
+Hidden, and mostly not something to run by hand — `rote start` spawns one for you
+and `rote watch` starts one if none is running (§13). Without `--foreground` it
+detaches, prints the address, and returns; with it, it serves in this process,
+which is what `spawn_detached` invokes and what the tests use. `--timeout` bounds
+the run either way, so a wedged daemon fails a suite rather than outliving the
+machine.
 
 ### Global flags
 `--project <path>` (override repo discovery), `-q/--quiet`, `--no-color`.
@@ -304,7 +322,11 @@ Re-locate the region via context matching as above, extract the lines between th
 - **A line-wise prefix of the proposal, last line allowed to be a character prefix → in progress.** No question is ever raised for it, however long the pause. A prefix cannot be a disagreement; it can only be an unfinished agreement. This is the contract that makes a watcher usable at all: without it, every keystroke-flush mid-hunk reads as a divergence.
 - Anything else → a **question**, but only after the file has been still for `watch.divergence_grace_ms` (default 2000). Any further save to that file restarts the window: it measures stillness, not time since the first mistake. The two layers are both needed — the prefix rule handles typing top to bottom, which is most transcription, and the timer handles pasting the middle or typing bottom-up, where no prefix relationship ever holds.
 
-A raised question sets `pending_divergence` and leaves the hunk `pending`; **the queue advances past it** rather than blocking. It is answered by `rote resolve` or by `k`/`r` in the pane. `keep` → status `diverged`, both versions stored in `divergence`. `retry` → withdraw the question and keep watching. Typing the proposal correctly while a question is open withdraws it too — the question is moot.
+A raised question sets `pending_divergence` and leaves the hunk `pending`; **the queue advances past it** rather than blocking. Mechanically: an open question is the first term of `queue_view`'s sort, so such a hunk sorts *last* among the pending ones — still in the queue, still answerable, no longer the head. The curator's "freeze current" pin therefore does not fire on it either; a hunk the user has deliberately been moved past is not the hunk they are looking at.
+
+It is answered by `rote resolve` or by `k`/`r` in a front end, and those keys address the questioned hunk rather than the active one — which is why `Snapshot` carries it as `question`, separately from `active`. `QueueItem.has_question` marks it in a list; answering it honestly needs the proposed and actual lines, so the whole `Presented` goes on the wire. A front end draws it alongside the hunk being typed, naming the file, because it is about something else.
+
+`keep` → status `diverged`, both versions stored in `divergence`. `retry` → withdraw the question and keep watching. Typing the proposal correctly while a question is open withdraws it too — the question is moot.
 
 ---
 
@@ -501,7 +523,7 @@ Identical to the reviewer's: `model::TOOL_FLAGS`, an empty temp cwd, and a hard 
 18. **A hunk re-identified mid-typing** — a floor sweep re-diffs the region as (half-typed → proposal), which changes `old_lines` and therefore the `key` too, so the evidence is lost and the next save re-creates it. The window is one save and the cost is `unknown`, which is why the record is keyed by `key` and not by a proposal-only hash: the latter would survive this but would alias two hunks in one file with identical `new_lines`, turning "typed the first, pasted the second" into a false `typed`. A false negative is the right failure.
 19. **A paste outside the active hunk's region** — not reported, and the verdict stays `unknown`. The active hunk is the only one whose id a front end holds reliably: `QueueItem` carries `anchor_hint`, which is where a hunk was at the last recompute rather than where it is now. Attributing a paste to the wrong hunk is worse than attributing it to none.
 20. **A browser page whose daemon restarted** — the new one has a new port *and* a new token, and a page cannot re-read `daemon.json` from inside a browser. `EventSource` would retry against a dead address forever, so the page closes the stream on a terminal error and says to re-run `rote watch --web`. This is a real asymmetry with the pane and the plugin, which both re-read the address book on every attempt.
-21. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation); classification's whitespace tolerance covers trailing `\r` when `strict_whitespace = false` (§7).
+21. **CRLF** — rely on byte diffs (`--no-textconv` is already in the §5 invocation), and carry the `\r` all the way through: `relativize_no_index_diff` and the parser's line split both work on bytes, so a proposal for a CRLF file ends its lines the way the file does. Both used `str::lines`, which strips a trailing `\r`, and the two sides of the comparison then agreed only through the whitespace tolerance — which meant `strict_whitespace = true` (§7) made a CRLF file permanently unclassifiable, diverging on a byte that had been thrown away. The tolerance is not what makes CRLF work; it just hid this.
 
 ---
 
@@ -562,7 +584,14 @@ Rust with no rustup has `cargo-clippy` and `cargo-fmt` on PATH but no
 `cargo clippy` subcommand, so the obvious defaults would be written into every
 `.rote.toml` and fail at the first `rote done`. The Node case reads the scripts
 actually declared in `package.json` before falling back to `npm test`. An
-unrecognized project gets no commands at all — rote does not invent checks.
+unrecognized project gets no commands at all — rote does not invent checks — and
+neither does a recognized one whose toolchain is absent: verification failing is
+what "verified before being written" *means*, so the command is simply not
+written. What gets probed is the program a command names, never the check itself;
+running `cargo test` to decide whether to write `cargo test` would cost `rote
+init` a full test suite. Each spelling is probed on its own, because clippy and
+fmt are separate rustup components and either can be missing while the other is
+present.
 
 `verbatim` globs follow the same ecosystem mapping, so a Rust project is not
 told to watch for `pnpm-lock.yaml`.
@@ -708,7 +737,17 @@ over HTTP first, so the daemon can broadcast `closed` with the reason — the
 reaper is the only thing that knows it, and it knows it before the archive
 exists. It escalates to SIGTERM then SIGKILL, which is safe because every write
 is an atomic rename and the kernel releases the flock. It refuses to signal a
-pid whose endpoint does not name this project: pids are recycled.
+pid whose endpoint does not name this project, **and one that is not holding the
+engine token**: the endpoint file outlives its author, so after a `kill -9` and
+enough pid churn the pid in it belongs to a stranger, and the project hash cannot
+tell — it is true by construction. The flock can. An engine holds it unbroken for
+its whole life and stamps it with its pid after acquiring, and the kernel drops it
+on any death, so a held lock naming that pid is the only proof rote has.
+
+Deliberately the flock rather than a `/health` reply. A wedged daemon holds the
+token and answers nothing — the `Opaque` case above — and it must stay stoppable,
+because `done` is about to `git clean -fdx` the shadow underneath it. Requiring a
+reply would leave it running, which is a worse failure than the one being fixed.
 
 The daemon lives until the session closes. The queue advancing while you type
 with no pane open is most of what it is for.
@@ -749,7 +788,17 @@ confuse a race with a transport failure.
 read-modify-write cycle as the mutation. Checking it in the handler and then
 locking to write is a TOCTOU that would make the mechanism decorative. `stale`
 writes nothing and does not move the generation, which is what makes retrying
-exactly once safe.
+exactly once safe. It applies to every verb that writes nothing as well as to
+every verb that does — `show` with no id moves no state, but a client that sent a
+stale generation with it still needs to be told so rather than told `applied`.
+
+`refresh` is the one exception, and deliberately. It asserts nothing about the
+queue's contents, so there is nothing for a generation to be stale against; and
+since the pane attaches the generation it is looking at to every command, checking
+it would refuse the client that has fallen behind the one verb that recovers from
+that, at the moment it asks. It also republishes even when the recompute finds
+nothing, because a client sending it is saying it thinks it is out of sync, and a
+heartbeat does not answer that.
 
 `GET /state` is the engine's **last published view**, not a fresh read: `drift`
 is engine-only state, so a stateless handler would either omit it or shell out to

@@ -207,6 +207,11 @@ async function verb(command) {
 
 const activeId = () => (snapshot && snapshot.active ? snapshot.active.hunk.id : null);
 
+// The hunk waiting on a keep-or-retry answer. Not the active one: the queue
+// advances past a question rather than blocking on it (DESIGN §6), so the two are
+// usually different hunks and the daemon puts this on the wire separately.
+const questionId = () => (snapshot && snapshot.question ? snapshot.question.hunk.id : null);
+
 // The s/k/r/g bindings below (and the keydown table near the bottom) exist
 // three times, once per front end, because they are three languages: here,
 // in src/pane.rs, and in lua/rote/ui.lua. The wire protocol underneath is
@@ -214,8 +219,8 @@ const activeId = () => (snapshot && snapshot.active ? snapshot.active.hunk.id : 
 // together. Same for the counts line.
 const act = {
   skip: () => { const id = activeId(); if (id) verb({ verb: "skip", hunk_id: id }); },
-  keep: () => { const id = activeId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "keep" }); },
-  retry: () => { const id = activeId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "retry" }); },
+  keep: () => { const id = questionId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "keep" }); },
+  retry: () => { const id = questionId(); if (id) verb({ verb: "resolve", hunk_id: id, choice: "retry" }); },
   refresh: () => verb({ verb: "refresh" }),
   show: (id) => verb({ verb: "show", hunk_id: id }),
   pasted: () => { const id = activeId(); if (id) verb({ verb: "report", hunk_id: id, input: "pasted" }); },
@@ -283,23 +288,28 @@ function drawActive(p) {
   card.appendChild(pre);
   el.active.appendChild(card);
 
-  if (h.pending_divergence) {
-    const d = h.pending_divergence;
-    const q = node("div", "question");
-    q.appendChild(node("h2", null, "this differs from the proposal"));
-    const pre2 = node("pre", "body");
-    (d.actual || []).forEach((l) => pre2.appendChild(node("span", "row del", "yours: " + l)));
-    (d.proposed || []).forEach((l) => pre2.appendChild(node("span", "row add", "  its: " + l)));
-    q.appendChild(pre2);
-    const keep = node("button", "act", "keep yours (k)");
-    keep.addEventListener("click", act.keep);
-    const retry = node("button", "act", "keep typing (r)");
-    retry.addEventListener("click", act.retry);
-    q.appendChild(keep);
-    q.appendChild(document.createTextNode(" "));
-    q.appendChild(retry);
-    el.active.appendChild(q);
-  }
+}
+
+// Drawn from `snapshot.question` and after the active hunk, not from it: the queue
+// advances past a question rather than blocking on it (DESIGN §6), so this is
+// usually about a different hunk and has to name which one.
+function drawQuestion(p) {
+  if (!p || !p.hunk.pending_divergence) return;
+  const d = p.hunk.pending_divergence;
+  const q = node("div", "question");
+  q.appendChild(node("h2", null, "a question about " + p.hunk.file + ":" + p.anchor_line));
+  const pre = node("pre", "body");
+  (d.actual || []).forEach((l) => pre.appendChild(node("span", "row del", "yours: " + l)));
+  (d.proposed || []).forEach((l) => pre.appendChild(node("span", "row add", "  its: " + l)));
+  q.appendChild(pre);
+  const keep = node("button", "act", "keep yours (k)");
+  keep.addEventListener("click", act.keep);
+  const retry = node("button", "act", "keep typing (r)");
+  retry.addEventListener("click", act.retry);
+  q.appendChild(keep);
+  q.appendChild(document.createTextNode(" "));
+  q.appendChild(retry);
+  el.active.appendChild(q);
 }
 
 function drawQueue(items, active) {
@@ -326,6 +336,7 @@ function draw() {
     c.pending + " pending · " + c.typed + " typed · " + c.diverged + " diverged · " + c.skipped + " skipped";
 
   drawActive(snapshot.active);
+  drawQuestion(snapshot.question);
   drawQueue(snapshot.queue, activeId());
 
   clear(el.notices);
@@ -350,6 +361,27 @@ async function handshake() {
   return h;
 }
 
+// A daemon that restarted has a new port *and* a new token, and there is no
+// daemon.json to re-read from a browser — so the page cannot follow it, and must
+// stop rather than hammer a dead address (DESIGN.md §9.20). What it must not do is
+// decide that from `readyState`: `EventSource` retries on its own and sits in
+// CONNECTING while it does, so a refused connection never reaches CLOSED and the
+// old check took the "reconnecting…" branch forever, which is the exact failure it
+// was written to prevent.
+//
+// So the daemon is asked instead. `handshake` is already a `/health` probe that
+// checks the status and the wire version, which makes a new token a 401, a new
+// port a network failure, and a mismatched build a mismatch — each of them
+// terminal. Only a blip against a daemon that is still there and still ours comes
+// back.
+const RECONNECT_LIMIT = 5;
+let reconnects = 0;
+let ended = false;
+
+function lost() {
+  say("lost the daemon. It may have restarted with a new address — re-run `rote watch --web`.");
+}
+
 function connect() {
   stream = new EventSource("/events?token=" + encodeURIComponent(TOKEN));
 
@@ -359,6 +391,10 @@ function connect() {
   stream.addEventListener("snapshot", (e) => {
     el.dot.className = "dot live";
     say("");
+    // A frame arrived, so whatever went wrong before is spent. Without this a
+    // long session with five separate blips in it would eventually be declared
+    // dead while the daemon was answering perfectly well.
+    reconnects = 0;
     snapshot = JSON.parse(e.data);
     draw();
   });
@@ -374,21 +410,28 @@ function connect() {
     say(c.terminal === "done" ? "session closed."
       : c.terminal === "aborted" ? "session aborted."
       : "the session ended.");
+    // The daemon closes the socket right after this, and that arrives as an
+    // `error`. Without the flag it would print "lost the daemon" over the reason
+    // the session actually ended.
+    ended = true;
     stream.close();
   });
 
-  stream.addEventListener("error", () => {
+  stream.addEventListener("error", async () => {
+    if (ended) return;
     el.dot.className = "dot lost";
-    // A page cannot recover from a restarted daemon: the new one has a new port
-    // *and* a new token, and there is no daemon.json to re-read from here. The
-    // pane and the nvim plugin both can, which is a real asymmetry — so stop
-    // retrying against a dead address and say what to do instead.
-    if (stream.readyState === EventSource.CLOSED) {
-      stream.close();
-      say("lost the daemon. It may have restarted with a new address — re-run `rote watch --web`.");
-    } else {
-      say("reconnecting…");
+    // Closed unconditionally: leaving it open is what let the browser retry a
+    // dead address on its own schedule, invisibly.
+    stream.close();
+    if (reconnects >= RECONNECT_LIMIT) return lost();
+    say("reconnecting…");
+    try {
+      await handshake();
+    } catch {
+      return lost();
     }
+    reconnects += 1;
+    connect();
   });
 }
 

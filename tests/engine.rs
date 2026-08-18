@@ -118,29 +118,80 @@ fn a_half_typed_save_does_not_raise_a_question() {
 
 #[test]
 fn a_settled_disagreement_becomes_a_question_and_the_queue_moves_on() {
-    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    // Two hunks, because the second half of the name needs somewhere to move *to*.
+    // With one hunk the queue cannot demonstrate advancing, which is how the
+    // behaviour went unimplemented under a test named for it.
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn a() {\n}\n");
+    fx.write("b.rs", "fn b() {\n}\n");
+    fx.commit_all("initial");
+    let project = fx.project();
+    project.ensure_state_dir().unwrap();
+    let cfg = Config {
+        curator_enabled: false,
+        ..Config::default()
+    };
+    let baseline = shadow::sync(&project, &cfg).unwrap();
+    std::fs::write(
+        project.shadow_dir.join("a.rs"),
+        "fn a() {\n    work();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.shadow_dir.join("b.rs"),
+        "fn b() {\n    more();\n}\n",
+    )
+    .unwrap();
+    Manifest::new(&project, "test task".into(), baseline)
+        .save(&project)
+        .unwrap();
+    let mut engine = Engine::new(project, cfg.clone());
+
     engine.step(None, Tick(0)).unwrap();
+    let head = manifest(&fx).active().unwrap().id.clone();
 
     fx.write("a.rs", "fn a() {\n    my_own_way();\n}\n");
-    engine.step(Some(changed()), Tick(100)).unwrap();
+    engine
+        .step(
+            Some(EngineEvent::Changed(Origin::Real, PathBuf::from("a.rs"))),
+            Tick(100),
+        )
+        .unwrap();
     assert!(
-        manifest(&fx).hunks[0].pending_divergence.is_none(),
+        manifest(&fx)
+            .find(&head)
+            .unwrap()
+            .pending_divergence
+            .is_none(),
         "not while the file might still be moving"
     );
 
     engine.step(None, Tick(100 + 2_000)).unwrap();
 
     let m = manifest(&fx);
-    let q = m.hunks[0]
-        .pending_divergence
-        .as_ref()
+    let asked = m
+        .questioned()
         .expect("a question, once the file stopped moving");
+    let q = asked.pending_divergence.as_ref().unwrap();
     assert_eq!(q.proposed, vec!["    work();"]);
     assert_eq!(q.actual, vec!["    my_own_way();"]);
     assert_eq!(
-        m.hunks[0].status,
+        asked.status,
         Status::Pending,
         "an unanswered question is not a terminal status"
+    );
+
+    // And the queue moved on, which is the half that was never implemented.
+    let active = m.active().expect("something else to be getting on with");
+    assert_ne!(
+        active.id, asked.id,
+        "a question must not hold the head of the queue"
+    );
+    assert_eq!(active.file, "b.rs");
+    assert_eq!(
+        m.queue_view().last().map(|h| h.id.clone()),
+        Some(asked.id.clone()),
+        "it sorts last, not out: it is still pending and still answerable"
     );
 }
 
@@ -854,4 +905,88 @@ fn a_report_for_a_hunk_that_does_not_exist_is_refused() {
 
     assert!(matches!(outcome, state::Outcome::Rejected { .. }));
     assert_eq!(manifest(&fx).generation, before);
+}
+
+/// Send one command at a chosen generation and report the outcome.
+fn apply_at(
+    engine: &mut Engine,
+    generation: Option<u64>,
+    command: state::Command,
+) -> state::Outcome {
+    let mut notices = Vec::new();
+    engine
+        .apply(
+            &state::Request {
+                wire_version: state::WIRE_VERSION,
+                generation,
+                command,
+            },
+            Tick(50),
+            &mut notices,
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_show_with_a_stale_generation_is_refused() {
+    // It returned before reaching `mutate`, where the check lives, so a client
+    // that had fallen behind was told its verb landed. §12 says the generation is
+    // checked whenever it is present — writing nothing is not an exemption.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let current = manifest(&fx).generation;
+
+    let outcome = apply_at(
+        &mut engine,
+        Some(current.saturating_sub(1)),
+        state::Command::Show { hunk_id: None },
+    );
+
+    assert!(
+        matches!(outcome, state::Outcome::Stale { current: c } if c == current),
+        "got {outcome:?}"
+    );
+    assert_eq!(manifest(&fx).generation, current, "and nothing was written");
+}
+
+#[test]
+fn a_show_at_the_current_generation_is_applied_and_writes_nothing() {
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let current = manifest(&fx).generation;
+
+    let outcome = apply_at(
+        &mut engine,
+        Some(current),
+        state::Command::Show { hunk_id: None },
+    );
+
+    assert!(
+        matches!(outcome, state::Outcome::Applied),
+        "got {outcome:?}"
+    );
+    assert_eq!(
+        manifest(&fx).generation,
+        current,
+        "no id means no state to move"
+    );
+}
+
+#[test]
+fn a_refresh_is_applied_however_stale_the_client_is() {
+    // The deliberate exception, pinned so it cannot be "fixed" into a refusal.
+    // The pane attaches its generation to every command and `g` maps to refresh,
+    // so checking it would refuse the client that has fallen behind the one verb
+    // that recovers from that.
+    let (fx, _cfg, mut engine) = started("fn a() {\n}\n", "fn a() {\n    work();\n}\n");
+    engine.step(None, Tick(0)).unwrap();
+    let current = manifest(&fx).generation;
+
+    let outcome = apply_at(&mut engine, Some(0), state::Command::Refresh);
+
+    assert!(
+        matches!(outcome, state::Outcome::Applied),
+        "got {outcome:?}"
+    );
+    assert_eq!(manifest(&fx).generation, current);
 }
