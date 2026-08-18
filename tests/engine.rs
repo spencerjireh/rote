@@ -127,8 +127,10 @@ fn a_settled_disagreement_becomes_a_question_and_the_queue_moves_on() {
     fx.commit_all("initial");
     let project = fx.project();
     project.ensure_state_dir().unwrap();
-    let mut cfg = Config::default();
-    cfg.curator_enabled = false;
+    let cfg = Config {
+        curator_enabled: false,
+        ..Config::default()
+    };
     let baseline = shadow::sync(&project, &cfg).unwrap();
     std::fs::write(
         project.shadow_dir.join("a.rs"),
