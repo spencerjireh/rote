@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Request, Response, ResponseBox, Server};
 
@@ -45,6 +46,14 @@ pub const HUB_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long to wait for the engine thread to finish after the loop ends.
 pub const JOIN_CEILING: Duration = Duration::from_secs(2);
+
+/// How long shutdown waits for each SSE writer to flush its last frame.
+///
+/// Short: the socket is loopback and the frame is a few hundred bytes, so this
+/// is a scheduling window rather than a transfer. A client that has stopped
+/// reading blocks its writer, and waiting out its whole timeout would be paying
+/// for a pane that already left.
+pub const STREAM_DRAIN_CEILING: Duration = Duration::from_millis(500);
 
 /// How long an idle event stream waits before writing a keepalive comment.
 ///
@@ -547,7 +556,7 @@ fn run_hub(rx: Receiver<HubMsg>, done: Sender<Option<Terminal>>) {
             HubMsg::Publish(state::Event::Closed { terminal }) => {
                 // Tell everyone before going, so a pane can say "session closed"
                 // rather than "the daemon vanished".
-                fan_out(&mut subscribers, state::Event::Closed { terminal });
+                fan_out_closed(&mut subscribers, terminal);
                 let _ = done.send(terminal);
                 return;
             }
@@ -574,7 +583,7 @@ fn run_hub(rx: Receiver<HubMsg>, done: Sender<Option<Terminal>>) {
                 view.subscribers = subscribers.len();
             }
             HubMsg::Close(terminal) => {
-                fan_out(&mut subscribers, state::Event::Closed { terminal });
+                fan_out_closed(&mut subscribers, terminal);
                 let _ = done.send(terminal);
                 return;
             }
@@ -589,6 +598,45 @@ fn run_hub(rx: Receiver<HubMsg>, done: Sender<Option<Terminal>>) {
 /// bookkeeping that can leak.
 fn fan_out(subscribers: &mut Vec<std::sync::mpsc::SyncSender<state::Event>>, ev: state::Event) {
     subscribers.retain(|s| s.try_send(ev.clone()).is_ok());
+}
+
+/// How long the terminal frame will wait for a subscriber that is behind.
+const CLOSE_WAIT: Duration = Duration::from_millis(500);
+
+/// Send the last frame there will ever be, waiting briefly for a full queue.
+///
+/// `fan_out`'s policy is right for snapshots: eight whole snapshots behind on
+/// loopback is broken, and there is always another snapshot coming. It is wrong
+/// for this one. `closed` is the difference between a pane saying "session
+/// closed" and "the daemon vanished", there is no later frame to recover with,
+/// and the subscriber that is behind is exactly the one that needs telling.
+///
+/// Draining rather than retaining: the hub returns immediately after this, so
+/// there is nothing left to keep them for.
+fn fan_out_closed(
+    subscribers: &mut Vec<std::sync::mpsc::SyncSender<state::Event>>,
+    terminal: Option<Terminal>,
+) {
+    // `SyncSender::send_timeout` is unstable, and a blocking `send` would hand a
+    // departed client the power to wedge shutdown. A bounded retry is both.
+    for s in subscribers.drain(..) {
+        let deadline = Instant::now() + CLOSE_WAIT;
+        let mut ev = state::Event::Closed { terminal };
+        loop {
+            match s.try_send(ev) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    ev = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // Already gone. Nothing to tell.
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- serving
@@ -672,6 +720,7 @@ pub fn serve(project: &ProjectPaths, cfg: &Config, opts: ServeOptions) -> Result
         started,
         hub: hub_tx.clone(),
         engine: engine_tx.clone(),
+        streams: Arc::new(Mutex::new(Vec::new())),
     };
 
     let mut terminal = None;
@@ -709,6 +758,18 @@ pub fn serve(project: &ProjectPaths, cfg: &Config, opts: ServeOptions) -> Result
     join_within(engine_thread, JOIN_CEILING);
     join_within(hub_thread, JOIN_CEILING);
 
+    // Then wait for the writers to put that frame on their sockets. The hub only
+    // queues it; returning here is what ends the process, and a frame still in a
+    // channel when that happens is a pane told the daemon vanished.
+    let live = ctx
+        .streams
+        .lock()
+        .map(|mut l| l.drain(..).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for h in live {
+        join_within(h, STREAM_DRAIN_CEILING);
+    }
+
     Endpoint::remove(project);
     drop(server);
 
@@ -745,6 +806,13 @@ struct Ctx {
     started: Instant,
     hub: Sender<HubMsg>,
     engine: Sender<EngineEvent>,
+    /// The live SSE writer threads.
+    ///
+    /// Kept so shutdown can wait for them. They were detached, which made
+    /// "tell everyone before going" true only if the scheduler happened to run
+    /// them before the process exited — and a pane that misses the `closed`
+    /// frame reports the daemon vanished, which is the one thing it must not do.
+    streams: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl Ctx {
@@ -868,7 +936,7 @@ fn events(ctx: &Ctx, request: Request) {
         return;
     }
 
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let mut w = request.into_writer();
         let head = "HTTP/1.1 200 OK\r\n\
                     Content-Type: text/event-stream\r\n\
@@ -907,6 +975,13 @@ fn events(ctx: &Ctx, request: Request) {
             }
         }
     });
+
+    if let Ok(mut live) = ctx.streams.lock() {
+        // Finished writers are dropped on the way past, so a long session that
+        // reconnects often does not accumulate handles.
+        live.retain(|h| !h.is_finished());
+        live.push(handle);
+    }
 }
 
 fn event_name(ev: &state::Event) -> &'static str {
